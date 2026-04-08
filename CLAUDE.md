@@ -20,11 +20,11 @@ There is no build step, test suite, or linter configured.
 ### Example Invocations
 
 ```bash
-node cli.js upload-dataset --file "data.csv" --datasetId "<id>" --batchSize 50000
-node cli.js update-stream-schedules --file "streams.csv" --startHour 6 --endHour 20 --timezone "America/Denver"
-node cli.js bulk-add-dataflow-trigger-condition --dataflowId 123
-node cli.js share-content-bulk --file "content.csv" --user "<userId>" --contentType "card"
-node cli.js bulk-delete-datasets --file "datasets.csv" --column "DataSet ID" --dryRun
+node cli.js upload-dataset --file "data.csv" --dataset-id "<id>" --batch-size 50000
+node cli.js bulk-update-stream-schedules --file "streams.csv" --start-hour 6 --end-hour 20 --timezone "America/Denver"
+node cli.js bulk-add-dataflow-trigger-condition --dataflow-id 123
+node cli.js bulk-share-content --file "content.csv" --user "<userId>" --content-type "card"
+node cli.js bulk-delete-datasets --file "datasets.csv" --column "DataSet ID" --dry-run
 ```
 
 ## Architecture
@@ -52,12 +52,12 @@ const { api, config, readCSV, resolveIds, createLogger } = require('../lib');
 | [config.js](lib/config.js) | `instance`, `instanceUrl`, `baseUrl`, `accessToken`, `requireAuth()` | Reads `.env` via dotenv. `requireAuth()` exits with an error if token is missing — called lazily so `--help` works without a `.env`. |
 | [api.js](lib/api.js) | `get(path)`, `put(path, body)`, `post(path, body)`, `del(path)` | Authenticated Domo API client. Paths are relative to `baseUrl` (e.g. `/data/v1/streams/123`). Automatically sets `X-DOMO-Developer-Token` and `Content-Type: application/json`. Throws on non-OK responses. |
 | [csv.js](lib/csv.js) | `readCSV(filePath, { column, filterColumn, filterValue })` | Parses CSV with optional row filtering and column extraction. Returns extracted values (if `column` set) or full record objects. |
-| [input.js](lib/input.js) | `resolveIds(argv, { name, columnDefault })` | Resolves entity IDs from `--file` (CSV), `--<name>Id` (single, enables debug mode), or `--<name>Ids` (comma-separated). Also handles `--column`, `--filterColumn`, `--filterValue`. Returns `{ ids, debugMode }`. |
+| [input.js](lib/input.js) | `resolveIds(argv, { name, columnDefault })` | Resolves entity IDs from `--file` (CSV), `--<name>-id` (single, enables debug mode), or `--<name>-ids` (comma-separated). Also handles `--column`, `--filter-column`, `--filter-value`. Returns `{ ids, debugMode }`. |
 | [log.js](lib/log.js) | `createLogger(commandName, { debugMode, dryRun, runMeta })` | Returns `{ writeDebugLog(itemId, data), addResult(entry), writeRunLog(summary) }`. In debug mode (single-ID), writes per-item JSON logs. In bulk mode, collects results and writes a summary run log. Logs go to `logs/<commandName>/`. Dry-run logs are prefixed with `dry_`. |
 
 ### Commands (commands/)
 
-31 command modules, each a standalone async script loaded by `cli.js`. Filenames are kebab-case matching the command name (e.g. `node cli.js update-stream-schedules` loads `commands/update-stream-schedules.js`).
+17 command modules, each a standalone async script loaded by `cli.js`. Filenames are kebab-case matching the command name (e.g. `node cli.js bulk-update-stream-schedules` loads `commands/bulk-update-stream-schedules.js`).
 
 **When adding a new command:**
 1. Create `commands/your-command.js`
@@ -67,20 +67,19 @@ const { api, config, readCSV, resolveIds, createLogger } = require('../lib');
 
 Key categories:
 - **Bulk tagging/triggers**: `bulk-add-dataflow-tags`, `bulk-add-dataset-tags`, `bulk-add-dataflow-trigger-condition`
-- **Bulk approval/deletion**: `bulk-approve-dataflow-schedules`, `bulk-approve-dataset-schedules`, `bulk-delete-datasets`
+- **Bulk deletion**: `bulk-delete-datasets`
 - **Bulk rename**: `bulk-rename-dataflows`, `bulk-rename-datasets`
-- **PDP policies**: `bulk-apply-pdp-policies`, `update-column-pdp-policy`
-- **Content access**: `share-content-bulk`, `revoke-content-bulk`
-- **Stream/schedule management**: `update-stream-schedules`, `bulk-update-streams`, `convert-stream-provider`, `switch-provider`
-- **DataFlow management**: `copy-dataflow`, `create-dataflow`, `create-stream`, `create-beast-modes`, `swap-input-in-dataflows`
-- **Data upload/export**: `upload-dataset`, `export-dataset-versions`
-- **Utilities**: `get-page-cards`, `compare-cards`, `extract-card-ids`, `json-array-length`, `query-to-json`, `read-account-credentials`
-- **Workflow**: `run-workflow-in-batches`, `user-attribute-updates-workflow-run`
+- **PDP policies**: `bulk-apply-pdp-policies`, `bulk-update-column-pdp-policy`
+- **Content access**: `bulk-share-content`, `bulk-revoke-content`
+- **Stream/schedule management**: `bulk-update-stream-schedules`, `bulk-update-stream-update-method`, `bulk-convert-stream-provider`
+- **DataFlow management**: `swap-input-in-dataflows`
+- **Data upload/export**: `upload-dataset`, `bulk-export-dataset-versions`
+- **Utilities**: `extract-card-ids`
 
 ### Logs
 
 Written to `logs/<commandName>/` (git-ignored). Two log types:
-- **Debug logs** (`debug_<itemId>_<timestamp>.json`) — detailed per-item logs in single-ID mode
+- **Debug logs** (`debug_<itemId>_<timestamp>.json`) — detailed per-item logs in single-ID mode (`--<entity>-id`)
 - **Run logs** (`run_<timestamp>.json`) — summary with all results in bulk mode
 - Dry-run variants prefixed with `dry_`
 
