@@ -1,0 +1,71 @@
+{
+	"sharepointonline->microsoft-sharepoint": {
+		"description": "Sharepoint Online (legacy username/password) to Microsoft Sharepoint Online Rest OAuth",
+		"fieldMappings": {
+			"fileType": "fileType",
+			"sheet": "sheetName",
+			"report": {
+				"to": "report",
+				"valueMap": {
+					"Document": "download_item_contents",
+					"List": "list_items",
+					"ListItemsDetailed": "list_item_detailed"
+				}
+			},
+			"delimiter": {
+				"to": "delimiter",
+				"valueMap": {
+					"COMMA": "comma",
+					"TAB": "tab",
+					"PIPE": "pipe",
+					"SEMICOLON": "semicolon"
+				}
+			},
+			"relativeURL": {
+				"to": [
+					"siteSearchQuery",
+					"enterSiteId",
+					{
+						"name": "fileRelativePath",
+						"transform": "extractRelativePath"
+					}
+				],
+				"transform": "extractSiteName"
+			},
+			"updatemode.mode": "updatemode.mode",
+			"updatemode.upsertKeys": "updatemode.upsertKeys",
+			"updatemode.mergeChoice": "updatemode.mergeChoice",
+			"_description_": "_description_",
+			"cloud": "cloud",
+			"decodeFields": "decodeFields",
+			"retry.retryNumber": "retry.retryNumber"
+		},
+		"defaults": {
+			"siteOption": "filterSiteNames",
+			"siteSelectionCriteria": "enterSiteId",
+			"fileIdOption": "selectFileId",
+			"fileSearchProperty": "id",
+			"fileDownloadRelativePath": "root",
+			"sheetSelectionCriteria": "Complete",
+			"headerRow": "1",
+			"dataStartRow": "2",
+			"footerRowsToSkip": "0",
+			"quoteChar": "double_quote",
+			"quoteChar_other": "\"",
+			"escapeChar": "no_escape",
+			"escapeChar_other": "\\",
+			"delimiter_other": ",",
+			"dateFormat": "ddmmyy",
+			"fileEncoding": "UTF-8",
+			"fileEncodingCheck": "false",
+			"jsonLineReader": "No",
+			"transitiveMembers": "false",
+			"includeAttributeFlag": "No",
+			"includePhoneticWords": "true",
+			"display_comma_separated_values": "false",
+			"isPathBased": "false",
+			"period_value": "D30",
+			"listItemIdOption": "enterListItemId"
+		}
+	}
+}
