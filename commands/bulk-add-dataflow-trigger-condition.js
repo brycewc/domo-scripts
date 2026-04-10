@@ -18,6 +18,10 @@
  *   --dataflow-ids   Comma-separated dataflow IDs
  *   --filter-column  CSV column to filter on (optional, requires --filter-value)
  *   --filter-value   Value the filter-column must equal to include the row
+ *   --value          Condition value (default: 1440)
+ *   --unit           Condition unit (default: "MINUTE")
+ *   --no-negated     Set negated to false (default: negated is true)
+ *   --type           Condition type (default: "DATAFLOW_LAST_RUN")
  */
 
 const api = require('../lib/api');
@@ -26,10 +30,10 @@ const { createLogger } = require('../lib/log');
 const argv = require('minimist')(process.argv.slice(2));
 
 const CONDITION_TO_ADD = {
-	value: 1440,
-	unit: 'MINUTE',
-	negated: true,
-	type: 'DATAFLOW_LAST_RUN'
+	value: argv.value !== undefined ? argv.value : 1440,
+	unit: argv.unit || 'MINUTE',
+	negated: argv.negated !== undefined ? argv.negated : true,
+	type: argv.type || 'DATAFLOW_LAST_RUN'
 };
 
 function hasMatchingCondition(triggerConditions) {
@@ -118,6 +122,10 @@ function printUsage() {
 	console.log('  --dataflow-ids   Comma-separated dataflow IDs');
 	console.log('  --filter-column  CSV column to filter on');
 	console.log('  --filter-value   Value the filter-column must equal');
+	console.log('  --value          Condition value (default: 1440)');
+	console.log('  --unit           Condition unit (default: "MINUTE")');
+	console.log('  --no-negated     Set negated to false (default: negated is true)');
+	console.log('  --type           Condition type (default: "DATAFLOW_LAST_RUN")');
 }
 
 async function main() {
