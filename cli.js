@@ -12,6 +12,7 @@ const commands = {
 	'bulk-export-dataset-versions': './commands/bulk-export-dataset-versions',
 	'bulk-revoke-content': './commands/bulk-revoke-content',
 	'bulk-share-content': './commands/bulk-share-content',
+	'run-workflow-from-csv': './commands/run-workflow-from-csv',
 	'bulk-update-column-pdp-policy': './commands/bulk-update-column-pdp-policy',
 	'bulk-update-stream-schedules': './commands/bulk-update-stream-schedules',
 	'bulk-update-stream-update-method': './commands/bulk-update-stream-update-method',
