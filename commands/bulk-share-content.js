@@ -6,15 +6,20 @@
  *   node cli.js bulk-share-content --file "content.csv" --group "12345"
  *   node cli.js bulk-share-content --file "card-ids.json" --user "1250228141" --content-type "card"
  *   node cli.js bulk-share-content --file "badge-ids.json" --group "12345" --content-type "badge"
+ *   node cli.js bulk-share-content --file "dataset-ids.json" --user "1250228141" --content-type "dataset" --access-level "CAN_VIEW"
  *
  * Options:
  *   --file             CSV or JSON file with content IDs (required)
  *   --user             User ID to share with (required if --group not set)
  *   --group            Group ID to share with (required if --user not set)
- *   --content-type     Content type for JSON files: card, badge, page, dataApp, alert (required for JSON)
+ *   --content-type     Content type for JSON files: card, badge, page, dataApp, alert, dataset (required for JSON)
+ *   --access-level     Access level for dataset sharing: CAN_VIEW, CAN_SHARE, CAN_EDIT, OWNER (default: CAN_VIEW)
  *
- * CSV format: Must have "Object ID" and "Object Type ID" columns.
+ * CSV format: Must have "Object ID" and "Object Type ID" columns. Use "DATA_SOURCE" for datasets.
  * JSON format: Must be an array of integers. Requires --content-type.
+ *
+ * Datasets are shared in bulk via /data/v1/ui/bulk/share (batched with the other content types).
+ * All other content types are batched through /content/v1/share.
  */
 
 const api = require('../lib/api');
@@ -37,6 +42,14 @@ async function main() {
 	const recipientType = argv.user ? 'user' : 'group';
 	const recipientId = argv.user || argv.group;
 
+	const validAccessLevels = ['CAN_VIEW', 'CAN_SHARE', 'CAN_EDIT', 'OWNER'];
+	const accessLevel = (argv['access-level'] || 'CAN_VIEW').toUpperCase();
+	if (!validAccessLevels.includes(accessLevel)) {
+		throw new Error(
+			`Invalid --access-level. Must be one of: ${validAccessLevels.join(', ')}`
+		);
+	}
+
 	// Determine file type by extension
 	const fileExtension = argv.file.toLowerCase().split('.').pop();
 	let fileJson;
@@ -49,19 +62,33 @@ async function main() {
 			throw new Error('CSV must have Object ID and Object Type ID columns');
 		}
 		fileJson = records.map((row) => {
-			let typeVal = row['Object Type ID'];
-			typeVal = typeVal === 'CARD' ? 'badge' : typeVal.toLowerCase();
+			const rawType = row['Object Type ID'];
+			let typeVal;
+			if (rawType === 'CARD') {
+				typeVal = 'badge';
+			} else if (rawType === 'DATA_SOURCE' || rawType === 'DATASET') {
+				typeVal = 'dataset';
+			} else {
+				typeVal = rawType.toLowerCase();
+			}
 			return {
 				id: String(row['Object ID']),
 				type: typeVal
 			};
 		});
 	} else if (fileExtension === 'json') {
-		const validContentTypes = ['card', 'badge', 'page', 'dataApp', 'alert'];
+		const validContentTypes = [
+			'card',
+			'badge',
+			'page',
+			'dataApp',
+			'alert',
+			'dataset'
+		];
 		// Handle JSON file (array of integers + contentType parameter)
 		if (!argv['content-type']) {
 			throw new Error(
-				`--content-type parameter is required for JSON files ${validContentTypes.join(
+				`--content-type parameter is required for JSON files: ${validContentTypes.join(
 					', '
 				)}`
 			);
@@ -74,10 +101,7 @@ async function main() {
 			contentType = 'badge';
 		}
 
-		if (
-			!validContentTypes.includes(contentType) &&
-			argv['content-type'].toLowerCase() !== 'card'
-		) {
+		if (!validContentTypes.includes(contentType)) {
 			throw new Error(
 				`Invalid contentType. Must be one of: ${validContentTypes.join(
 					', '
@@ -115,66 +139,128 @@ async function main() {
 		throw new Error('File must have .csv or .json extension');
 	}
 
-	const batchSize = 50;
+	// Datasets use a separate per-item endpoint; split them out
+	const datasetItems = fileJson.filter((item) => item.type === 'dataset');
+	const contentItems = fileJson.filter((item) => item.type !== 'dataset');
+
 	let successCount = 0;
 	let errorCount = 0;
-	const totalBatches = Math.ceil(fileJson.length / batchSize);
 
-	console.log(
-		`Processing ${fileJson.length} items in batches of ${batchSize}...`
-	);
-
-	for (let start = 0; start < fileJson.length; start += batchSize) {
-		const batch = fileJson.slice(start, start + batchSize);
-		const batchNumber = Math.floor(start / batchSize) + 1;
+	// Process non-dataset items via the batched content-share endpoint
+	if (contentItems.length > 0) {
+		const batchSize = 50;
+		const totalBatches = Math.ceil(contentItems.length / batchSize);
 
 		console.log(
-			`Processing batch ${batchNumber}/${totalBatches} (${batch.length} items)...`
+			`Processing ${contentItems.length} content items in batches of ${batchSize}...`
 		);
 
-		const body = {
-			resources: batch,
-			recipients: [
-				{
-					type: recipientType,
-					id: recipientId
-				}
-			],
-			message: 'Bulk sharing from script.'
-		};
+		for (let start = 0; start < contentItems.length; start += batchSize) {
+			const batch = contentItems.slice(start, start + batchSize);
+			const batchNumber = Math.floor(start / batchSize) + 1;
 
-		try {
-			const result = await api.post(
-				'/content/v1/share?sendEmail=false',
-				body
-			);
 			console.log(
-				`Batch ${batchNumber} success:`,
-				JSON.stringify(result, null, 2)
+				`Processing batch ${batchNumber}/${totalBatches} (${batch.length} items)...`
 			);
-			successCount++;
-		} catch (error) {
-			console.error(`Batch ${batchNumber} error:`, error.message);
-			errorCount++;
-		}
 
-		// Add a small delay between batches to avoid overwhelming the API
-		if (start + batchSize < fileJson.length) {
-			await new Promise((resolve) => setTimeout(resolve, 100));
+			const body = {
+				resources: batch,
+				recipients: [
+					{
+						type: recipientType,
+						id: recipientId
+					}
+				],
+				message: 'Bulk sharing from script.'
+			};
+
+			try {
+				const result = await api.post(
+					'/content/v1/share?sendEmail=false',
+					body
+				);
+				console.log(
+					`Batch ${batchNumber} success:`,
+					JSON.stringify(result, null, 2)
+				);
+				successCount++;
+			} catch (error) {
+				console.error(`Batch ${batchNumber} error:`, error.message);
+				errorCount++;
+			}
+
+			if (start + batchSize < contentItems.length) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+		}
+	}
+
+	// Datasets use the bulk share endpoint: /data/v1/ui/bulk/share
+	if (datasetItems.length > 0) {
+		const batchSize = 50;
+		const totalBatches = Math.ceil(datasetItems.length / batchSize);
+
+		console.log(
+			`\nProcessing ${datasetItems.length} dataset(s) with access level ${accessLevel} in batches of ${batchSize}...`
+		);
+
+		for (let start = 0; start < datasetItems.length; start += batchSize) {
+			const batch = datasetItems.slice(start, start + batchSize);
+			const batchNumber = Math.floor(start / batchSize) + 1;
+
+			console.log(
+				`Processing dataset batch ${batchNumber}/${totalBatches} (${batch.length} items)...`
+			);
+
+			const body = {
+				bulkItems: {
+					ids: batch.map((item) => String(item.id)),
+					type: 'DATA_SOURCE'
+				},
+				dataSourceShareEntity: {
+					permissions: [
+						{
+							accessLevel,
+							id: String(recipientId),
+							type: recipientType.toUpperCase()
+						}
+					],
+					sendEmail: false,
+					message: 'Bulk sharing from script.'
+				}
+			};
+
+			try {
+				const result = await api.post('/data/v1/ui/bulk/share', body);
+				console.log(
+					`Dataset batch ${batchNumber} success:`,
+					JSON.stringify(result, null, 2)
+				);
+				successCount++;
+			} catch (error) {
+				console.error(`Dataset batch ${batchNumber} error:`, error.message);
+				errorCount++;
+			}
+
+			if (start + batchSize < datasetItems.length) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
 		}
 	}
 
 	// Summary
 	console.log('\n=== Summary ===');
 	console.log(`Total items processed: ${fileJson.length}`);
-	console.log(`Successful batches: ${successCount}`);
-	console.log(`Failed batches: ${errorCount}`);
+	console.log(`  Content items: ${contentItems.length}`);
+	console.log(`  Datasets: ${datasetItems.length}`);
+	console.log(`Successful operations: ${successCount}`);
+	console.log(`Failed operations: ${errorCount}`);
 
 	if (errorCount > 0) {
-		console.error('\nSome batches failed. Check the error messages above.');
+		console.error('\nSome operations failed. Check the error messages above.');
 		process.exit(1);
 	} else {
-		console.log('\nAll batches completed successfully!');
+		console.log('\nAll operations completed successfully!');
 	}
 }
 
