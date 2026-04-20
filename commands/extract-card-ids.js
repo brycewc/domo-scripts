@@ -11,7 +11,18 @@
 
 const fs = require('fs');
 const path = require('path');
+const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const HELP_TEXT = `Usage: node cli.js extract-card-ids [options]
+
+Extract cardId values from a cards JSON file and create a simple array of integers.
+
+Options:
+  --input   Path to the input JSON file (required)
+  --output  Path to the output JSON file (default: <input-dir>/<input-name>-ids-only.json)`;
+
+showHelp(argv, HELP_TEXT);
 
 const inputFile = argv.input || argv._[0];
 if (!inputFile) {

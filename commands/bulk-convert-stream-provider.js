@@ -26,27 +26,26 @@
 
 const api = require('../lib/api');
 const { providerMap, instanceUrl } = require('../lib/index');
+const { showHelp } = require('../lib/help');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
+
+const HELP_TEXT = `Usage:
+  node cli.js bulk-convert-stream-provider --from-connector <connectorId> --to-connector <connectorId> [...fields] [--dry-run]
+
+Options:
+  --from-connector Source connector ID (required)
+  --to-connector   Target connector ID (required)
+  --stream-id      Process a single stream instead of all
+  --dry-run        Preview changes without applying them
+  --<credential>   Required credential fields for the target provider`;
+
+showHelp(argv, HELP_TEXT);
 
 const fromConnector = argv['from-connector'];
 const toConnector = argv['to-connector'];
 const dryRun = argv['dry-run'] || false;
 const singleStreamId = argv['stream-id'];
-
-if (argv.help || argv.h) {
-	console.log('Usage:');
-	console.log(
-		'  node cli.js bulk-convert-stream-provider --from-connector <connectorId> --to-connector <connectorId> [...fields] [--dry-run]'
-	);
-	console.log('\nOptions:');
-	console.log('  --from-connector Source connector ID (required)');
-	console.log('  --to-connector   Target connector ID (required)');
-	console.log('  --stream-id      Process a single stream instead of all');
-	console.log('  --dry-run        Preview changes without applying them');
-	console.log('  --<credential>   Required credential fields for the target provider');
-	process.exit(0);
-}
 
 if (!fromConnector || !toConnector) {
 	console.error(

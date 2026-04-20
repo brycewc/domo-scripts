@@ -21,7 +21,21 @@
 
 const api = require('../lib/api');
 const { resolveIds } = require('../lib/input');
+const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const HELP_TEXT = `Usage:
+  node cli.js bulk-add-dataset-tags --file "datasets.csv" --tags "tag1,tag2"
+  node cli.js bulk-add-dataset-tags --file "datasets.csv" --column "My Column" --tags "tag1,tag2"
+  node cli.js bulk-add-dataset-tags --owner-id "1234567890" --tags "tag1,tag2"
+  node cli.js bulk-add-dataset-tags --owner-id "1234567890" --tags "tag1,tag2" --batch-size 100
+
+Options:
+  --file       Path to a CSV file containing dataset IDs
+  --column     CSV column name containing dataset IDs (default: "DataSet ID")
+  --owner-id   Domo user ID whose owned datasets will be tagged
+  --tags       Comma-separated list of tags to apply
+  --batch-size Number of datasets per API call (default: 50)`;
 
 async function fetchDatasetIdsByOwner(ownerId) {
 	const body = [{ id: ownerId.toString(), type: 'USER' }];
@@ -46,37 +60,8 @@ async function bulkTagDatasets(ids, tags) {
 	return api.post('/data/v1/ui/bulk/tag', body);
 }
 
-function printUsage() {
-	console.log('Usage:');
-	console.log(
-		'  node cli.js bulk-add-dataset-tags --file "datasets.csv" --tags "tag1,tag2"'
-	);
-	console.log(
-		'  node cli.js bulk-add-dataset-tags --file "datasets.csv" --column "My Column" --tags "tag1,tag2"'
-	);
-	console.log(
-		'  node cli.js bulk-add-dataset-tags --owner-id "1234567890" --tags "tag1,tag2"'
-	);
-	console.log(
-		'  node cli.js bulk-add-dataset-tags --owner-id "1234567890" --tags "tag1,tag2" --batch-size 100'
-	);
-	console.log('\nOptions:');
-	console.log('  --file       Path to a CSV file containing dataset IDs');
-	console.log(
-		'  --column     CSV column name containing dataset IDs (default: "DataSet ID")'
-	);
-	console.log(
-		'  --owner-id   Domo user ID whose owned datasets will be tagged'
-	);
-	console.log('  --tags       Comma-separated list of tags to apply');
-	console.log('  --batch-size Number of datasets per API call (default: 50)');
-}
-
 async function main() {
-	if (argv.help || argv.h) {
-		printUsage();
-		process.exit(0);
-	}
+	showHelp(argv, HELP_TEXT);
 
 	const file = argv.file || argv.f;
 	const ownerId = argv['owner-id'] || argv.o;
@@ -85,19 +70,19 @@ async function main() {
 
 	if (!file && !ownerId) {
 		console.error('Error: Either --file or --owner-id is required\n');
-		printUsage();
+		console.error(HELP_TEXT);
 		process.exit(1);
 	}
 
 	if (file && ownerId) {
 		console.error('Error: Specify --file or --owner-id, not both\n');
-		printUsage();
+		console.error(HELP_TEXT);
 		process.exit(1);
 	}
 
 	if (!tagsRaw) {
 		console.error('Error: --tags parameter is required\n');
-		printUsage();
+		console.error(HELP_TEXT);
 		process.exit(1);
 	}
 

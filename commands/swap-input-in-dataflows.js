@@ -18,8 +18,17 @@
  */
 
 const api = require('../lib/api');
+const { showHelp } = require('../lib/help');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
+
+const HELP_TEXT = `Usage: node cli.js swap-input-in-dataflows [options]
+
+Options:
+  --old-dataset-id    The dataset ID to find and replace (required)
+  --new-dataset-id    The dataset ID to replace it with (required)
+  --dry-run           Show what would change without making updates
+  --skip-schema-check Skip the schema comparison step`;
 
 const DELAY_MS = 500;
 
@@ -241,21 +250,7 @@ function replaceDatasetInDataflow(
 }
 
 async function main() {
-	if (argv.help || argv.h) {
-		console.log('Usage: node cli.js swap-input-in-dataflows [options]\n');
-		console.log('Options:');
-		console.log(
-			'  --old-dataset-id    The dataset ID to find and replace (required)'
-		);
-		console.log(
-			'  --new-dataset-id    The dataset ID to replace it with (required)'
-		);
-		console.log(
-			'  --dry-run           Show what would change without making updates'
-		);
-		console.log('  --skip-schema-check Skip the schema comparison step');
-		process.exit(0);
-	}
+	showHelp(argv, HELP_TEXT);
 
 	const oldDatasetId = argv['old-dataset-id'];
 	const newDatasetId = argv['new-dataset-id'];
@@ -263,16 +258,8 @@ async function main() {
 	const skipSchemaCheck = argv['skip-schema-check'] || false;
 
 	if (!oldDatasetId || !newDatasetId) {
-		console.error('Error: --old-dataset-id and --new-dataset-id are required');
-		console.log('\nUsage:');
-		console.log(
-			'  node cli.js swap-input-in-dataflows --old-dataset-id "<uuid>" --new-dataset-id "<uuid>"'
-		);
-		console.log('\nOptions:');
-		console.log(
-			'  --dry-run           Show what would change without making updates'
-		);
-		console.log('  --skip-schema-check Skip the schema comparison step');
+		console.error('Error: --old-dataset-id and --new-dataset-id are required\n');
+		console.error(HELP_TEXT);
 		process.exit(1);
 	}
 

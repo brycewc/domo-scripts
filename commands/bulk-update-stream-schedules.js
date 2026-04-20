@@ -31,7 +31,23 @@
 const api = require('../lib/api');
 const { resolveIds } = require('../lib/input');
 const { createLogger } = require('../lib/log');
+const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const HELP_TEXT = `Usage: node cli.js bulk-update-stream-schedules [options]
+
+Options:
+  --file, -f        CSV file with stream IDs
+  --stream-id       Single stream ID (enables debug logging)
+  --stream-ids      Comma-separated stream IDs
+  --column, -c      CSV column with stream IDs (default: "streamId")
+  --mode            "daily" (default) or "manual"
+  --start-hour      Start of hour range, 0-23 (default: 0)
+  --end-hour        End of hour range, 0-23 (default: 23)
+  --timezone        Schedule timezone (default: "UTC")
+  --filter-column   CSV column to filter on
+  --filter-value    Value the filter-column must equal
+  --dry-run         Preview changes without applying`;
 
 // -- Schedule helpers --------------------------------------------------------
 
@@ -112,28 +128,13 @@ function modifyScheduleToManual(streamDefinition) {
 // -- Main --------------------------------------------------------------------
 
 async function main() {
+	showHelp(argv, HELP_TEXT);
+
 	const mode = argv.mode || 'daily';
 	const startHour = argv['start-hour'] != null ? Number(argv['start-hour']) : 0;
 	const endHour = argv['end-hour'] != null ? Number(argv['end-hour']) : 23;
 	const timezone = argv.timezone || 'UTC';
 	const dryRun = argv['dry-run'] || false;
-
-	if (argv.help || argv.h) {
-		console.log('Usage: node cli.js bulk-update-stream-schedules [options]\n');
-		console.log('Options:');
-		console.log('  --file, -f        CSV file with stream IDs');
-		console.log('  --stream-id       Single stream ID (enables debug logging)');
-		console.log('  --stream-ids      Comma-separated stream IDs');
-		console.log('  --column, -c      CSV column with stream IDs (default: "streamId")');
-		console.log('  --mode            "daily" (default) or "manual"');
-		console.log('  --start-hour      Start of hour range, 0-23 (default: 0)');
-		console.log('  --end-hour        End of hour range, 0-23 (default: 23)');
-		console.log('  --timezone        Schedule timezone (default: "UTC")');
-		console.log('  --filter-column   CSV column to filter on');
-		console.log('  --filter-value    Value the filter-column must equal');
-		console.log('  --dry-run         Preview changes without applying');
-		process.exit(0);
-	}
 
 	if (!['daily', 'manual'].includes(mode)) {
 		console.error('Error: --mode must be "daily" or "manual"');

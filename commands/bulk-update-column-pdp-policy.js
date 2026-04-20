@@ -21,7 +21,23 @@
  */
 
 const api = require('../lib/api');
+const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const HELP_TEXT = `Usage:
+  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --add-users "111,222"
+  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --add-groups "333,444"
+  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --remove-users "111" --remove-groups "333"
+  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --add-users "555" --remove-users "111"
+
+Options:
+  --dataset-id       DataSet ID (required)
+  --filter-group-id  Filter group ID (required)
+  --policy-id        Column policy ID within the filter group (required)
+  --add-users        Comma-separated user IDs to add
+  --add-groups       Comma-separated group IDs to add
+  --remove-users     Comma-separated user IDs to remove
+  --remove-groups    Comma-separated group IDs to remove`;
 
 function parseIdList(value) {
 	if (!value) return [];
@@ -90,30 +106,7 @@ async function validateGroupIds(groupIds) {
 }
 
 async function main() {
-	if (argv.help || argv.h) {
-		console.log('Usage:');
-		console.log(
-			'  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --add-users "111,222"'
-		);
-		console.log(
-			'  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --add-groups "333,444"'
-		);
-		console.log(
-			'  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --remove-users "111" --remove-groups "333"'
-		);
-		console.log(
-			'  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --add-users "555" --remove-users "111"'
-		);
-		console.log('\nOptions:');
-		console.log('  --dataset-id       DataSet ID (required)');
-		console.log('  --filter-group-id  Filter group ID (required)');
-		console.log('  --policy-id        Column policy ID within the filter group (required)');
-		console.log('  --add-users        Comma-separated user IDs to add');
-		console.log('  --add-groups       Comma-separated group IDs to add');
-		console.log('  --remove-users     Comma-separated user IDs to remove');
-		console.log('  --remove-groups    Comma-separated group IDs to remove');
-		process.exit(0);
-	}
+	showHelp(argv, HELP_TEXT);
 
 	const datasetId = argv['dataset-id'];
 	const filterGroupId = parseInt(argv['filter-group-id'], 10);
@@ -125,21 +118,9 @@ async function main() {
 
 	if (!datasetId || isNaN(filterGroupId) || isNaN(policyId)) {
 		console.error(
-			'Error: --dataset-id, --filter-group-id, and --policy-id are required'
+			'Error: --dataset-id, --filter-group-id, and --policy-id are required\n'
 		);
-		console.log('\nUsage:');
-		console.log(
-			'  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --add-users "111,222"'
-		);
-		console.log(
-			'  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --add-groups "333,444"'
-		);
-		console.log(
-			'  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --remove-users "111" --remove-groups "333"'
-		);
-		console.log(
-			'  node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --add-users "555" --remove-users "111"'
-		);
+		console.error(HELP_TEXT);
 		process.exit(1);
 	}
 

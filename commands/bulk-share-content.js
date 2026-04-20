@@ -24,10 +24,29 @@
 
 const api = require('../lib/api');
 const { readCSV } = require('../lib/csv');
+const { showHelp } = require('../lib/help');
 const fs = require('fs');
 const argv = require('minimist')(process.argv.slice(2));
 
+const HELP_TEXT = `Usage: node cli.js bulk-share-content [options]
+
+Share content in bulk using a CSV or JSON file of content IDs.
+
+Options:
+  --file           CSV or JSON file with content IDs (required)
+  --user           User ID to share with (required if --group not set)
+  --group          Group ID to share with (required if --user not set)
+  --content-type   Content type for JSON files: card, badge, page, dataApp, alert, dataset
+                   (required for JSON files)
+  --access-level   Access level for dataset sharing: CAN_VIEW, CAN_SHARE, CAN_EDIT, OWNER
+                   (default: CAN_VIEW)
+
+CSV format: Must have "Object ID" and "Object Type ID" columns. Use "DATA_SOURCE" for datasets.
+JSON format: Must be an array of integers. Requires --content-type.`;
+
 async function main() {
+	showHelp(argv, HELP_TEXT);
+
 	// Validate parameters
 	if (!argv.file) {
 		throw new Error('--file parameter is required');

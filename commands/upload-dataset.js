@@ -14,10 +14,23 @@
  */
 
 const { baseUrl, accessToken, requireAuth } = require('../lib/config');
+const { showHelp } = require('../lib/help');
 const fs = require('fs');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
 
+const HELP_TEXT = `Usage:
+  node cli.js upload-dataset --file "data.csv" --dataset-id "<id>"
+  node cli.js upload-dataset --file "data.csv" --dataset-id "<id>" --batch-size 50000
+  node cli.js upload-dataset --file "data.csv" --dataset-id "<id>" --action APPEND
+
+Options:
+  --file, -f        Path to the CSV file to upload (required)
+  --dataset-id, -d  DataSet ID to upload to (required)
+  --batch-size, -b  Number of rows per upload part (default: 10000)
+  --action, -a      REPLACE or APPEND (default: REPLACE)`;
+
+showHelp(argv, HELP_TEXT);
 requireAuth();
 
 const jsonHeaders = {
@@ -153,37 +166,9 @@ async function main() {
 	const batchSize = parseInt(argv['batch-size'] || argv.b || '10000', 10);
 	const action = (argv.action || argv.a || 'REPLACE').toUpperCase();
 
-	if (argv.help || argv.h) {
-		console.log('Usage:');
-		console.log(
-			'  node cli.js upload-dataset --file "data.csv" --dataset-id "<id>"'
-		);
-		console.log(
-			'  node cli.js upload-dataset --file "data.csv" --dataset-id "<id>" --batch-size 50000'
-		);
-		console.log(
-			'  node cli.js upload-dataset --file "data.csv" --dataset-id "<id>" --action APPEND'
-		);
-		console.log('\nOptions:');
-		console.log('  --file, -f        Path to the CSV file to upload (required)');
-		console.log('  --dataset-id, -d  DataSet ID to upload to (required)');
-		console.log('  --batch-size, -b  Number of rows per upload part (default: 10000)');
-		console.log('  --action, -a    REPLACE or APPEND (default: REPLACE)');
-		process.exit(0);
-	}
-
 	if (!filePath) {
-		console.error('Error: --file parameter is required');
-		console.error('\nUsage:');
-		console.error(
-			'  node cli.js upload-dataset --file "data.csv" --dataset-id "<id>"'
-		);
-		console.error(
-			'  node cli.js upload-dataset --file "data.csv" --dataset-id "<id>" --batch-size 50000'
-		);
-		console.error(
-			'  node cli.js upload-dataset --file "data.csv" --dataset-id "<id>" --action APPEND'
-		);
+		console.error('Error: --file parameter is required\n');
+		console.error(HELP_TEXT);
 		process.exit(1);
 	}
 

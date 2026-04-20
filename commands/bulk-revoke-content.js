@@ -23,10 +23,26 @@
 const api = require('../lib/api');
 const { readCSV } = require('../lib/csv');
 const { baseUrl } = require('../lib/config');
+const { showHelp } = require('../lib/help');
 const fs = require('fs');
 const argv = require('minimist')(process.argv.slice(2));
 
+const HELP_TEXT = `Usage: node cli.js bulk-revoke-content [options]
+
+Revoke access to content in bulk using a CSV or JSON file of content IDs.
+
+Options:
+  --file           CSV or JSON file with content IDs (required)
+  --user           User ID to revoke from (required if --group not set)
+  --group          Group ID to revoke from (required if --user not set)
+  --content-type   Content type: card, badge, page, dataApp, alert (required)
+
+CSV format: Must have one of these columns: "Object ID", "Entity ID", or "id".
+JSON format: Must be an array of integers.`;
+
 async function main() {
+	showHelp(argv, HELP_TEXT);
+
 	const validContentTypes = ['card', 'badge', 'page', 'dataapp', 'alert'];
 
 	// Validate parameters

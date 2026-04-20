@@ -14,9 +14,19 @@
  */
 
 const { baseUrl, accessToken, requireAuth } = require('../lib/config');
+const { showHelp } = require('../lib/help');
 const fs = require('fs');
 const argv = require('minimist')(process.argv.slice(2));
 
+const HELP_TEXT = `Usage:
+  node cli.js bulk-export-dataset-versions --dataset-id "00000000-0000-0000-0000-000000000000"
+  node cli.js bulk-export-dataset-versions --dataset-id "00000000-0000-0000-0000-000000000000" --start-version-id 5
+
+Options:
+  --dataset-id        DataSet ID to export versions from (required)
+  --start-version-id  Version number to start from (default: 1)`;
+
+showHelp(argv, HELP_TEXT);
 requireAuth();
 
 async function getDataVersion(datasetId, versionId) {
@@ -45,32 +55,12 @@ async function getDataVersion(datasetId, versionId) {
 }
 
 async function main() {
-	if (argv.help || argv.h) {
-		console.log('Usage:');
-		console.log(
-			'  node cli.js bulk-export-dataset-versions --dataset-id "00000000-0000-0000-0000-000000000000"'
-		);
-		console.log(
-			'  node cli.js bulk-export-dataset-versions --dataset-id "00000000-0000-0000-0000-000000000000" --start-version-id 5'
-		);
-		console.log('\nOptions:');
-		console.log('  --dataset-id        DataSet ID to export versions from (required)');
-		console.log('  --start-version-id  Version number to start from (default: 1)');
-		process.exit(0);
-	}
-
 	const datasetId = argv['dataset-id'];
 	let startVersionId = parseInt(argv['start-version-id'], 10) || 1;
 
 	if (!datasetId) {
-		console.error('Error: --dataset-id parameter is required');
-		console.log('\nUsage:');
-		console.log(
-			'  node cli.js bulk-export-dataset-versions --dataset-id "00000000-0000-0000-0000-000000000000"'
-		);
-		console.log(
-			'  node cli.js bulk-export-dataset-versions --dataset-id "00000000-0000-0000-0000-000000000000" --start-version-id 5'
-		);
+		console.error('Error: --dataset-id parameter is required\n');
+		console.error(HELP_TEXT);
 		process.exit(1);
 	}
 

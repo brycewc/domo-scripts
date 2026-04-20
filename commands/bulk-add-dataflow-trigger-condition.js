@@ -27,7 +27,26 @@
 const api = require('../lib/api');
 const { resolveIds } = require('../lib/input');
 const { createLogger } = require('../lib/log');
+const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const HELP_TEXT = `Usage:
+  node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv"
+  node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv" --column "id"
+  node cli.js bulk-add-dataflow-trigger-condition --dataflow-id 123
+  node cli.js bulk-add-dataflow-trigger-condition --dataflow-ids "123,456,789"
+
+Options:
+  --file, -f       CSV file with dataflow IDs
+  --column, -c     CSV column name containing dataflow IDs (default: "DataFlow ID")
+  --dataflow-id    Single dataflow ID (enables debug logging)
+  --dataflow-ids   Comma-separated dataflow IDs
+  --filter-column  CSV column to filter on
+  --filter-value   Value the filter-column must equal
+  --value          Condition value (default: 1440)
+  --unit           Condition unit (default: "MINUTE")
+  --no-negated     Set negated to false (default: negated is true)
+  --type           Condition type (default: "DATAFLOW_LAST_RUN")`;
 
 const CONDITION_TO_ADD = {
 	value: argv.value !== undefined ? argv.value : 1440,
@@ -99,44 +118,12 @@ function addTriggerConditions(definition) {
 	return { modified: triggersUpdated > 0, triggersUpdated };
 }
 
-function printUsage() {
-	console.log('Usage:');
-	console.log(
-		'  node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv"'
-	);
-	console.log(
-		'  node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv" --column "id"'
-	);
-	console.log(
-		'  node cli.js bulk-add-dataflow-trigger-condition --dataflow-id 123'
-	);
-	console.log(
-		'  node cli.js bulk-add-dataflow-trigger-condition --dataflow-ids "123,456,789"'
-	);
-	console.log('\nOptions:');
-	console.log('  --file, -f       CSV file with dataflow IDs');
-	console.log(
-		'  --column, -c     CSV column name containing dataflow IDs (default: "DataFlow ID")'
-	);
-	console.log('  --dataflow-id    Single dataflow ID (enables debug logging)');
-	console.log('  --dataflow-ids   Comma-separated dataflow IDs');
-	console.log('  --filter-column  CSV column to filter on');
-	console.log('  --filter-value   Value the filter-column must equal');
-	console.log('  --value          Condition value (default: 1440)');
-	console.log('  --unit           Condition unit (default: "MINUTE")');
-	console.log('  --no-negated     Set negated to false (default: negated is true)');
-	console.log('  --type           Condition type (default: "DATAFLOW_LAST_RUN")');
-}
-
 async function main() {
-	if (argv.help || argv.h) {
-		printUsage();
-		process.exit(0);
-	}
+	showHelp(argv, HELP_TEXT);
 
 	if (!argv.file && !argv.f && !argv['dataflow-id'] && !argv['dataflow-ids']) {
 		console.error('Error: --file, --dataflow-id, or --dataflow-ids is required\n');
-		printUsage();
+		console.error(HELP_TEXT);
 		process.exit(1);
 	}
 

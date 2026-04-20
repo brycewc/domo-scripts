@@ -23,7 +23,20 @@
 
 const api = require('../lib/api');
 const { resolveIds } = require('../lib/input');
+const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const HELP_TEXT = `Usage: node cli.js bulk-delete-datasets [options]
+
+WARNING: This is a destructive operation.
+
+Options:
+  --file, -f     CSV file with dataset IDs
+  --dataset-id   Single dataset ID
+  --dataset-ids  Comma-separated dataset IDs
+  --column, -c   CSV column with dataset IDs (default: "DataSet ID")
+  --batch-size   Datasets per bulk API call (default: 50)
+  --dry-run      Preview without deleting`;
 
 async function bulkDeleteDatasets(ids) {
 	return api.post('/data/v1/ui/bulk/delete', {
@@ -37,18 +50,7 @@ async function deleteSingleDataset(id) {
 }
 
 async function main() {
-	if (argv.help || argv.h) {
-		console.log('Usage: node cli.js bulk-delete-datasets [options]\n');
-		console.log('WARNING: This is a destructive operation.\n');
-		console.log('Options:');
-		console.log('  --file, -f     CSV file with dataset IDs');
-		console.log('  --dataset-id   Single dataset ID');
-		console.log('  --dataset-ids  Comma-separated dataset IDs');
-		console.log('  --column, -c   CSV column with dataset IDs (default: "DataSet ID")');
-		console.log('  --batch-size   Datasets per bulk API call (default: 50)');
-		console.log('  --dry-run      Preview without deleting');
-		process.exit(0);
-	}
+	showHelp(argv, HELP_TEXT);
 
 	const batchSize = parseInt(argv['batch-size'] || argv.b || '50', 10);
 	const dryRun = argv['dry-run'] || argv.dry || false;

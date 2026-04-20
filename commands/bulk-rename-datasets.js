@@ -15,10 +15,21 @@
 
 const api = require('../lib/api');
 const { instanceUrl } = require('../lib/config');
+const { showHelp } = require('../lib/help');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
 
 const PAGE_SIZE = 100;
+
+const HELP_TEXT = `Usage: node cli.js bulk-rename-datasets [options]
+
+Bulk rename Domo datasets by searching for a substring and replacing it.
+
+Options:
+  --search, -s       Substring to find in dataset names (required)
+  --replace, -r      Replacement string (required)
+  --case-sensitive   Perform case-sensitive matching (default: false)
+  --dry-run          Preview changes without applying them`;
 
 function ask(question) {
 	const rl = readline.createInterface({
@@ -110,6 +121,8 @@ function buildNewName(originalName, searchStr, replaceStr, caseSensitive) {
 }
 
 async function main() {
+	showHelp(argv, HELP_TEXT);
+
 	const searchStr = argv.search || argv.s;
 	const replaceStr = argv.replace || argv.r;
 	const caseSensitive = argv['case-sensitive'] || argv.c || false;

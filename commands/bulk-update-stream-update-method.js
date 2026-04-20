@@ -18,7 +18,20 @@
 
 const api = require('../lib/api');
 const { resolveIds } = require('../lib/input');
+const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const HELP_TEXT = `Usage: node cli.js bulk-update-stream-update-method [options]
+
+Bulk update Domo streams to change update mode from Replace to Append.
+
+Options:
+  --file, -f        CSV file with stream IDs
+  --stream-id       Single stream ID
+  --stream-ids      Comma-separated stream IDs
+  --column, -c      CSV column containing stream IDs (default: "streamId")
+  --filter-column   CSV column to filter on (optional, requires --filter-value)
+  --filter-value    Value the filter-column must equal to include the row`;
 
 function modifyUpdateMode(streamDefinition) {
 	if (!streamDefinition.configuration || !Array.isArray(streamDefinition.configuration)) {
@@ -60,6 +73,8 @@ function modifyUpdateMode(streamDefinition) {
 }
 
 async function main() {
+	showHelp(argv, HELP_TEXT);
+
 	const { ids: streamIds } = resolveIds(argv, {
 		name: 'stream',
 		columnDefault: 'streamId'

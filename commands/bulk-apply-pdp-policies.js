@@ -25,7 +25,20 @@
 
 const api = require('../lib/api');
 const { resolveIds } = require('../lib/input');
+const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const HELP_TEXT = `Usage: node cli.js bulk-apply-pdp-policies [options]
+
+Options:
+  --file, -f          CSV file with target dataset IDs
+  --dataset-id        Single target dataset ID
+  --dataset-ids       Comma-separated target dataset IDs
+  --column, -c        CSV column with dataset IDs (default: "DataSet ID")
+  --source-dataset-id Source dataset to copy policies from (required)
+  --allowed-columns   Allowed PDP filter columns, comma-separated (required)
+  --all-rows-users    User IDs for the All Rows policy
+  --all-rows-groups   Group IDs for the All Rows policy`;
 
 
 async function getPdpPolicies(datasetId) {
@@ -80,19 +93,7 @@ async function createPdpPolicy(datasetId, policy) {
 }
 
 async function main() {
-	if (argv.help || argv.h) {
-		console.log('Usage: node cli.js bulk-apply-pdp-policies [options]\n');
-		console.log('Options:');
-		console.log('  --file, -f          CSV file with target dataset IDs');
-		console.log('  --dataset-id        Single target dataset ID');
-		console.log('  --dataset-ids       Comma-separated target dataset IDs');
-		console.log('  --column, -c        CSV column with dataset IDs (default: "DataSet ID")');
-		console.log('  --source-dataset-id Source dataset to copy policies from (required)');
-		console.log('  --allowed-columns   Allowed PDP filter columns, comma-separated (required)');
-		console.log('  --all-rows-users    User IDs for the All Rows policy');
-		console.log('  --all-rows-groups   Group IDs for the All Rows policy');
-		process.exit(0);
-	}
+	showHelp(argv, HELP_TEXT);
 
 	const sourceDatasetId = argv['source-dataset-id'] || argv.s;
 	if (!sourceDatasetId) {

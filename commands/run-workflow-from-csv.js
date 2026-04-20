@@ -12,23 +12,20 @@
 
 const fs = require('fs');
 const { parse } = require('csv-parse/sync');
+const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
 
-if (argv.help || argv.h) {
-	console.log('Usage:');
-	console.log(
-		'  node cli.js run-workflow-from-csv --workflow-id "<id>" --file "/path/to/data.csv"'
-	);
-	console.log(
-		'  node cli.js run-workflow-from-csv --workflow-id "<id>" --file "/path/to/data.csv" --numeric-columns "hireDate,salary"'
-	);
-	console.log('\nOptions:');
-	console.log('  --workflow-id, -w       Workflow model ID (required)');
-	console.log('  --file, -f              Path to the CSV file (required)');
-	console.log('  --numeric-columns, -n   Comma-separated column names to parse as integers');
-	console.log('  --help, -h              Show this help message');
-	process.exit(0);
-}
+const HELP_TEXT = `Usage:
+  node cli.js run-workflow-from-csv --workflow-id "<id>" --file "/path/to/data.csv"
+  node cli.js run-workflow-from-csv --workflow-id "<id>" --file "/path/to/data.csv" --numeric-columns "hireDate,salary"
+
+Options:
+  --workflow-id, -w       Workflow model ID (required)
+  --file, -f              Path to the CSV file (required)
+  --numeric-columns, -n   Comma-separated column names to parse as integers
+  --help, -h              Show this help message`;
+
+showHelp(argv, HELP_TEXT);
 
 const { api } = require('../lib');
 
