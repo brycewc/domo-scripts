@@ -47,31 +47,34 @@ All shared code is re-exported from [lib/index.js](lib/index.js), so commands ca
 const { api, config, readCSV, resolveIds, createLogger } = require('../lib');
 ```
 
-| Module | Exports | Purpose |
-|--------|---------|---------|
-| [config.js](lib/config.js) | `instance`, `instanceUrl`, `baseUrl`, `accessToken`, `requireAuth()` | Reads `.env` via dotenv. `requireAuth()` exits with an error if token is missing — called lazily so `--help` works without a `.env`. |
-| [api.js](lib/api.js) | `get(path)`, `put(path, body)`, `post(path, body)`, `del(path)` | Authenticated Domo API client. Paths are relative to `baseUrl` (e.g. `/data/v1/streams/123`). Automatically sets `X-DOMO-Developer-Token` and `Content-Type: application/json`. Throws on non-OK responses. |
-| [csv.js](lib/csv.js) | `readCSV(filePath, { column, filterColumn, filterValue })` | Parses CSV with optional row filtering and column extraction. Returns extracted values (if `column` set) or full record objects. |
-| [input.js](lib/input.js) | `resolveIds(argv, { name, columnDefault })` | Resolves entity IDs from `--file` (CSV), `--<name>-id` (single, enables debug mode), or `--<name>-ids` (comma-separated). Also handles `--column`, `--filter-column`, `--filter-value`. Returns `{ ids, debugMode }`. |
-| [log.js](lib/log.js) | `createLogger(commandName, { debugMode, dryRun, runMeta })` | Returns `{ writeDebugLog(itemId, data), addResult(entry), writeRunLog(summary) }`. In debug mode (single-ID), writes per-item JSON logs. In bulk mode, collects results and writes a summary run log. Logs go to `logs/<commandName>/`. Dry-run logs are prefixed with `dry_`. |
+| Module                     | Exports                                                              | Purpose                                                                                                                                                                                                                                                                        |
+| -------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [config.js](lib/config.js) | `instance`, `instanceUrl`, `baseUrl`, `accessToken`, `requireAuth()` | Reads `.env` via dotenv. `requireAuth()` exits with an error if token is missing — called lazily so `--help` works without a `.env`.                                                                                                                                           |
+| [api.js](lib/api.js)       | `get(path)`, `put(path, body)`, `post(path, body)`, `del(path)`      | Authenticated Domo API client. Paths are relative to `baseUrl` (e.g. `/data/v1/streams/123`). Automatically sets `X-DOMO-Developer-Token` and `Content-Type: application/json`. Throws on non-OK responses.                                                                    |
+| [csv.js](lib/csv.js)       | `readCSV(filePath, { column, filterColumn, filterValue })`           | Parses CSV with optional row filtering and column extraction. Returns extracted values (if `column` set) or full record objects.                                                                                                                                               |
+| [input.js](lib/input.js)   | `resolveIds(argv, { name, columnDefault })`                          | Resolves entity IDs from `--file` (CSV), `--<name>-id` (single, enables debug mode), or `--<name>-ids` (comma-separated). Also handles `--column`, `--filter-column`, `--filter-value`. Returns `{ ids, debugMode }`.                                                          |
+| [log.js](lib/log.js)       | `createLogger(commandName, { debugMode, dryRun, runMeta })`          | Returns `{ writeDebugLog(itemId, data), addResult(entry), writeRunLog(summary) }`. In debug mode (single-ID), writes per-item JSON logs. In bulk mode, collects results and writes a summary run log. Logs go to `logs/<commandName>/`. Dry-run logs are prefixed with `dry_`. |
 
 ### Commands (commands/)
 
-17 command modules, each a standalone async script loaded by `cli.js`. Filenames are kebab-case matching the command name (e.g. `node cli.js bulk-update-stream-schedules` loads `commands/bulk-update-stream-schedules.js`).
+18 command modules, each a standalone async script loaded by `cli.js`. Filenames are kebab-case matching the command name (e.g. `node cli.js bulk-update-stream-schedules` loads `commands/bulk-update-stream-schedules.js`).
 
 **When adding a new command:**
+
 1. Create `commands/your-command.js`
 2. Add an entry to the `commands` map in `cli.js`
 3. Use shared libs instead of manual fetch/CSV/logging code
 4. Add `--help` handling early in main (before `requireAuth` is triggered)
 
 Key categories:
+
 - **Bulk tagging/triggers**: `bulk-add-dataflow-tags`, `bulk-add-dataset-tags`, `bulk-add-dataflow-trigger-condition`
 - **Bulk deletion**: `bulk-delete-datasets`
 - **Bulk rename**: `bulk-rename-dataflows`, `bulk-rename-datasets`
 - **PDP policies**: `bulk-apply-pdp-policies`, `bulk-update-column-pdp-policy`
 - **Content access**: `bulk-share-content`, `bulk-revoke-content`
 - **Stream/schedule management**: `bulk-update-stream-schedules`, `bulk-update-stream-update-method`, `bulk-convert-stream-provider`
+- **Ownership management**: `bulk-transfer-ownership`
 - **DataFlow management**: `swap-input-in-dataflows`
 - **Data upload/export**: `upload-dataset`, `bulk-export-dataset-versions`
 - **Utilities**: `extract-card-ids`
@@ -79,6 +82,7 @@ Key categories:
 ### Logs
 
 Written to `logs/<commandName>/` (git-ignored). Two log types:
+
 - **Debug logs** (`debug_<itemId>_<timestamp>.json`) — detailed per-item logs in single-ID mode (`--<entity>-id`)
 - **Run logs** (`run_<timestamp>.json`) — summary with all results in bulk mode
 - Dry-run variants prefixed with `dry_`
