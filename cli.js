@@ -17,6 +17,7 @@ const commands = {
 	'bulk-update-column-pdp-policy': './commands/bulk-update-column-pdp-policy',
 	'bulk-update-stream-schedules': './commands/bulk-update-stream-schedules',
 	'bulk-update-stream-update-method': './commands/bulk-update-stream-update-method',
+	'bulk-update-users': './commands/bulk-update-users',
 	'extract-card-ids': './commands/extract-card-ids',
 	'swap-input-in-dataflows': './commands/swap-input-in-dataflows',
 	'upload-dataset': './commands/upload-dataset'
