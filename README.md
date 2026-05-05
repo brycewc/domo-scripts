@@ -64,6 +64,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-convert-stream-provider` | Convert streams from one connector type to another |
 | `bulk-delete-datasets` | Delete datasets listed in a CSV |
 | `bulk-export-dataset-versions` | Export historical versions of a dataset |
+| `bulk-list-user-content` | List everything a set of users own (datasets, cards, pages, etc.) into a single CSV — one row per (user, object) |
 | `bulk-rename-dataflows` | Find/replace in dataflow names across the instance |
 | `bulk-rename-datasets` | Find/replace in dataset names across the instance |
 | `bulk-revoke-content` | Revoke access to content in bulk |

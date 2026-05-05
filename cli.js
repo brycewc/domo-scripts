@@ -10,6 +10,7 @@ const commands = {
 	'bulk-rename-datasets': './commands/bulk-rename-datasets',
 	'bulk-convert-stream-provider': './commands/bulk-convert-stream-provider',
 	'bulk-export-dataset-versions': './commands/bulk-export-dataset-versions',
+	'bulk-list-user-content': './commands/bulk-list-user-content',
 	'bulk-revoke-content': './commands/bulk-revoke-content',
 	'bulk-share-content': './commands/bulk-share-content',
 	'bulk-transfer-ownership': './commands/bulk-transfer-ownership',
