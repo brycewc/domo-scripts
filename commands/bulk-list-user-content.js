@@ -41,8 +41,11 @@ Optional:
   --help                 Show this help
 
 Output CSV columns: User ID, User Name, Object Type, Object ID, Object Name
+The "Object Type" column uses the activity-log naming (e.g. DATA_SOURCE,
+DATAFLOW_TYPE, RYUU_APP) so rows can be joined directly with audit-log exports.
 
-Object types (case-insensitive, hyphens or underscores both accepted):
+Object types accepted by --object-types (case-insensitive, hyphens or
+underscores both accepted):
   account, ai-model, ai-project, alert, app-studio, approval, beast-mode, card,
   code-engine, collection, custom-app, dataflow, dataset, fileset, goal, group,
   jupyter, metric, page, project, project-task, publication, queue, repository,
@@ -93,6 +96,42 @@ for (const [canonical, aliases] of Object.entries(TYPE_ALIASES)) {
 	for (const alias of aliases) ALIAS_TO_CANONICAL[alias] = canonical;
 }
 const ALL_TYPES = Object.keys(TYPE_ALIASES);
+
+// Maps canonical kebab-case types to the labels used in Domo activity-log
+// exports, so the CSV "Object Type" column joins cleanly with audit logs.
+const TYPE_TO_ACTIVITY_LOG = {
+	account: 'ACCOUNT',
+	'ai-model': 'AI_MODEL',
+	'ai-project': 'AI_PROJECT',
+	alert: 'ALERT',
+	'app-studio': 'DATA_APP',
+	approval: 'APPROVAL',
+	'beast-mode': 'BEAST_MODE_FORMULA',
+	card: 'CARD',
+	'code-engine': 'CODEENGINE_PACKAGE',
+	collection: 'MAGNUM_COLLECTION',
+	'custom-app': 'RYUU_APP',
+	dataflow: 'DATAFLOW_TYPE',
+	dataset: 'DATA_SOURCE',
+	fileset: 'FILESET',
+	goal: 'OBJECTIVE',
+	group: 'GROUP',
+	jupyter: 'DATA_SCIENCE_NOTEBOOK',
+	metric: 'METRIC',
+	page: 'PAGE',
+	project: 'PROJECT',
+	'project-task': 'PROJECT_TASK',
+	publication: 'PUBLICATION',
+	queue: 'HOPPER_QUEUE',
+	repository: 'REPOSITORY',
+	subscription: 'SUBSCRIPTION',
+	task: 'HOPPER_TASK',
+	template: 'TEMPLATE',
+	variable: 'VARIABLE',
+	workflow: 'WORKFLOW_MODEL',
+	worksheet: 'WORKSHEET',
+	workspace: 'WORKSPACE'
+};
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -1008,8 +1047,9 @@ async function _main() {
 				const items = await listForUserAndType(type, userId, caches, userCache);
 				console.log(`  ${type}: ${items.length}`);
 				if (items.length > 0) {
+					const activityType = TYPE_TO_ACTIVITY_LOG[type] || type;
 					const rows = items.map((item) =>
-						csvRow([userId, userName, type, item.id ?? '', item.name ?? ''])
+						csvRow([userId, userName, activityType, item.id ?? '', item.name ?? ''])
 					);
 					fs.appendFileSync(outputFile, rows.join(''));
 				}

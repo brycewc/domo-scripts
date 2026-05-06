@@ -36,8 +36,9 @@ node cli.js bulk-delete-datasets --file "datasets.csv" --column "DataSet ID" --d
 ### Configuration
 
 - [.env](.env) — Environment variables: `DOMO_ACCESS_TOKEN` (required) and `DOMO_INSTANCE` (defaults to `"domo"`). Git-ignored.
+- [.env.&lt;name&gt;](.env.example) — Per-environment overrides selected at runtime with `--env <name>` (e.g. `.env.prod`, `.env.sandbox`). Loaded in addition to `.env`. Git-ignored.
 - [.env.example](.env.example) — Template for `.env`.
-- [idMapping.json](idMapping.json) — Maps old IDs to new IDs (accounts, providers, users, streams, datasets, dataflows) for cross-instance migration. Used by `createDataflow`, `createStream`, and others. Not checked in — copy from source instance as needed.
+- [id-mappings/](id-mappings) — Per-env-pair old→new ID maps (`<source>_to_<target>.json`). Written by `transfer-stream` (and future migration commands). Each file holds arrays of `{ name, oldId, newId }` keyed by kind (`accounts`, `providers`, `users`, `streams`, `datasets`, `dataflows`). Git-ignored. Account/user/provider mappings must be populated manually before transferring assets that reference them.
 
 ### Shared Libraries (lib/)
 
@@ -49,15 +50,17 @@ const { api, config, readCSV, resolveIds, createLogger } = require('../lib');
 
 | Module                     | Exports                                                              | Purpose                                                                                                                                                                                                                                                                        |
 | -------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [config.js](lib/config.js) | `instance`, `instanceUrl`, `baseUrl`, `accessToken`, `requireAuth()` | Reads `.env` via dotenv. `requireAuth()` exits with an error if token is missing — called lazily so `--help` works without a `.env`.                                                                                                                                           |
-| [api.js](lib/api.js)       | `get(path)`, `put(path, body)`, `post(path, body)`, `del(path)`      | Authenticated Domo API client. Paths are relative to `baseUrl` (e.g. `/data/v1/streams/123`). Automatically sets `X-DOMO-Developer-Token` and `Content-Type: application/json`. Throws on non-OK responses.                                                                    |
+| [config.js](lib/config.js) | `instance`, `instanceUrl`, `baseUrl`, `accessToken`, `env`, `requireAuth()`, `loadEnvConfig(name)` | Reads `.env` via dotenv (and `.env.<name>` when `DOMO_ENV` / `--env` is set). Module-level exports describe the *default* instance. `loadEnvConfig(name)` reads a specific `.env.<name>` without touching `process.env` and returns `{ env, instance, instanceUrl, baseUrl, accessToken }` — used by transfer commands that need a second instance. |
+| [api.js](lib/api.js)       | `createApiClient({ baseUrl, accessToken, instance })`, plus default singleton: `get`, `put`, `post`, `patch`, `del`, `request` | The default singleton uses module-level config (and lazily calls `requireAuth()` on first request, so `--help` works without a token). Two-instance commands call `createApiClient(loadEnvConfig(name))` to get a second client bound to a different instance.                                                              |
+| [id-mapping.js](lib/id-mapping.js) | `loadMapping(sourceEnv, targetEnv)`, `translate(mapping, kind, oldId)`, `recordMapping(mapping, kind, entry)`, `saveMapping(mapping)`, `resolveOrPrompt(mapping, kind, oldId, opts)`, `KINDS` | Reads/writes `id-mappings/<source>_to_<target>.json`. `kind` is one of `accounts`, `providers`, `users`, `streams`, `datasets`, `dataflows`. Entries are `{ name, oldId, newId }`. Multiple env-pairs coexist — each pair has its own file. `resolveOrPrompt` looks up an ID and, if missing, prompts the user (via `readline/promises`) for the target-instance equivalent, persists the entry to disk, and returns the new ID. Returns `null` if the user enters blank (skip). Throws if stdin isn't a TTY and the default prompt would have been used. Use this in any transfer command that needs to translate IDs without forcing the user to pre-populate the mapping file. |
+| [rewrite.js](lib/rewrite.js) | `rewriteDomain(value, source, target) → { value, count }` | Recursively replaces every occurrence of `source` (e.g. `domo.domo.com`) with `target` in any string inside `value`. Walks arrays and plain objects. JSON-encoded strings (like Domo's `configuration[].value` blobs) are treated as ordinary strings — a literal substring replace inside the encoded form is still valid JSON because hostnames don't contain any characters JSON has to escape. Used by `transfer-stream`'s `--rewrite-domain` flag for Domo-on-Domo (governance) transfers. |
 | [csv.js](lib/csv.js)       | `readCSV(filePath, { column, filterColumn, filterValue })`           | Parses CSV with optional row filtering and column extraction. Returns extracted values (if `column` set) or full record objects.                                                                                                                                               |
 | [input.js](lib/input.js)   | `resolveIds(argv, { name, columnDefault })`                          | Resolves entity IDs from `--file` (CSV), `--<name>-id` (single, enables debug mode), or `--<name>-ids` (comma-separated). Also handles `--column`, `--filter-column`, `--filter-value`. Returns `{ ids, debugMode }`.                                                          |
-| [log.js](lib/log.js)       | `createLogger(commandName, { debugMode, dryRun, runMeta })`          | Returns `{ writeDebugLog(itemId, data), addResult(entry), writeRunLog(summary) }`. In debug mode (single-ID), writes per-item JSON logs. In bulk mode, collects results and writes a summary run log. Logs go to `logs/<commandName>/`. Dry-run logs are prefixed with `dry_`. |
+| [log.js](lib/log.js)       | `createLogger(commandName, { debugMode, dryRun, runMeta, instances })` | Returns `{ writeDebugLog(itemId, data), addResult(entry), writeRunLog(summary) }`. In debug mode (single-ID), writes per-item JSON logs. In bulk mode, collects results and writes a summary run log. Logs go to `logs/<commandName>/`. Dry-run logs are prefixed with `dry_`. Single-instance runs stamp `env`/`instance`; if `instances: { source, target }` is passed (transfer commands), that replaces the single-instance fields. |
 
 ### Commands (commands/)
 
-18 command modules, each a standalone async script loaded by `cli.js`. Filenames are kebab-case matching the command name (e.g. `node cli.js bulk-update-stream-schedules` loads `commands/bulk-update-stream-schedules.js`).
+19 command modules, each a standalone async script loaded by `cli.js`. Filenames are kebab-case matching the command name (e.g. `node cli.js bulk-update-stream-schedules` loads `commands/bulk-update-stream-schedules.js`).
 
 **When adding a new command:**
 
@@ -74,6 +77,7 @@ Key categories:
 - **PDP policies**: `bulk-apply-pdp-policies`, `bulk-update-column-pdp-policy`
 - **Content access**: `bulk-share-content`, `bulk-unshare-content`
 - **Stream/schedule management**: `bulk-update-stream-schedules`, `bulk-update-stream-update-method`, `bulk-convert-stream-provider`
+- **Cross-instance migration**: `transfer-stream` (uses `--source-env` / `--target-env` + `id-mappings/`)
 - **Ownership management**: `bulk-transfer-ownership`
 - **DataFlow management**: `swap-input-in-dataflows`
 - **Data upload/export**: `upload-dataset`, `bulk-export-dataset-versions`

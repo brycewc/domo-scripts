@@ -6,6 +6,7 @@ const commands = {
 	'bulk-add-dataset-tags': './commands/bulk-add-dataset-tags',
 	'bulk-apply-pdp-policies': './commands/bulk-apply-pdp-policies',
 	'bulk-delete-datasets': './commands/bulk-delete-datasets',
+	'bulk-delete-users': './commands/bulk-delete-users',
 	'bulk-rename-dataflows': './commands/bulk-rename-dataflows',
 	'bulk-rename-datasets': './commands/bulk-rename-datasets',
 	'bulk-convert-stream-provider': './commands/bulk-convert-stream-provider',
@@ -22,14 +23,35 @@ const commands = {
 	'bulk-update-users': './commands/bulk-update-users',
 	'extract-card-ids': './commands/extract-card-ids',
 	'swap-input-in-dataflows': './commands/swap-input-in-dataflows',
+	'transfer-stream': './commands/transfer-stream',
 	'upload-dataset': './commands/upload-dataset'
 };
+
+// Strip --env <name> / --env=<name> from argv anywhere it appears, so it works
+// before or after the command name. Set DOMO_ENV before any command (and thus
+// lib/config.js) is loaded.
+for (let i = 2; i < process.argv.length; i++) {
+	const a = process.argv[i];
+	if (a === '--env' && i + 1 < process.argv.length) {
+		process.env.DOMO_ENV = process.argv[i + 1];
+		process.argv.splice(i, 2);
+		break;
+	}
+	if (a.startsWith('--env=')) {
+		process.env.DOMO_ENV = a.slice('--env='.length);
+		process.argv.splice(i, 1);
+		break;
+	}
+}
 
 const name = process.argv[2];
 
 if (!name || name === '--help' || name === '-h' || name === 'help') {
 	console.log('domo-scripts — CLI tools for managing Domo instances\n');
-	console.log('Usage: node cli.js <command> [options]\n');
+	console.log('Usage: node cli.js [--env <name>] <command> [options]\n');
+	console.log('Global options:');
+	console.log('  --env <name>    Load .env.<name> instead of (or in addition to) .env');
+	console.log('');
 	console.log('Commands:');
 	for (const cmd of Object.keys(commands).sort()) {
 		console.log(`  ${cmd}`);

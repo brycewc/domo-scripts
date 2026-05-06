@@ -20,10 +20,39 @@ DOMO_ACCESS_TOKEN=your-access-token
 
 The instance name is the subdomain from your Domo URL (`https://<instance>.domo.com`).
 
+### Multiple Environments
+
+To target more than one Domo instance, create a per-environment file alongside `.env`:
+
+```
+.env.prod        # DOMO_INSTANCE=acme-prod, DOMO_ACCESS_TOKEN=...
+.env.sandbox     # DOMO_INSTANCE=acme-sandbox, DOMO_ACCESS_TOKEN=...
+```
+
+Select one at runtime with `--env <name>`:
+
+```bash
+node cli.js --env prod bulk-rename-datasets --file ds.csv
+node cli.js --env sandbox bulk-rename-datasets --file ds.csv --dry-run
+```
+
+`.env.*` files are git-ignored. A bare `.env` is still loaded as a fallback for any shared defaults.
+
+### Transferring Between Instances
+
+Migration commands (e.g. `transfer-stream`) operate on two instances at once. Pass both env names:
+
+```bash
+node cli.js transfer-stream --source-env prod --target-env sandbox --stream-id 12345
+node cli.js transfer-stream --source-env prod --target-env sandbox --file streams.csv --dry-run
+```
+
+Each transfer records old→new IDs in `id-mappings/<source>_to_<target>.json` (also git-ignored), so multiple instance pairs can coexist (`prod_to_sandbox.json`, `prod_to_dev.json`, etc.). Some kinds — accounts, users, providers — must be pre-populated by hand before transferring assets that reference them; commands abort with a clear error if a required mapping is missing.
+
 ## Usage
 
 ```bash
-node cli.js <command> [options]
+node cli.js [--env <name>] <command> [options]
 node cli.js --help                    # List all commands
 node cli.js <command> --help          # Command-specific options
 ```
@@ -63,6 +92,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-apply-pdp-policies` | Copy PDP policies from a source dataset to target datasets |
 | `bulk-convert-stream-provider` | Convert streams from one connector type to another |
 | `bulk-delete-datasets` | Delete datasets listed in a CSV |
+| `bulk-delete-users` | Delete users listed in a CSV. Does not check or transfer ownership — prompts for confirmation. |
 | `bulk-export-dataset-versions` | Export historical versions of a dataset |
 | `bulk-list-user-content` | List everything a set of users own (datasets, cards, pages, etc.) into a single CSV — one row per (user, object) |
 | `bulk-rename-dataflows` | Find/replace in dataflow names across the instance |
@@ -76,6 +106,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-update-stream-update-method` | Change stream update mode from Replace to Append |
 | `extract-card-ids` | Extract card IDs from a page export JSON |
 | `swap-input-in-dataflows` | Replace a dataset input across all consuming dataflows |
+| `transfer-stream` | Copy a stream (and its input dataset) from one instance to another |
 | `upload-dataset` | Upload CSV data to a dataset in configurable batches |
 
 ## Common Options
@@ -107,7 +138,9 @@ domo-scripts/
 ├── commands/           # One file per command (17 total)
 ├── logs/               # Generated run/debug logs (git-ignored)
 ├── .env                # Your credentials (git-ignored)
-└── .env.example        # Template for .env
+├── .env.<name>         # Per-environment credentials, selected with --env (git-ignored)
+├── .env.example        # Template for .env
+└── id-mappings/        # Per-env-pair old→new ID mappings, written by transfer commands (git-ignored)
 ```
 
 ### Adding a New Command
