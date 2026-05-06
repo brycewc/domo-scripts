@@ -1,19 +1,19 @@
 /**
- * Revoke access to content in bulk using an array of content IDs from a JSON or CSV file
+ * Unshare content in bulk using an array of content IDs from a JSON or CSV file
  *
  * Usage:
- *   node cli.js bulk-revoke-content --file "cards-diff.json" --user "1250228141" --content-type "card"
- *   node cli.js bulk-revoke-content --file "cards-diff.json" --group "12345" --content-type "badge"
- *   node cli.js bulk-revoke-content --file "file.csv" --user "142591333" --content-type "card"
- *   node cli.js bulk-revoke-content --file "file.csv" --user "142591333" --content-type "page"
- *   node cli.js bulk-revoke-content --file "page-ids.json" --user "1250228141" --content-type "page"
- *   node cli.js bulk-revoke-content --file "app-ids.json" --group "12345" --content-type "dataApp"
- *   node cli.js bulk-revoke-content --file "alert-ids.json" --user "1250228141" --content-type "alert"
+ *   node cli.js bulk-unshare-content --file "cards-diff.json" --user "1250228141" --content-type "card"
+ *   node cli.js bulk-unshare-content --file "cards-diff.json" --group "12345" --content-type "badge"
+ *   node cli.js bulk-unshare-content --file "file.csv" --user "142591333" --content-type "card"
+ *   node cli.js bulk-unshare-content --file "file.csv" --user "142591333" --content-type "page"
+ *   node cli.js bulk-unshare-content --file "page-ids.json" --user "1250228141" --content-type "page"
+ *   node cli.js bulk-unshare-content --file "app-ids.json" --group "12345" --content-type "dataApp"
+ *   node cli.js bulk-unshare-content --file "alert-ids.json" --user "1250228141" --content-type "alert"
  *
  * Options:
  *   --file             CSV or JSON file with content IDs (required)
- *   --user             User ID to revoke from (required if --group not set)
- *   --group            Group ID to revoke from (required if --user not set)
+ *   --user             User ID to unshare from (required if --group not set)
+ *   --group            Group ID to unshare from (required if --user not set)
  *   --content-type     Content type: card, badge, page, dataApp, alert (required)
  *
  * CSV format: Must have one of these columns: "Object ID", "Entity ID", or "id".
@@ -27,14 +27,14 @@ const { showHelp } = require('../lib/help');
 const fs = require('fs');
 const argv = require('minimist')(process.argv.slice(2));
 
-const HELP_TEXT = `Usage: node cli.js bulk-revoke-content [options]
+const HELP_TEXT = `Usage: node cli.js bulk-unshare-content [options]
 
-Revoke access to content in bulk using a CSV or JSON file of content IDs.
+Unshare content in bulk using a CSV or JSON file of content IDs.
 
 Options:
   --file           CSV or JSON file with content IDs (required)
-  --user           User ID to revoke from (required if --group not set)
-  --group          Group ID to revoke from (required if --user not set)
+  --user           User ID to unshare from (required if --group not set)
+  --group          Group ID to unshare from (required if --user not set)
   --content-type   Content type: card, badge, page, dataApp, alert (required)
 
 CSV format: Must have one of these columns: "Object ID", "Entity ID", or "id".
@@ -136,7 +136,7 @@ async function main() {
 	const endpoint = `/content/v1/share/bulk/${contentType}/${recipientType}/${recipientId}`;
 
 	console.log(
-		`Revoking access to ${contentIds.length} ${displayType}s for ${recipientType} ${recipientId}...`
+		`Unsharing ${contentIds.length} ${displayType}s from ${recipientType} ${recipientId}...`
 	);
 	console.log(`Endpoint: ${baseUrl}${endpoint}`);
 	console.log('Processing in batches of 50...');
@@ -215,7 +215,7 @@ async function main() {
 		}
 	}
 
-	// Special handling for dataapps: remove group 144874194 as owner after revoking
+	// Special handling for dataapps: remove group 144874194 as owner after unsharing
 	if (contentType === 'dataapp') {
 		console.log(
 			'\n=== Removing group 144874194 as owner from all dataapps ==='

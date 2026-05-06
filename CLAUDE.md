@@ -72,7 +72,7 @@ Key categories:
 - **Bulk deletion**: `bulk-delete-datasets`
 - **Bulk rename**: `bulk-rename-dataflows`, `bulk-rename-datasets`
 - **PDP policies**: `bulk-apply-pdp-policies`, `bulk-update-column-pdp-policy`
-- **Content access**: `bulk-share-content`, `bulk-revoke-content`
+- **Content access**: `bulk-share-content`, `bulk-unshare-content`
 - **Stream/schedule management**: `bulk-update-stream-schedules`, `bulk-update-stream-update-method`, `bulk-convert-stream-provider`
 - **Ownership management**: `bulk-transfer-ownership`
 - **DataFlow management**: `swap-input-in-dataflows`

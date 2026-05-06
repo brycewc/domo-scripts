@@ -67,7 +67,8 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-list-user-content` | List everything a set of users own (datasets, cards, pages, etc.) into a single CSV — one row per (user, object) |
 | `bulk-rename-dataflows` | Find/replace in dataflow names across the instance |
 | `bulk-rename-datasets` | Find/replace in dataset names across the instance |
-| `bulk-revoke-content` | Revoke access to content in bulk |
+| `bulk-revoke-access-tokens` | Revoke developer access tokens by ID, CSV, owner, or expiration |
+| `bulk-unshare-content` | Unshare content in bulk |
 | `bulk-share-content` | Share content (cards, datasets, pages, dataflows) with users/groups |
 | `bulk-transfer-ownership` | Transfer ownership of a user's content (datasets, cards, pages, etc.) to a new owner, either all discovered from the user or from a CSV |
 | `bulk-update-column-pdp-policy` | Update users/groups on a column-based PDP policy |
