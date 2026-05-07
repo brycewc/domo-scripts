@@ -7,6 +7,7 @@
  *   --file              CSV with token IDs (default column: "Token ID")
  *   --owner             User ID — fetches all tokens and revokes those owned by that user
  *   --expired           Fetches all tokens and revokes those whose expiry is in the past
+ *   --deleted-owners    Fetches all tokens and revokes those whose owner has been deleted
  *
  * Usage:
  *   node cli.js bulk-revoke-access-tokens --token-id 42
@@ -15,7 +16,7 @@
  *   node cli.js bulk-revoke-access-tokens --file "tokens.csv" --column "id"
  *   node cli.js bulk-revoke-access-tokens --owner 1250228141
  *   node cli.js bulk-revoke-access-tokens --expired
- *   node cli.js bulk-revoke-access-tokens --expired --dry-run
+ *   node cli.js bulk-revoke-access-tokens --deleted-owners --dry-run
  *
  * Options:
  *   --token-id        Single token ID (enables debug logging)
@@ -26,14 +27,18 @@
  *   --filter-value    Required value for --filter-column
  *   --owner           Revoke every token owned by this user ID
  *   --expired         Revoke every token whose expiry is in the past
+ *   --deleted-owners  Revoke every token whose owner has been deleted
  *   --dry-run         Preview without revoking
  */
 
 const api = require('../lib/api');
+const config = require('../lib/config');
 const { resolveIds } = require('../lib/input');
 const { createLogger } = require('../lib/log');
 const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const USER_INDEX_BATCH_SIZE = 50;
 
 const HELP_TEXT = `Usage: node cli.js bulk-revoke-access-tokens [options]
 
@@ -45,6 +50,7 @@ Token source (one of):
   --file, -f <path>      CSV with token IDs
   --owner <userId>       Revoke every token owned by this user ID
   --expired              Revoke every token whose expiry is in the past
+  --deleted-owners       Revoke every token whose owner has been deleted
 
 Optional:
   --column, -c <name>    CSV column with token IDs (default: "Token ID")
@@ -56,6 +62,63 @@ Optional:
 async function fetchAllAccessTokens() {
 	const tokens = await api.get('/data/v1/accesstokens');
 	return Array.isArray(tokens) ? tokens : [];
+}
+
+async function fetchUserIndexBatch(ids) {
+	config.requireAuth();
+	const url = `${config.instanceUrl}/users/index?cvUserIds=${ids.join(',')}`;
+	const res = await fetch(url, {
+		headers: {
+			'X-DOMO-Developer-Token': config.accessToken,
+			Accept: 'application/json'
+		}
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(`GET /users/index failed: HTTP ${res.status}: ${text}`);
+	}
+	const text = await res.text();
+	const data = text ? JSON.parse(text) : [];
+	return Array.isArray(data) ? data : [];
+}
+
+async function findDeletedOwners(tokens) {
+	const uniqueOwnerIds = [
+		...new Set(
+			tokens
+				.map((t) => t.ownerId)
+				.filter((id) => id != null)
+				.map(String)
+		)
+	];
+	const totalBatches = Math.ceil(uniqueOwnerIds.length / USER_INDEX_BATCH_SIZE);
+	console.log(
+		`  Checking ${uniqueOwnerIds.length} unique owner(s) in ${totalBatches} batch(es) of ${USER_INDEX_BATCH_SIZE}...`
+	);
+
+	const deleted = new Map();
+	for (let start = 0; start < uniqueOwnerIds.length; start += USER_INDEX_BATCH_SIZE) {
+		const batch = uniqueOwnerIds.slice(start, start + USER_INDEX_BATCH_SIZE);
+		let users;
+		try {
+			users = await fetchUserIndexBatch(batch);
+		} catch (err) {
+			console.error(`    ✗ Batch ${start / USER_INDEX_BATCH_SIZE + 1} failed: ${err.message}`);
+			continue;
+		}
+
+		for (const user of users) {
+			if (user && user.userActive === false && user.id != null) {
+				deleted.set(String(user.id), user.displayName || null);
+			}
+		}
+
+		if (start + USER_INDEX_BATCH_SIZE < uniqueOwnerIds.length) {
+			await new Promise((r) => setTimeout(r, 100));
+		}
+	}
+	console.log(`  Found ${deleted.size} deleted owner(s)`);
+	return deleted;
 }
 
 function describeToken(token) {
@@ -76,22 +139,24 @@ async function main() {
 	const dryRun = argv['dry-run'] || argv.dry || false;
 	const owner = argv.owner != null ? String(argv.owner) : null;
 	const expiredOnly = Boolean(argv.expired);
+	const deletedOwnersOnly = Boolean(argv['deleted-owners']);
 
-	if (owner && expiredOnly) {
-		throw new Error('Cannot combine --owner and --expired');
+	const fetchModes = [owner && '--owner', expiredOnly && '--expired', deletedOwnersOnly && '--deleted-owners'].filter(Boolean);
+	if (fetchModes.length > 1) {
+		throw new Error(`Cannot combine ${fetchModes.join(' and ')}`);
 	}
 
-	const fetchSource = owner || expiredOnly;
+	const fetchSource = fetchModes.length === 1;
 	const idSource = argv['token-id'] || argv['token-ids'] || argv.file || argv.f;
 
 	if (fetchSource && idSource) {
 		throw new Error(
-			'Use either --owner / --expired (fetch mode) OR --token-id / --token-ids / --file (list mode), not both'
+			'Use either --owner / --expired / --deleted-owners (fetch mode) OR --token-id / --token-ids / --file (list mode), not both'
 		);
 	}
 	if (!fetchSource && !idSource) {
 		throw new Error(
-			'One of --token-id, --token-ids, --file, --owner, or --expired is required'
+			'One of --token-id, --token-ids, --file, --owner, --expired, or --deleted-owners is required'
 		);
 	}
 
@@ -101,15 +166,30 @@ async function main() {
 	let source;
 
 	if (fetchSource) {
-		source = owner ? `owner=${owner}` : 'expired';
+		source = owner ? `owner=${owner}` : expiredOnly ? 'expired' : 'deleted-owners';
 		console.log(`Fetching all access tokens to filter by ${source}...`);
 		const all = await fetchAllAccessTokens();
-		console.log(`  Retrieved ${all.length} token(s)\n`);
+		console.log(`  Retrieved ${all.length} token(s)`);
 
-		const now = Date.now();
-		const matches = owner
-			? all.filter((t) => String(t.ownerId) === owner)
-			: all.filter((t) => typeof t.expires === 'number' && t.expires < now);
+		let matches;
+		if (owner) {
+			matches = all.filter((t) => String(t.ownerId) === owner);
+		} else if (expiredOnly) {
+			const now = Date.now();
+			matches = all.filter((t) => typeof t.expires === 'number' && t.expires < now);
+		} else {
+			const deletedOwners = await findDeletedOwners(all);
+			matches = all.filter(
+				(t) => t.ownerId != null && deletedOwners.has(String(t.ownerId))
+			);
+			// /users/index gives a usable displayName; the access-token record's
+			// ownerName is often null for deleted users, so backfill it.
+			for (const t of matches) {
+				const displayName = deletedOwners.get(String(t.ownerId));
+				if (displayName && !t.ownerName) t.ownerName = displayName;
+			}
+		}
+		console.log('');
 
 		tokenIds = matches.map((t) => String(t.id));
 		for (const t of matches) tokenById[String(t.id)] = t;
@@ -131,6 +211,7 @@ async function main() {
 			source,
 			owner: owner || null,
 			expiredOnly,
+			deletedOwnersOnly,
 			file: argv.file || argv.f || null,
 			column: argv.column || argv.c || 'Token ID',
 			total: tokenIds.length
