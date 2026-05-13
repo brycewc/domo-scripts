@@ -3,7 +3,8 @@
  *
  * Modes:
  *   daily  (default) — streams running more than once a day get changed to once daily
- *                       at a random time within --start-hour/--end-hour
+ *                       at a random time within --start-hour/--end-hour. Manually
+ *                       scheduled streams are skipped unless --include-manual is set.
  *   manual           — all streams in the input are set to MANUAL schedule
  *
  * Usage:
@@ -12,6 +13,7 @@
  *   node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "status" --filter-value "ACTIVE" --start-hour 6 --end-hour 20
  *   node cli.js bulk-update-stream-schedules --stream-id 119533 --start-hour 6 --end-hour 20
  *   node cli.js bulk-update-stream-schedules --stream-ids "119533,110462" --start-hour 6 --end-hour 20
+ *   node cli.js bulk-update-stream-schedules --file "streams.csv" --start-hour 6 --end-hour 20 --include-manual
  *   node cli.js bulk-update-stream-schedules --file "streams.csv" --mode manual
  *
  * Options:
@@ -23,6 +25,8 @@
  *   --start-hour      Start of hour range, 0-23 (default: 0, daily mode only)
  *   --end-hour        End of hour range, 0-23 (default: 23, daily mode only)
  *   --timezone        Timezone for the schedule (default: "UTC")
+ *   --include-manual  In daily mode, also convert MANUAL streams to a daily schedule
+ *                       (activates them) instead of skipping them
  *   --filter-column   CSV column to filter on (optional, requires --filter-value)
  *   --filter-value    Value the filter-column must equal to include the row
  *   --dry-run         Preview changes without applying them
@@ -45,6 +49,7 @@ Options:
   --start-hour      Start of hour range, 0-23 (default: 0)
   --end-hour        End of hour range, 0-23 (default: 23)
   --timezone        Schedule timezone (default: "UTC")
+  --include-manual  In daily mode, also convert MANUAL streams to a daily schedule
   --filter-column   CSV column to filter on
   --filter-value    Value the filter-column must equal
   --dry-run         Preview changes without applying`;
@@ -107,6 +112,13 @@ function modifyScheduleToDaily(streamDefinition, startHour, endHour, timezone) {
 		`  Set advancedScheduleJson to ${streamDefinition.advancedScheduleJson}`
 	);
 
+	// MANUAL streams have scheduleState='MANUAL', which suppresses the schedule.
+	// Flip to ACTIVE so the new daily schedule actually fires.
+	if (currentSchedule.type === 'MANUAL' || streamDefinition.scheduleState === 'MANUAL') {
+		streamDefinition.scheduleState = 'ACTIVE';
+		console.log('  Set scheduleState to ACTIVE');
+	}
+
 	return streamDefinition;
 }
 
@@ -134,6 +146,7 @@ async function main() {
 	const startHour = argv['start-hour'] != null ? Number(argv['start-hour']) : 0;
 	const endHour = argv['end-hour'] != null ? Number(argv['end-hour']) : 23;
 	const timezone = argv.timezone || 'UTC';
+	const includeManual = argv['include-manual'] || false;
 	const dryRun = argv['dry-run'] || false;
 
 	if (!['daily', 'manual'].includes(mode)) {
@@ -170,6 +183,7 @@ async function main() {
 			startHour: mode === 'daily' ? startHour : undefined,
 			endHour: mode === 'daily' ? endHour : undefined,
 			timezone,
+			includeManual: mode === 'daily' ? includeManual : undefined,
 			totalStreams: streamIds.length
 		}
 	});
@@ -183,6 +197,11 @@ async function main() {
 			`Random time range: ${startHour}:00 - ${endHour}:59 ${timezone}`
 		);
 		console.log(`Timezone: ${timezone}`);
+		if (includeManual) {
+			console.log(
+				'Include manual: MANUAL streams will be converted to daily (and activated)'
+			);
+		}
 	}
 	if (dryRun) console.log('DRY RUN (no changes will be made)');
 	console.log(`Found ${streamIds.length} stream(s) to process\n`);
@@ -227,11 +246,22 @@ async function main() {
 					streamDefinition.scheduleExpression;
 			}
 
-			if (mode === 'daily' && !isMoreThanOnceADay(currentSchedule)) {
-				const parsed = JSON.parse(currentSchedule);
-				console.log(
-					`  Skipped — schedule type "${parsed.type}" does not run more than once a day\n`
-				);
+			let parsedCurrent = {};
+			try {
+				parsedCurrent = JSON.parse(currentSchedule);
+			} catch {
+				/* leave empty */
+			}
+			const isManual = parsedCurrent.type === 'MANUAL';
+			const shouldProcessForDaily =
+				mode === 'daily' &&
+				(isMoreThanOnceADay(currentSchedule) || (includeManual && isManual));
+
+			if (mode === 'daily' && !shouldProcessForDaily) {
+				const reason = isManual
+					? 'is MANUAL (use --include-manual to convert)'
+					: `type "${parsedCurrent.type}" does not run more than once a day`;
+				console.log(`  Skipped — schedule ${reason}\n`);
 				entry.status = 'skipped';
 				if (debugLog) debugLog.skipped = true;
 				skipCount++;
