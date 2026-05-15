@@ -5,6 +5,7 @@ const commands = {
 	'bulk-add-dataflow-trigger-condition': './commands/bulk-add-dataflow-trigger-condition',
 	'bulk-add-dataset-tags': './commands/bulk-add-dataset-tags',
 	'bulk-apply-pdp-policies': './commands/bulk-apply-pdp-policies',
+	'bulk-delete-dataflow-triggers': './commands/bulk-delete-dataflow-triggers',
 	'bulk-delete-datasets': './commands/bulk-delete-datasets',
 	'bulk-delete-users': './commands/bulk-delete-users',
 	'bulk-rename-dataflows': './commands/bulk-rename-dataflows',

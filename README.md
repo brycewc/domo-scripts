@@ -91,6 +91,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-add-dataset-tags` | Add tags to datasets from a CSV or by owner |
 | `bulk-apply-pdp-policies` | Copy PDP policies from a source dataset to target datasets |
 | `bulk-convert-stream-provider` | Convert streams from one connector type to another |
+| `bulk-delete-dataflow-triggers` | Remove all triggers from dataflows listed in a CSV |
 | `bulk-delete-datasets` | Delete datasets listed in a CSV |
 | `bulk-delete-users` | Delete users listed in a CSV. Does not check or transfer ownership — prompts for confirmation. |
 | `bulk-export-dataset-versions` | Export historical versions of a dataset |
