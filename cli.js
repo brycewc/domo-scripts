@@ -22,6 +22,7 @@ const commands = {
 	'bulk-update-stream-schedules': './commands/bulk-update-stream-schedules',
 	'bulk-update-stream-update-method': './commands/bulk-update-stream-update-method',
 	'bulk-update-users': './commands/bulk-update-users',
+	'clear-logs': './commands/clear-logs',
 	'extract-card-ids': './commands/extract-card-ids',
 	'swap-input-in-dataflows': './commands/swap-input-in-dataflows',
 	'transfer-stream': './commands/transfer-stream',
