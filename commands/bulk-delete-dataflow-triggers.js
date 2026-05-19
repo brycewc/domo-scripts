@@ -2,9 +2,16 @@
  * Delete all triggers from dataflows listed in a CSV file (or by ID).
  *
  * Reads a CSV, extracts dataflow IDs from a configurable column (default "DataFlow ID"),
- * then for each dataflow: GETs the definition, clears triggerSettings.triggers and
- * triggerSettings.triggerEvents, and PUTs the full definition back. Skips dataflows
- * that have no triggers to begin with.
+ * then for each dataflow: GETs the definition, nulls triggerSettings, flips every
+ * inputs[].executeFlowWhenUpdated and actions[].executeFlowWhenUpdated flag to false,
+ * and PUTs the full definition back. Skips dataflows that have no triggers to begin
+ * with.
+ *
+ * Some dataflow types (e.g. MySQL) represent dataset-update triggers in two places:
+ * the triggerSettings object AND a per-input executeFlowWhenUpdated flag on both
+ * `inputs[]` and the matching LoadFromVault entry in `actions[]`. Clearing only
+ * triggerSettings leaves the input-level flag set, and Domo keeps firing the
+ * dataflow on dataset updates — so we must clear both.
  *
  * Usage:
  *   node cli.js bulk-delete-dataflow-triggers --file "dataflows.csv"
@@ -52,12 +59,48 @@ Options:
 
 function clearTriggers(definition, description) {
 	const triggers = definition.triggerSettings?.triggers;
-	const triggerEvents = definition.triggerSettings?.triggerEvents;
 	const triggersRemoved = Array.isArray(triggers) ? triggers.length : 0;
-	const eventsRemoved = Array.isArray(triggerEvents) ? triggerEvents.length : 0;
+	const eventsRemoved = Array.isArray(triggers)
+		? triggers.reduce(
+				(sum, t) => sum + (Array.isArray(t?.triggerEvents) ? t.triggerEvents.length : 0),
+				0
+			)
+		: 0;
 
-	if (triggersRemoved === 0 && eventsRemoved === 0) {
-		return { modified: false, triggersRemoved: 0, eventsRemoved: 0 };
+	let inputTriggersRemoved = 0;
+	if (Array.isArray(definition.inputs)) {
+		for (const input of definition.inputs) {
+			if (input && input.executeFlowWhenUpdated === true) {
+				input.executeFlowWhenUpdated = false;
+				inputTriggersRemoved++;
+			}
+		}
+	}
+
+	let actionTriggersRemoved = 0;
+	if (Array.isArray(definition.actions)) {
+		for (const action of definition.actions) {
+			if (action && action.executeFlowWhenUpdated === true) {
+				action.executeFlowWhenUpdated = false;
+				actionTriggersRemoved++;
+			}
+		}
+	}
+
+	const modified =
+		triggersRemoved > 0 ||
+		eventsRemoved > 0 ||
+		inputTriggersRemoved > 0 ||
+		actionTriggersRemoved > 0;
+
+	if (!modified) {
+		return {
+			modified: false,
+			triggersRemoved: 0,
+			eventsRemoved: 0,
+			inputTriggersRemoved: 0,
+			actionTriggersRemoved: 0
+		};
 	}
 
 	definition.triggerSettings = null;
@@ -67,7 +110,13 @@ function clearTriggers(definition, description) {
 		onboardFlowId: definition.id
 	};
 
-	return { modified: true, triggersRemoved, eventsRemoved };
+	return {
+		modified: true,
+		triggersRemoved,
+		eventsRemoved,
+		inputTriggersRemoved,
+		actionTriggersRemoved
+	};
 }
 
 async function main() {
@@ -126,6 +175,8 @@ async function main() {
 			name: null,
 			triggersRemoved: 0,
 			eventsRemoved: 0,
+			inputTriggersRemoved: 0,
+			actionTriggersRemoved: 0,
 			error: null
 		};
 
@@ -140,28 +191,42 @@ async function main() {
 				debugLog.originalTriggerSettings = JSON.parse(JSON.stringify(definition.triggerSettings || null));
 			}
 
-			const { modified, triggersRemoved, eventsRemoved } = clearTriggers(definition, description);
+			const {
+				modified,
+				triggersRemoved,
+				eventsRemoved,
+				inputTriggersRemoved,
+				actionTriggersRemoved
+			} = clearTriggers(definition, description);
 
 			entry.triggersRemoved = triggersRemoved;
 			entry.eventsRemoved = eventsRemoved;
+			entry.inputTriggersRemoved = inputTriggersRemoved;
+			entry.actionTriggersRemoved = actionTriggersRemoved;
 
 			if (debugLog) {
 				debugLog.modified = modified;
 				debugLog.triggersRemoved = triggersRemoved;
 				debugLog.eventsRemoved = eventsRemoved;
+				debugLog.inputTriggersRemoved = inputTriggersRemoved;
+				debugLog.actionTriggersRemoved = actionTriggersRemoved;
 				debugLog.modifiedTriggerSettings = JSON.parse(JSON.stringify(definition.triggerSettings || null));
+				debugLog.modifiedInputs = JSON.parse(JSON.stringify(definition.inputs || null));
+				debugLog.modifiedActions = JSON.parse(JSON.stringify(definition.actions || null));
 			}
+
+			const summary = `${triggersRemoved} trigger(s), ${eventsRemoved} trigger event(s), ${inputTriggersRemoved} input flag(s), ${actionTriggersRemoved} action flag(s)`;
 
 			if (!modified) {
 				console.log('  Skipped (no triggers to delete)\n');
 				entry.status = 'skipped';
 				skipCount++;
 			} else if (dryRun) {
-				console.log(`  [DRY RUN] Would remove ${triggersRemoved} trigger(s) and ${eventsRemoved} trigger event(s)\n`);
+				console.log(`  [DRY RUN] Would remove ${summary}\n`);
 				entry.status = 'dry-run';
 				successCount++;
 			} else {
-				console.log(`  Removing ${triggersRemoved} trigger(s) and ${eventsRemoved} trigger event(s)...`);
+				console.log(`  Removing ${summary}...`);
 				const putResult = await api.put(`/dataprocessing/v1/dataflows/${dataflowId}`, definition);
 				console.log('  ✓ Successfully updated\n');
 				entry.status = 'updated';

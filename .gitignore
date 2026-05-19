@@ -4,3 +4,10 @@ node_modules/
 !.env.example
 logs/
 id-mappings/
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.pnp.*
