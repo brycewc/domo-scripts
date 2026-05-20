@@ -88,16 +88,33 @@ function modifyScheduleToDaily(streamDefinition, startHour, endHour, timezone) {
 	let newSchedule;
 	if (currentSchedule.type === 'ADVANCED') {
 		// Keep as ADVANCED type but switch from interval-based to time-based,
-		// preserving existing month/dayOfMonth/dayOfWeek/weekOfMonths values
+		// preserving existing month/dayOfMonth/dayOfWeek/weekOfMonths values.
+		// Only include dayOfMonth when it has values — sending an empty array
+		// alongside a populated dayOfWeek triggers a server NPE
+		// ("Cannot read field 'scheduler'..."). The UI omits it in that case.
 		newSchedule = {
 			type: 'ADVANCED',
-			month: currentSchedule.month || [],
-			dayOfMonth: currentSchedule.dayOfMonth || [],
-			dayOfWeek: currentSchedule.dayOfWeek || [],
-			weekOfMonths: currentSchedule.weekOfMonths || [],
+			month:
+				Array.isArray(currentSchedule.month) && currentSchedule.month.length
+					? currentSchedule.month
+					: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+			dayOfWeek:
+				Array.isArray(currentSchedule.dayOfWeek) &&
+				currentSchedule.dayOfWeek.length
+					? currentSchedule.dayOfWeek
+					: [1, 2, 3, 4, 5, 6, 7],
+			weekOfMonths: Array.isArray(currentSchedule.weekOfMonths)
+				? currentSchedule.weekOfMonths
+				: [],
 			time: at,
 			timezone
 		};
+		if (
+			Array.isArray(currentSchedule.dayOfMonth) &&
+			currentSchedule.dayOfMonth.length
+		) {
+			newSchedule.dayOfMonth = currentSchedule.dayOfMonth;
+		}
 	} else {
 		newSchedule = {
 			type: 'DAY',
