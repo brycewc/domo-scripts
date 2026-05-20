@@ -103,7 +103,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-share-content` | Share content (cards, datasets, pages, dataflows) with users/groups |
 | `bulk-transfer-ownership` | Transfer ownership of a user's content (datasets, cards, pages, etc.) to a new owner, either all discovered from the user or from a CSV |
 | `bulk-update-column-pdp-policy` | Update users/groups on a column-based PDP policy |
-| `bulk-update-stream-schedules` | Change stream schedules to daily or manual (with randomized times) |
+| `bulk-update-stream-schedules` | Change stream schedules to daily (randomized times), manual, or restore arbitrary schedules from a CSV (`--mode from-file`) |
 | `bulk-update-stream-update-method` | Change stream update mode from Replace to Append |
 | `clear-logs` | Delete every log file under `logs/` (supports `--dry-run` and `--command` filter) |
 | `extract-card-ids` | Extract card IDs from a page export JSON |
