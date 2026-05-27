@@ -31,11 +31,7 @@
  *   --dry-run         Preview without revoking
  */
 
-const api = require('../lib/api');
-const config = require('../lib/config');
-const { resolveIds } = require('../lib/input');
-const { createLogger } = require('../lib/log');
-const { showHelp } = require('../lib/help');
+const { api, config, resolveIds, createLogger, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
 
 const USER_INDEX_BATCH_SIZE = 50;

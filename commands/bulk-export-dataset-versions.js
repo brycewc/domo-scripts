@@ -13,8 +13,7 @@
  *   --start-version-id  Version number to start from (default: 1)
  */
 
-const { baseUrl, accessToken, requireAuth } = require('../lib/config');
-const { showHelp } = require('../lib/help');
+const { config, showHelp } = require('../lib');
 const fs = require('fs');
 const argv = require('minimist')(process.argv.slice(2));
 
@@ -27,15 +26,15 @@ Options:
   --start-version-id  Version number to start from (default: 1)`;
 
 showHelp(argv, HELP_TEXT);
-requireAuth();
+config.requireAuth();
 
 async function getDataVersion(datasetId, versionId) {
-	const url = `${baseUrl}/data/v2/datasources/${datasetId}/dataversions/${versionId}?excludeAppendedData=true&rowLimit=1000000`;
+	const url = `${config.baseUrl}/data/v2/datasources/${datasetId}/dataversions/${versionId}?excludeAppendedData=true&rowLimit=1000000`;
 
 	const options = {
 		method: 'GET',
 		headers: {
-			'X-DOMO-Developer-Token': accessToken,
+			'X-DOMO-Developer-Token': config.accessToken,
 			Accept: 'text/csv'
 		}
 	};

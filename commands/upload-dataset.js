@@ -13,8 +13,7 @@
  *   --action, -a    REPLACE or APPEND (default: REPLACE)
  */
 
-const { baseUrl, accessToken, requireAuth } = require('../lib/config');
-const { showHelp } = require('../lib/help');
+const { config, showHelp } = require('../lib');
 const fs = require('fs');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
@@ -31,16 +30,16 @@ Options:
   --action, -a      REPLACE or APPEND (default: REPLACE)`;
 
 showHelp(argv, HELP_TEXT);
-requireAuth();
+config.requireAuth();
 
 const jsonHeaders = {
-	'X-DOMO-Developer-Token': accessToken,
+	'X-DOMO-Developer-Token': config.accessToken,
 	Accept: 'application/json',
 	'Content-Type': 'application/json'
 };
 
 async function createUpload(datasetId, action = 'REPLACE') {
-	const url = `${baseUrl}/data/v3/datasources/${datasetId}/uploads`;
+	const url = `${config.baseUrl}/data/v3/datasources/${datasetId}/uploads`;
 	const response = await fetch(url, {
 		method: 'POST',
 		headers: jsonHeaders,
@@ -63,11 +62,11 @@ async function createUpload(datasetId, action = 'REPLACE') {
 }
 
 async function uploadPart(datasetId, uploadId, partNumber, csvData) {
-	const url = `${baseUrl}/data/v3/datasources/${datasetId}/uploads/${uploadId}/parts/${partNumber}`;
+	const url = `${config.baseUrl}/data/v3/datasources/${datasetId}/uploads/${uploadId}/parts/${partNumber}`;
 	const response = await fetch(url, {
 		method: 'PUT',
 		headers: {
-			'X-DOMO-Developer-Token': accessToken,
+			'X-DOMO-Developer-Token': config.accessToken,
 			'Content-Type': 'text/csv'
 		},
 		body: csvData
@@ -84,7 +83,7 @@ async function uploadPart(datasetId, uploadId, partNumber, csvData) {
 }
 
 async function commitUpload(datasetId, uploadId, action) {
-	const url = `${baseUrl}/data/v3/datasources/${datasetId}/uploads/${uploadId}/commit`;
+	const url = `${config.baseUrl}/data/v3/datasources/${datasetId}/uploads/${uploadId}/commit`;
 	const response = await fetch(url, {
 		method: 'PUT',
 		headers: jsonHeaders,
@@ -107,7 +106,7 @@ async function commitUpload(datasetId, uploadId, action) {
 }
 
 async function indexDataset(datasetId, action) {
-	const url = `${baseUrl}/data/v3/datasources/${datasetId}/indexes`;
+	const url = `${config.baseUrl}/data/v3/datasources/${datasetId}/indexes`;
 	const response = await fetch(url, {
 		method: 'POST',
 		headers: jsonHeaders,
@@ -126,7 +125,7 @@ async function indexDataset(datasetId, action) {
 }
 
 async function pollIndexStatus(datasetId, requestKey) {
-	const url = `${baseUrl}/data/v3/datasources/${datasetId}/indexes/${requestKey}/statuses`;
+	const url = `${config.baseUrl}/data/v3/datasources/${datasetId}/indexes/${requestKey}/statuses`;
 	const processingStates = ['PENDING', 'PROCESSING'];
 
 	await new Promise((r) => setTimeout(r, 1000));
@@ -135,7 +134,7 @@ async function pollIndexStatus(datasetId, requestKey) {
 		const response = await fetch(url, {
 			method: 'GET',
 			headers: {
-				'X-DOMO-Developer-Token': accessToken,
+				'X-DOMO-Developer-Token': config.accessToken,
 				Accept: 'application/json'
 			}
 		});

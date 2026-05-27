@@ -23,9 +23,7 @@
  *   --all-rows-groups   Comma-separated group IDs to assign to the All Rows policy
  */
 
-const api = require('../lib/api');
-const { resolveIds } = require('../lib/input');
-const { showHelp } = require('../lib/help');
+const { api, resolveIds, createLogger, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage: node cli.js bulk-apply-pdp-policies [options]
@@ -122,9 +120,14 @@ async function main() {
 				.filter(Boolean)
 		: [];
 
-	const { ids: datasetIds } = resolveIds(argv, {
+	const { ids: datasetIds, debugMode } = resolveIds(argv, {
 		name: 'dataset',
 		columnDefault: 'DataSet ID'
+	});
+
+	const logger = createLogger('bulk-apply-pdp-policies', {
+		debugMode,
+		runMeta: { sourceDatasetId, allowedColumns, allRowsUserIds, allRowsGroupIds }
 	});
 
 	console.log('Bulk Apply PDP Policies');
@@ -145,6 +148,7 @@ async function main() {
 		console.log(
 			`\nNo PDP policies found matching columns [${allowedColumns.join(', ')}]. Nothing to copy.`
 		);
+		logger.writeRunLog({ total: datasetIds.length, applied: 0, errors: 0 });
 		process.exit(0);
 	}
 
@@ -221,9 +225,19 @@ async function main() {
 			}
 
 			console.log('  Done');
+			logger.addResult({ datasetId: targetId, status: 'applied' });
+			if (debugMode)
+				logger.writeDebugLog(targetId, { datasetId: targetId, status: 'applied' });
 			successCount++;
 		} catch (error) {
 			console.error(`  Error: ${error.message}`);
+			logger.addResult({ datasetId: targetId, status: 'error', error: error.message });
+			if (debugMode)
+				logger.writeDebugLog(targetId, {
+					datasetId: targetId,
+					status: 'error',
+					error: error.message
+				});
 			errorCount++;
 		}
 
@@ -241,6 +255,12 @@ async function main() {
 	console.log(
 		`Policies per dataset:  ${policiesToCopy.length + 1} (${policiesToCopy.length} filtered + All Rows)`
 	);
+
+	logger.writeRunLog({
+		total: datasetIds.length,
+		applied: successCount,
+		errors: errorCount
+	});
 
 	if (errorCount > 0) {
 		console.error('\nSome datasets failed. Check the error messages above.');

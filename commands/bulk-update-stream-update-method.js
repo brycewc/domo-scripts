@@ -16,9 +16,7 @@
  *   --filter-value    Value the filter-column must equal to include the row
  */
 
-const api = require('../lib/api');
-const { resolveIds } = require('../lib/input');
-const { showHelp } = require('../lib/help');
+const { api, resolveIds, createLogger, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage: node cli.js bulk-update-stream-update-method [options]
@@ -75,9 +73,14 @@ function modifyUpdateMode(streamDefinition) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	const { ids: streamIds } = resolveIds(argv, {
+	const { ids: streamIds, debugMode } = resolveIds(argv, {
 		name: 'stream',
 		columnDefault: 'streamId'
+	});
+
+	const logger = createLogger('bulk-update-stream-update-method', {
+		debugMode,
+		runMeta: { updateMethod: 'APPEND' }
 	});
 
 	console.log(`Processing ${streamIds.length} stream(s)...\n`);
@@ -103,13 +106,19 @@ async function main() {
 				console.log('  Updating stream...');
 				await api.put(`/data/v1/streams/${streamId}`, definition);
 				console.log('  ✓ Successfully updated\n');
+				logger.addResult({ streamId, status: 'updated' });
+				if (debugMode) logger.writeDebugLog(streamId, { streamId, status: 'updated' });
 				successCount++;
 			} else {
 				console.log('  ⊘ Skipped (no changes needed)\n');
+				logger.addResult({ streamId, status: 'skipped' });
+				if (debugMode) logger.writeDebugLog(streamId, { streamId, status: 'skipped' });
 				skipCount++;
 			}
 		} catch (error) {
 			console.error(`  ✗ Error: ${error.message}\n`);
+			logger.addResult({ streamId, status: 'error', error: error.message });
+			if (debugMode) logger.writeDebugLog(streamId, { streamId, status: 'error', error: error.message });
 			errorCount++;
 		}
 
@@ -125,6 +134,8 @@ async function main() {
 	console.log(`Successfully updated: ${successCount}`);
 	console.log(`Skipped (no changes): ${skipCount}`);
 	console.log(`Errors: ${errorCount}`);
+
+	logger.writeRunLog({ total: streamIds.length, updated: successCount, errors: errorCount });
 
 	if (errorCount > 0) {
 		console.error('\nSome streams failed to update. Check the error messages above.');

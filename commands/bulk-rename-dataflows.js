@@ -13,9 +13,7 @@
  *   --dry-run           Preview changes without applying them
  */
 
-const api = require('../lib/api');
-const { instanceUrl } = require('../lib/config');
-const { showHelp } = require('../lib/help');
+const { api, config, showHelp, createLogger } = require('../lib');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
 
@@ -131,6 +129,8 @@ async function main() {
 	const caseSensitive = argv['case-sensitive'] || argv.c || false;
 	const dryRun = argv['dry-run'] || argv.dry || false;
 
+	const logger = createLogger('bulk-rename-dataflows', { debugMode: false, dryRun });
+
 	if (!searchStr || replaceStr === undefined) {
 		console.error('Error: --search and --replace parameters are required\n');
 		console.error('Usage:');
@@ -148,7 +148,7 @@ async function main() {
 
 	console.log('Bulk Rename DataFlows');
 	console.log('=====================\n');
-	console.log(`Instance:       ${instanceUrl}`);
+	console.log(`Instance:       ${config.instanceUrl}`);
 	console.log(`Search for:     "${searchStr}"`);
 	console.log(`Replace with:   "${replaceStr}"`);
 	console.log(`Case sensitive: ${caseSensitive}`);
@@ -192,6 +192,10 @@ async function main() {
 
 	if (dryRun) {
 		console.log('Dry run complete. No changes were made.');
+		for (const { id, name, newName } of renames) {
+			logger.addResult({ dataflowId: id, oldName: name, newName, status: 'skipped' });
+		}
+		logger.writeRunLog({ total: renames.length, renamed: 0, errors: 0 });
 		process.exit(0);
 	}
 
@@ -215,11 +219,19 @@ async function main() {
 		try {
 			await renameDataflow(id, newName);
 			console.log(
-				`  ✓ Renamed: ${instanceUrl}/datacenter/dataflows/${id}/details`
+				`  ✓ Renamed: ${config.instanceUrl}/datacenter/dataflows/${id}/details`
 			);
+			logger.addResult({ dataflowId: id, oldName: name, newName, status: 'renamed' });
 			successCount++;
 		} catch (error) {
 			console.error(`  ✗ Error: ${error.message}`);
+			logger.addResult({
+				dataflowId: id,
+				oldName: name,
+				newName,
+				status: 'error',
+				error: error.message
+			});
 			errorCount++;
 		}
 
@@ -232,6 +244,8 @@ async function main() {
 	console.log(`Total dataflows: ${renames.length}`);
 	console.log(`Renamed:         ${successCount}`);
 	console.log(`Errors:          ${errorCount}`);
+
+	logger.writeRunLog({ total: renames.length, renamed: successCount, errors: errorCount });
 
 	if (errorCount > 0) {
 		console.error(

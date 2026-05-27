@@ -13,9 +13,7 @@
  *   --dry-run           Preview changes without applying them
  */
 
-const api = require('../lib/api');
-const { instanceUrl } = require('../lib/config');
-const { showHelp } = require('../lib/help');
+const { api, config, showHelp, createLogger } = require('../lib');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
 
@@ -143,9 +141,14 @@ async function main() {
 		process.exit(1);
 	}
 
+	const logger = createLogger('bulk-rename-datasets', {
+		debugMode: false,
+		dryRun
+	});
+
 	console.log('Bulk Rename Datasets');
 	console.log('====================\n');
-	console.log(`Instance:       ${instanceUrl}`);
+	console.log(`Instance:       ${config.instanceUrl}`);
 	console.log(`Search for:     "${searchStr}"`);
 	console.log(`Replace with:   "${replaceStr}"`);
 	console.log(`Case sensitive: ${caseSensitive}`);
@@ -189,6 +192,19 @@ async function main() {
 
 	if (dryRun) {
 		console.log('Dry run complete. No changes were made.');
+		for (const r of renames) {
+			logger.addResult({
+				datasetId: r.id,
+				oldName: r.name,
+				newName: r.newName,
+				status: 'skipped'
+			});
+		}
+		logger.writeRunLog({
+			total: renames.length,
+			renamed: 0,
+			errors: 0
+		});
 		process.exit(0);
 	}
 
@@ -212,11 +228,24 @@ async function main() {
 		try {
 			await renameDatasource(id, newName, renames[i].description);
 			console.log(
-				`  ✓ Renamed: ${instanceUrl}/datasources/${id}/details/overview`
+				`  ✓ Renamed: ${config.instanceUrl}/datasources/${id}/details/overview`
 			);
+			logger.addResult({
+				datasetId: id,
+				oldName: name,
+				newName,
+				status: 'renamed'
+			});
 			successCount++;
 		} catch (error) {
 			console.error(`  ✗ Error: ${error.message}`);
+			logger.addResult({
+				datasetId: id,
+				oldName: name,
+				newName,
+				status: 'error',
+				error: error.message
+			});
 			errorCount++;
 		}
 
@@ -229,6 +258,12 @@ async function main() {
 	console.log(`Total datasets:  ${renames.length}`);
 	console.log(`Renamed:         ${successCount}`);
 	console.log(`Errors:          ${errorCount}`);
+
+	logger.writeRunLog({
+		total: renames.length,
+		renamed: successCount,
+		errors: errorCount
+	});
 
 	if (errorCount > 0) {
 		console.error(

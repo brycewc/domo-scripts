@@ -12,7 +12,7 @@
 
 const fs = require('fs');
 const { parse } = require('csv-parse/sync');
-const { showHelp } = require('../lib/help');
+const { api, createLogger, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage:
@@ -26,8 +26,6 @@ Options:
   --help, -h              Show this help message`;
 
 showHelp(argv, HELP_TEXT);
-
-const { api } = require('../lib');
 
 function csvToWorkflowBody(csvPath, numericColumns) {
 	const raw = fs.readFileSync(csvPath, 'utf8');
@@ -80,8 +78,14 @@ async function main() {
 	console.log('Converting CSV to workflow body...');
 	const body = csvToWorkflowBody(csvPath, numericColumns);
 	const columnNames = Object.keys(body);
+	const rows = body[columnNames[0]].length;
 	console.log(`  Columns: ${columnNames.join(', ')}`);
-	console.log(`  Rows: ${body[columnNames[0]].length}`);
+	console.log(`  Rows: ${rows}`);
+
+	const logger = createLogger('run-workflow-from-csv', {
+		debugMode: false,
+		runMeta: { workflowId, rows }
+	});
 
 	console.log('Fetching workflow model...');
 	const model = await api.get(`/workflow/v1/models/${workflowId}`);
@@ -108,13 +112,34 @@ async function main() {
 	console.log(
 		`Activating workflow (version ${latest.version}, trigger ${manualTriggerId})...`
 	);
-	const result = await api.post(
-		`/workflow/v2/triggers/${manualTriggerId}/activate`,
-		body
-	);
-	console.log('Workflow run triggered successfully.');
-	if (result && typeof result === 'object') {
-		console.log(JSON.stringify(result, null, 2));
+	try {
+		const result = await api.post(
+			`/workflow/v2/triggers/${manualTriggerId}/activate`,
+			body
+		);
+		console.log('Workflow run triggered successfully.');
+		if (result && typeof result === 'object') {
+			console.log(JSON.stringify(result, null, 2));
+		}
+		logger.addResult({
+			row: 0,
+			workflowId,
+			version: latest.version,
+			manualTriggerId,
+			status: 'success'
+		});
+		logger.writeRunLog({ total: 1, success: 1, errors: 0 });
+	} catch (err) {
+		logger.addResult({
+			row: 0,
+			workflowId,
+			version: latest.version,
+			manualTriggerId,
+			status: 'error',
+			error: err.message
+		});
+		logger.writeRunLog({ total: 1, success: 0, errors: 1 });
+		throw err;
 	}
 }
 

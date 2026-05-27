@@ -24,9 +24,7 @@
  *   --<credential>   Any required credential fields for the target provider (e.g. --client_id, --client_secret)
  */
 
-const api = require('../lib/api');
-const { providerMap, instanceUrl } = require('../lib/index');
-const { showHelp } = require('../lib/help');
+const { api, config, providerMap, createLogger, showHelp } = require('../lib');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
 
@@ -46,6 +44,7 @@ const fromConnector = argv['from-connector'];
 const toConnector = argv['to-connector'];
 const dryRun = argv['dry-run'] || false;
 const singleStreamId = argv['stream-id'];
+const debugMode = Boolean(singleStreamId);
 
 if (!fromConnector || !toConnector) {
 	console.error(
@@ -276,8 +275,20 @@ async function main() {
 	}
 	console.log(`  Found ${streamEntries.length} stream(s) to process\n`);
 
+	const logger = createLogger('bulk-convert-stream-provider', {
+		debugMode,
+		dryRun,
+		runMeta: {
+			fromConnector,
+			toConnector,
+			fromProvider: fromProvider.key,
+			toProvider: toProvider.key
+		}
+	});
+
 	if (streamEntries.length === 0) {
 		console.log('Nothing to convert.');
+		logger.writeRunLog({ total: 0, successful: 0, errors: 0 });
 		return;
 	}
 
@@ -413,11 +424,36 @@ async function main() {
 					await api.put(`/data/v3/datasources/${dataSourceId}/providers/${toProvider.key}`);
 				}
 
-				console.log(`  Updated: ${instanceUrl}/datasources/${dataSourceId}/details/overview`);
+				console.log(`  Updated: ${config.instanceUrl}/datasources/${dataSourceId}/details/overview`);
 			}
+			const status = dryRun ? 'dry-run' : 'converted';
+			logger.addResult({ streamId, dataSourceId, dataSourceName, targetAccountId, status });
+			if (debugMode)
+				logger.writeDebugLog(streamId, {
+					streamId,
+					dataSourceId,
+					dataSourceName,
+					targetAccountId,
+					status
+				});
 			successCount++;
 		} catch (err) {
 			console.error(`  Error: ${err.message}`);
+			logger.addResult({
+				streamId,
+				dataSourceId,
+				dataSourceName,
+				status: 'error',
+				error: err.message
+			});
+			if (debugMode)
+				logger.writeDebugLog(streamId, {
+					streamId,
+					dataSourceId,
+					dataSourceName,
+					status: 'error',
+					error: err.message
+				});
 			errorCount++;
 		}
 
@@ -433,6 +469,12 @@ async function main() {
 	console.log(`Errors: ${errorCount}`);
 	if (createdAccountIds.length) console.log(`New accounts created: ${createdAccountIds.join(', ')}`);
 	if (dryRun) console.log('(DRY RUN — no changes were made)');
+	logger.writeRunLog({
+		total: streamEntries.length,
+		successful: successCount,
+		errors: errorCount,
+		createdAccountIds
+	});
 	if (errorCount > 0) process.exitCode = 1;
 }
 

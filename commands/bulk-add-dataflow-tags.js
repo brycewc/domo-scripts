@@ -19,9 +19,7 @@
  *   --batch-size  Number of dataflows per API call (default: 50)
  */
 
-const api = require('../lib/api');
-const { resolveIds } = require('../lib/input');
-const { showHelp } = require('../lib/help');
+const { api, resolveIds, createLogger, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage:
@@ -160,6 +158,10 @@ async function main() {
 		`\nProcessing ${dataflowIds.length} dataflow(s) in ${totalBatches} batch(es)...\n`
 	);
 
+	const logger = createLogger('bulk-add-dataflow-tags', {
+		runMeta: { mode: file ? 'file' : 'owner', tags, batchSize }
+	});
+
 	let successCount = 0;
 	let errorCount = 0;
 
@@ -174,9 +176,18 @@ async function main() {
 		try {
 			await bulkTagDataflows(chunk, tags);
 			console.log(`  ✓ Batch ${batchNumber} succeeded`);
+			for (const id of chunk)
+				logger.addResult({ dataflowId: id, status: 'tagged', batch: batchNumber });
 			successCount += chunk.length;
 		} catch (error) {
 			console.error(`  ✗ Batch ${batchNumber} failed: ${error.message}`);
+			for (const id of chunk)
+				logger.addResult({
+					dataflowId: id,
+					status: 'error',
+					error: error.message,
+					batch: batchNumber
+				});
 			errorCount += chunk.length;
 		}
 
@@ -189,6 +200,8 @@ async function main() {
 	console.log(`Total dataflows: ${dataflowIds.length}`);
 	console.log(`Successfully tagged: ${successCount}`);
 	console.log(`Errors: ${errorCount}`);
+
+	logger.writeRunLog({ total: dataflowIds.length, tagged: successCount, errors: errorCount });
 
 	if (errorCount > 0) {
 		console.error('\nSome batches failed. Check the error messages above.');

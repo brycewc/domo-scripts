@@ -17,8 +17,7 @@
  *   --skip-schema-check Skip the schema comparison step
  */
 
-const api = require('../lib/api');
-const { showHelp } = require('../lib/help');
+const { api, createLogger, showHelp } = require('../lib');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
 
@@ -424,6 +423,17 @@ async function main() {
 	}
 
 	// Step 5: Replace dataset and update each dataflow
+	const logger = createLogger('swap-input-in-dataflows', {
+		dryRun,
+		runMeta: {
+			oldDatasetId,
+			newDatasetId,
+			oldDatasetName,
+			newDatasetName,
+			skipSchemaCheck
+		}
+	});
+
 	let successCount = 0;
 	let errorCount = 0;
 	let skipCount = 0;
@@ -436,6 +446,11 @@ async function main() {
 
 		if (!dataflow) {
 			console.error('  Skipped (failed to fetch earlier)\n');
+			logger.addResult({
+				dataflowId: dfId,
+				status: 'error',
+				error: dataflows[i].error || 'failed to fetch'
+			});
 			errorCount++;
 			continue;
 		}
@@ -454,6 +469,12 @@ async function main() {
 			console.log(
 				'  No references to old dataset found in definition — skipping.\n'
 			);
+			logger.addResult({
+				dataflowId: dfId,
+				name: dataflow.name,
+				status: 'skipped',
+				replacements: 0
+			});
 			skipCount++;
 			continue;
 		}
@@ -462,14 +483,33 @@ async function main() {
 
 		if (dryRun) {
 			console.log('  (dry run) Would update this dataflow.\n');
+			logger.addResult({
+				dataflowId: dfId,
+				name: dataflow.name,
+				status: 'dry-run',
+				replacements
+			});
 			successCount++;
 		} else {
 			try {
 				await updateDataflow(dfId, dataflow);
 				console.log('  Successfully updated\n');
+				logger.addResult({
+					dataflowId: dfId,
+					name: dataflow.name,
+					status: 'updated',
+					replacements
+				});
 				successCount++;
 			} catch (error) {
 				console.error(`  Error: ${error.message}\n`);
+				logger.addResult({
+					dataflowId: dfId,
+					name: dataflow.name,
+					status: 'error',
+					error: error.message,
+					replacements
+				});
 				errorCount++;
 			}
 		}
@@ -487,6 +527,13 @@ async function main() {
 	);
 	if (skipCount > 0) console.log(`Skipped (no references): ${skipCount}`);
 	console.log(`Errors: ${errorCount}`);
+
+	logger.writeRunLog({
+		total: dataflows.length,
+		updated: successCount,
+		skipped: skipCount,
+		errors: errorCount
+	});
 
 	if (errorCount > 0) {
 		console.error(

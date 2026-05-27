@@ -8,11 +8,7 @@
  *   { "attributes": [ { "key": "<column>", "values": ["<value>"] }, ... ] }
  */
 
-const api = require('../lib/api');
-const { readCSV } = require('../lib/csv');
-const { showHelp } = require('../lib/help');
-const { createLogger } = require('../lib/log');
-const { instanceUrl } = require('../lib/config');
+const { api, readCSV, showHelp, createLogger, config } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage: node cli.js bulk-update-users --file "users.csv" [options]
@@ -80,7 +76,7 @@ async function main() {
 
 	console.log('Bulk Update Users');
 	console.log('=================\n');
-	console.log(`Instance:         ${instanceUrl}`);
+	console.log(`Instance:         ${config.instanceUrl}`);
 	console.log(`File:             ${filePath}`);
 	console.log(`ID column:        ${idColumn}`);
 	console.log(`Patched fields:   ${updatableColumns.join(', ')}`);

@@ -43,12 +43,7 @@
  * recorded (so invalid IDs can be recovered afterward); pass --verbose to also log successes.
  */
 
-const api = require('../lib/api');
-const { readCSV } = require('../lib/csv');
-const { baseUrl } = require('../lib/config');
-const { showHelp } = require('../lib/help');
-const { createLogger } = require('../lib/log');
-const { partitionExistingDatasets } = require('../lib/datasets');
+const { api, readCSV, config, showHelp, createLogger, partitionExistingDatasets } = require('../lib');
 const fs = require('fs');
 const argv = require('minimist')(process.argv.slice(2));
 
@@ -450,7 +445,7 @@ async function main() {
 		console.log(
 			`\nUnsharing ${ids.length} ${type}s from ${recipientType} ${recipientId}...`
 		);
-		console.log(`Endpoint: ${baseUrl}${endpoint}`);
+		console.log(`Endpoint: ${config.baseUrl}${endpoint}`);
 		console.log('Processing in batches of 50...');
 
 		const totalBatches = Math.ceil(ids.length / batchSize);

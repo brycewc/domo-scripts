@@ -19,9 +19,7 @@
  *   --batch-size  Number of datasets per API call (default: 50)
  */
 
-const api = require('../lib/api');
-const { resolveIds } = require('../lib/input');
-const { showHelp } = require('../lib/help');
+const { api, resolveIds, createLogger, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage:
@@ -134,6 +132,10 @@ async function main() {
 		`\nProcessing ${datasetIds.length} dataset(s) in ${totalBatches} batch(es)...\n`
 	);
 
+	const logger = createLogger('bulk-add-dataset-tags', {
+		runMeta: { mode: file ? 'file' : 'owner', tags, batchSize }
+	});
+
 	let successCount = 0;
 	let errorCount = 0;
 
@@ -148,9 +150,18 @@ async function main() {
 		try {
 			await bulkTagDatasets(chunk, tags);
 			console.log(`  ✓ Batch ${batchNumber} succeeded`);
+			for (const id of chunk)
+				logger.addResult({ datasetId: id, status: 'tagged', batch: batchNumber });
 			successCount += chunk.length;
 		} catch (error) {
 			console.error(`  ✗ Batch ${batchNumber} failed: ${error.message}`);
+			for (const id of chunk)
+				logger.addResult({
+					datasetId: id,
+					status: 'error',
+					error: error.message,
+					batch: batchNumber
+				});
 			errorCount += chunk.length;
 		}
 
@@ -163,6 +174,8 @@ async function main() {
 	console.log(`Total datasets: ${datasetIds.length}`);
 	console.log(`Successfully tagged: ${successCount}`);
 	console.log(`Errors: ${errorCount}`);
+
+	logger.writeRunLog({ total: datasetIds.length, tagged: successCount, errors: errorCount });
 
 	if (errorCount > 0) {
 		console.error('\nSome batches failed. Check the error messages above.');

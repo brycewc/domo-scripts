@@ -21,9 +21,7 @@
  *   --dry-run      Preview which datasets would be deleted without actually deleting
  */
 
-const api = require('../lib/api');
-const { resolveIds } = require('../lib/input');
-const { showHelp } = require('../lib/help');
+const { api, resolveIds, createLogger, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage: node cli.js bulk-delete-datasets [options]
@@ -55,10 +53,12 @@ async function main() {
 	const batchSize = parseInt(argv['batch-size'] || argv.b || '50', 10);
 	const dryRun = argv['dry-run'] || argv.dry || false;
 
-	const { ids: datasetIds } = resolveIds(argv, {
+	const { ids: datasetIds, debugMode } = resolveIds(argv, {
 		name: 'dataset',
 		columnDefault: 'DataSet ID'
 	});
+
+	const logger = createLogger('bulk-delete-datasets', { debugMode, dryRun });
 
 	console.log('Bulk Delete Datasets');
 	console.log('====================\n');
@@ -80,11 +80,13 @@ async function main() {
 			console.log(
 				`[${batchNumber}/${totalBatches}] Would delete ${chunk.length} dataset(s): ${chunk.join(', ')}`
 			);
+			for (const id of chunk) logger.addResult({ datasetId: id, status: 'dry-run' });
 		}
 
 		console.log('\n=== Dry Run Summary ===');
 		console.log(`Total datasets that would be deleted: ${datasetIds.length}`);
 		console.log('\nRe-run without --dry-run to execute the deletion.');
+		logger.writeRunLog({ total: datasetIds.length, deleted: 0, errors: 0 });
 		process.exit(0);
 	}
 
@@ -102,6 +104,11 @@ async function main() {
 		try {
 			await bulkDeleteDatasets(chunk);
 			console.log(`  + Batch ${batchNumber} succeeded`);
+			for (const id of chunk) {
+				logger.addResult({ datasetId: id, status: 'deleted', batch: batchNumber });
+				if (debugMode)
+					logger.writeDebugLog(id, { datasetId: id, status: 'deleted', batch: batchNumber });
+			}
 			successCount += chunk.length;
 		} catch (error) {
 			console.error(`  x Batch ${batchNumber} failed: ${error.message}`);
@@ -111,9 +118,30 @@ async function main() {
 				try {
 					await deleteSingleDataset(id);
 					console.log(`    + Dataset ${id} deleted`);
+					logger.addResult({ datasetId: id, status: 'deleted', batch: batchNumber, retried: true });
+					if (debugMode)
+						logger.writeDebugLog(id, {
+							datasetId: id,
+							status: 'deleted',
+							batch: batchNumber,
+							retried: true
+						});
 					successCount++;
 				} catch (singleError) {
 					console.error(`    x Dataset ${id} failed: ${singleError.message}`);
+					logger.addResult({
+						datasetId: id,
+						status: 'error',
+						error: singleError.message,
+						batch: batchNumber
+					});
+					if (debugMode)
+						logger.writeDebugLog(id, {
+							datasetId: id,
+							status: 'error',
+							error: singleError.message,
+							batch: batchNumber
+						});
 					errorCount++;
 				}
 				await new Promise((resolve) => setTimeout(resolve, 150));
@@ -129,6 +157,8 @@ async function main() {
 	console.log(`Total datasets: ${datasetIds.length}`);
 	console.log(`Successfully deleted: ${successCount}`);
 	console.log(`Errors: ${errorCount}`);
+
+	logger.writeRunLog({ total: datasetIds.length, deleted: successCount, errors: errorCount });
 
 	if (errorCount > 0) {
 		console.error('\nSome batches failed. Check the error messages above.');

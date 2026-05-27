@@ -20,8 +20,7 @@
  *   --remove-groups    Comma-separated group IDs to remove
  */
 
-const api = require('../lib/api');
-const { showHelp } = require('../lib/help');
+const { api, createLogger, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage:
@@ -136,6 +135,12 @@ async function main() {
 		process.exit(1);
 	}
 
+	const debugMode = false;
+	const logger = createLogger('bulk-update-column-pdp-policy', {
+		debugMode,
+		runMeta: { datasetId, filterGroupId, policyId }
+	});
+
 	console.log('Update PDP Column Policy');
 	console.log('========================\n');
 	console.log(`DataSet ID:      ${datasetId}`);
@@ -227,8 +232,22 @@ async function main() {
 		`  Final groups: [${policy.groupIds.length}] ${policy.groupIds.join(', ')}`
 	);
 
-	await updateFilterGroup(datasetId, filterGroupId, filterGroup);
+	try {
+		await updateFilterGroup(datasetId, filterGroupId, filterGroup);
+	} catch (err) {
+		logger.addResult({ policyId, status: 'error', error: err.message });
+		logger.writeRunLog({ total: 1, updated: 0, errors: 1 });
+		throw err;
+	}
 	console.log('\nPolicy updated successfully!');
+
+	logger.addResult({
+		policyId,
+		status: 'updated',
+		userIds: policy.userIds,
+		groupIds: policy.groupIds
+	});
+	logger.writeRunLog({ total: 1, updated: 1, errors: 0 });
 }
 
 main().catch((err) => {
