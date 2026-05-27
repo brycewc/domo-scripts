@@ -43,6 +43,9 @@
  *   --verbose               Log every batch (success and failure) to the run log. By default only
  *                           failures are logged. For dataset batches, a non-empty `failed` object in
  *                           the API response counts as a failure.
+ *   --skip-invalid-datasets Before sharing, look up every dataset ID and drop any that don't exist
+ *                           (one bad ID otherwise fails its whole batch of 50). Datasets only;
+ *                           the dropped IDs are recorded in the run log.
  *
  * Type values are case-insensitive. Aliases accepted: CARD → badge, DATA_SOURCE / DATASET → dataset.
  *
@@ -54,6 +57,7 @@ const api = require('../lib/api');
 const { readCSV } = require('../lib/csv');
 const { showHelp } = require('../lib/help');
 const { createLogger } = require('../lib/log');
+const { partitionExistingDatasets } = require('../lib/datasets');
 const fs = require('fs');
 const argv = require('minimist')(process.argv.slice(2));
 
@@ -81,6 +85,8 @@ Options:
   --verbose               Log every batch (success and failure) to the run log. By default only
                           failures are logged. For dataset batches, a non-empty \`failed\` object
                           in the API response counts as a failure.
+  --skip-invalid-datasets Before sharing, look up every dataset ID and drop any that don't
+                          exist (datasets only). Dropped IDs are recorded in the run log.
 
 Type values are case-insensitive. Aliases: CARD → badge, DATA_SOURCE / DATASET → dataset.`;
 
@@ -252,8 +258,36 @@ async function main() {
 		throw new Error('File must have .csv or .json extension');
 	}
 
-	const datasetItems = fileJson.filter((item) => item.type === 'dataset');
+	let datasetItems = fileJson.filter((item) => item.type === 'dataset');
 	const contentItems = fileJson.filter((item) => item.type !== 'dataset');
+
+	const skipInvalidDatasets = Boolean(argv['skip-invalid-datasets']);
+	let invalidDatasetIds = [];
+	if (skipInvalidDatasets && datasetItems.length > 0) {
+		console.log(
+			`\nValidating ${datasetItems.length} dataset ID(s) before sharing...`
+		);
+		const { invalid } = await partitionExistingDatasets(
+			api,
+			datasetItems.map((it) => it.id),
+			{
+				onProgress: (n, total, validCount) =>
+					console.log(`  Checked chunk ${n}/${total} (${validCount} valid)`)
+			}
+		);
+		invalidDatasetIds = invalid;
+		if (invalid.length > 0) {
+			const invalidSet = new Set(invalid);
+			datasetItems = datasetItems.filter(
+				(it) => !invalidSet.has(String(it.id))
+			);
+			console.log(
+				`  Dropped ${invalid.length} invalid dataset ID(s); ${datasetItems.length} remain.`
+			);
+		} else {
+			console.log('  All dataset IDs are valid.');
+		}
+	}
 
 	const verbose = Boolean(argv.verbose);
 	const logger = createLogger('bulk-share-content', {
@@ -269,6 +303,9 @@ async function main() {
 			accessLevelColumn,
 			defaultAccessLevel,
 			verbose,
+			skipInvalidDatasets,
+			invalidDatasetCount: invalidDatasetIds.length,
+			invalidDatasetIds,
 			totalItems: fileJson.length,
 			contentItemCount: contentItems.length,
 			datasetItemCount: datasetItems.length
@@ -475,9 +512,14 @@ async function main() {
 	}
 
 	console.log('\n=== Summary ===');
-	console.log(`Total items processed: ${fileJson.length}`);
+	console.log(
+		`Total items processed: ${contentItems.length + datasetItems.length}`
+	);
 	console.log(`  Content items: ${contentItems.length}`);
 	console.log(`  Datasets: ${datasetItems.length}`);
+	if (invalidDatasetIds.length > 0) {
+		console.log(`Skipped invalid datasets: ${invalidDatasetIds.length}`);
+	}
 	console.log(`Successful operations: ${successCount}`);
 	console.log(`Failed operations: ${errorCount}`);
 
@@ -485,6 +527,7 @@ async function main() {
 		totalItems: fileJson.length,
 		contentItems: contentItems.length,
 		datasetItems: datasetItems.length,
+		skippedInvalidDatasets: invalidDatasetIds.length,
 		successfulBatches: successCount,
 		failedBatches: errorCount
 	});
