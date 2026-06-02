@@ -2,16 +2,29 @@
 
 CLI toolkit for automating and managing [Domo](https://www.domo.com/) business intelligence instances. Bulk operations on DataFlows, DataSets, Streams, PDP policies, content sharing, and more — all through a single entry point.
 
-## Setup
+## Install
+
+This package is **not published to the npm registry**. Install it directly from GitHub.
+
+### As a dependency in another project
 
 ```bash
-git clone <repo-url>
-cd domo-scripts
-yarn install
-cp .env.example .env
+npm install github:brycewc/domo-scripts            # latest main
+npm install github:brycewc/domo-scripts#v1.0.0     # pinned to a release tag
 ```
 
-Edit `.env` with your Domo credentials:
+or in your `package.json`:
+
+```json
+"dependencies": {
+  "domo-scripts": "github:brycewc/domo-scripts#v1.0.0"
+}
+```
+
+There is no build step, so a plain `npm install` (or `yarn add`) is all that's needed.
+
+Then create a `.env` in **your project's** root (the directory you run commands from) with
+your Domo credentials:
 
 ```
 DOMO_INSTANCE=your-instance
@@ -19,6 +32,35 @@ DOMO_ACCESS_TOKEN=your-access-token
 ```
 
 The instance name is the subdomain from your Domo URL (`https://<instance>.domo.com`).
+Config (`.env` / `.env.<name>`), `logs/`, and `id-mappings/` all resolve against your
+project's working directory, not the installed package. You can also supply
+`DOMO_INSTANCE` / `DOMO_ACCESS_TOKEN` as real environment variables (e.g. in CI) with no
+`.env` file at all.
+
+**Use the CLI** — the package installs a `domo-scripts` bin:
+
+```bash
+npx domo-scripts --help
+npx domo-scripts bulk-share-content --file content.csv --user 12345 --content-type card
+```
+
+**Use it as a library** — `require('domo-scripts')` returns the shared modules:
+
+```js
+const { api, readCSV, resolveIds, createLogger, config } = require('domo-scripts');
+```
+
+### For local development on this repo
+
+```bash
+git clone https://github.com/brycewc/domo-scripts.git
+cd domo-scripts
+yarn install
+cp .env.example .env
+```
+
+Edit `.env` with your Domo credentials (same variables as above), then run commands with
+`node cli.js <command>`.
 
 ### Multiple Environments
 
