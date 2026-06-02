@@ -2,9 +2,9 @@
  * Delete all triggers from dataflows listed in a CSV file (or by ID).
  *
  * Reads a CSV, extracts dataflow IDs from a configurable column (default "DataFlow ID"),
- * then for each dataflow: GETs the definition, nulls triggerSettings, flips every
- * inputs[].executeFlowWhenUpdated and actions[].executeFlowWhenUpdated flag to false,
- * and PUTs the full definition back. Skips dataflows that have no triggers to begin
+ * then for each dataflow: GETs the definition, nulls triggerSettings and scheduleInfo,
+ * flips every inputs[].executeFlowWhenUpdated and actions[].executeFlowWhenUpdated flag
+ * to false, and PUTs the full definition back. Skips dataflows that have no triggers to begin
  * with.
  *
  * Some dataflow types (e.g. MySQL) represent dataset-update triggers in two places:
@@ -12,6 +12,9 @@
  * `inputs[]` and the matching LoadFromVault entry in `actions[]`. Clearing only
  * triggerSettings leaves the input-level flag set, and Domo keeps firing the
  * dataflow on dataset updates — so we must clear both.
+ *
+ * Time-based (SCHEDULE) triggers are mirrored the same way: the schedule lives in
+ * triggerSettings AND in a top-level scheduleInfo cron object, so we null both.
  *
  * Usage:
  *   node cli.js bulk-delete-dataflow-triggers --file "dataflows.csv"
@@ -67,6 +70,8 @@ function clearTriggers(definition, description) {
 			)
 		: 0;
 
+	const scheduleRemoved = definition.scheduleInfo != null;
+
 	let inputTriggersRemoved = 0;
 	if (Array.isArray(definition.inputs)) {
 		for (const input of definition.inputs) {
@@ -90,6 +95,7 @@ function clearTriggers(definition, description) {
 	const modified =
 		triggersRemoved > 0 ||
 		eventsRemoved > 0 ||
+		scheduleRemoved ||
 		inputTriggersRemoved > 0 ||
 		actionTriggersRemoved > 0;
 
@@ -98,12 +104,14 @@ function clearTriggers(definition, description) {
 			modified: false,
 			triggersRemoved: 0,
 			eventsRemoved: 0,
+			scheduleRemoved: false,
 			inputTriggersRemoved: 0,
 			actionTriggersRemoved: 0
 		};
 	}
 
 	definition.triggerSettings = null;
+	definition.scheduleInfo = null;
 
 	definition.onboardFlowVersion = {
 		description,
@@ -114,6 +122,7 @@ function clearTriggers(definition, description) {
 		modified: true,
 		triggersRemoved,
 		eventsRemoved,
+		scheduleRemoved,
 		inputTriggersRemoved,
 		actionTriggersRemoved
 	};
@@ -175,6 +184,7 @@ async function main() {
 			name: null,
 			triggersRemoved: 0,
 			eventsRemoved: 0,
+			scheduleRemoved: false,
 			inputTriggersRemoved: 0,
 			actionTriggersRemoved: 0,
 			error: null
@@ -189,18 +199,21 @@ async function main() {
 			if (debugLog) {
 				debugLog.originalDefinition = JSON.parse(JSON.stringify(definition));
 				debugLog.originalTriggerSettings = JSON.parse(JSON.stringify(definition.triggerSettings || null));
+				debugLog.originalScheduleInfo = JSON.parse(JSON.stringify(definition.scheduleInfo || null));
 			}
 
 			const {
 				modified,
 				triggersRemoved,
 				eventsRemoved,
+				scheduleRemoved,
 				inputTriggersRemoved,
 				actionTriggersRemoved
 			} = clearTriggers(definition, description);
 
 			entry.triggersRemoved = triggersRemoved;
 			entry.eventsRemoved = eventsRemoved;
+			entry.scheduleRemoved = scheduleRemoved;
 			entry.inputTriggersRemoved = inputTriggersRemoved;
 			entry.actionTriggersRemoved = actionTriggersRemoved;
 
@@ -208,14 +221,16 @@ async function main() {
 				debugLog.modified = modified;
 				debugLog.triggersRemoved = triggersRemoved;
 				debugLog.eventsRemoved = eventsRemoved;
+				debugLog.scheduleRemoved = scheduleRemoved;
 				debugLog.inputTriggersRemoved = inputTriggersRemoved;
 				debugLog.actionTriggersRemoved = actionTriggersRemoved;
 				debugLog.modifiedTriggerSettings = JSON.parse(JSON.stringify(definition.triggerSettings || null));
+				debugLog.modifiedScheduleInfo = JSON.parse(JSON.stringify(definition.scheduleInfo || null));
 				debugLog.modifiedInputs = JSON.parse(JSON.stringify(definition.inputs || null));
 				debugLog.modifiedActions = JSON.parse(JSON.stringify(definition.actions || null));
 			}
 
-			const summary = `${triggersRemoved} trigger(s), ${eventsRemoved} trigger event(s), ${inputTriggersRemoved} input flag(s), ${actionTriggersRemoved} action flag(s)`;
+			const summary = `${triggersRemoved} trigger(s), ${eventsRemoved} trigger event(s), ${scheduleRemoved ? 1 : 0} schedule(s), ${inputTriggersRemoved} input flag(s), ${actionTriggersRemoved} action flag(s)`;
 
 			if (!modified) {
 				console.log('  Skipped (no triggers to delete)\n');

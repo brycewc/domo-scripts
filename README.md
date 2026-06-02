@@ -91,6 +91,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-add-dataset-tags` | Add tags to datasets from a CSV or by owner |
 | `bulk-apply-pdp-policies` | Copy PDP policies from a source dataset to target datasets |
 | `bulk-convert-stream-provider` | Convert streams from one connector type to another |
+| `bulk-delete-accounts` | Delete data connection accounts listed in a CSV |
 | `bulk-delete-dataflow-triggers` | Remove all triggers from dataflows listed in a CSV |
 | `bulk-delete-datasets` | Delete datasets listed in a CSV |
 | `bulk-delete-users` | Delete users listed in a CSV. Does not check or transfer ownership — prompts for confirmation. |
@@ -105,6 +106,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-update-column-pdp-policy` | Update users/groups on a column-based PDP policy |
 | `bulk-update-stream-schedules` | Change stream schedules to daily (randomized times), manual, or restore arbitrary schedules from a CSV (`--mode from-file`) |
 | `bulk-update-stream-update-method` | Change stream update mode from Replace to Append |
+| `check-credentials` | Validate the configured API credentials against the selected instance |
 | `clear-logs` | Delete every log file under `logs/` (supports `--dry-run` and `--command` filter) |
 | `extract-card-ids` | Extract card IDs from a page export JSON |
 | `swap-input-in-dataflows` | Replace a dataset input across all consuming dataflows |
