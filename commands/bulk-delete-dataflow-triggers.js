@@ -30,7 +30,7 @@
  *   --dataflow-ids   Comma-separated dataflow IDs
  *   --filter-column  CSV column to filter on (optional, requires --filter-value)
  *   --filter-value   Value the filter-column must equal to include the row
- *   --description    Version description recorded on the dataflow (default: "Removed all triggers")
+ *   --description    Version description recorded on the dataflow (default: "Removed all triggers via script")
  *   --dry-run        Preview which dataflows would be modified without applying
  */
 
@@ -57,17 +57,14 @@ Options:
   --dataflow-ids   Comma-separated dataflow IDs
   --filter-column  CSV column to filter on
   --filter-value   Value the filter-column must equal
-  --description    Version description recorded on the dataflow (default: "Removed all triggers")
+  --description    Version description recorded on the dataflow (default: "Removed all triggers via script")
   --dry-run        Preview without applying changes`;
 
 function clearTriggers(definition, description) {
 	const triggers = definition.triggerSettings?.triggers;
 	const triggersRemoved = Array.isArray(triggers) ? triggers.length : 0;
 	const eventsRemoved = Array.isArray(triggers)
-		? triggers.reduce(
-				(sum, t) => sum + (Array.isArray(t?.triggerEvents) ? t.triggerEvents.length : 0),
-				0
-			)
+		? triggers.reduce((sum, t) => sum + (Array.isArray(t?.triggerEvents) ? t.triggerEvents.length : 0), 0)
 		: 0;
 
 	const scheduleRemoved = definition.scheduleInfo != null;
@@ -138,7 +135,7 @@ async function main() {
 	}
 
 	const dryRun = argv['dry-run'] || argv.dry || false;
-	const description = argv.description || 'Removed all triggers';
+	const description = argv.description || 'Removed all triggers via script';
 
 	const { ids: dataflowIds, debugMode } = resolveIds(argv, {
 		name: 'dataflow',
@@ -202,14 +199,8 @@ async function main() {
 				debugLog.originalScheduleInfo = JSON.parse(JSON.stringify(definition.scheduleInfo || null));
 			}
 
-			const {
-				modified,
-				triggersRemoved,
-				eventsRemoved,
-				scheduleRemoved,
-				inputTriggersRemoved,
-				actionTriggersRemoved
-			} = clearTriggers(definition, description);
+			const { modified, triggersRemoved, eventsRemoved, scheduleRemoved, inputTriggersRemoved, actionTriggersRemoved } =
+				clearTriggers(definition, description);
 
 			entry.triggersRemoved = triggersRemoved;
 			entry.eventsRemoved = eventsRemoved;

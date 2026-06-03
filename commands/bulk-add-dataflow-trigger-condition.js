@@ -22,6 +22,9 @@
  *   --unit           Condition unit (default: "MINUTE")
  *   --no-negated     Set negated to false (default: negated is true)
  *   --type           Condition type (default: "DATAFLOW_LAST_RUN")
+ *   --description    Version description recorded on the dataflow. {value} and {unit}
+ *                    are replaced with the condition value/unit
+ *                    (default: "Updated the schedule settings to limit triggers to {value}")
  */
 
 const api = require('../lib/api');
@@ -46,7 +49,10 @@ Options:
   --value          Condition value (default: 1440)
   --unit           Condition unit (default: "MINUTE")
   --no-negated     Set negated to false (default: negated is true)
-  --type           Condition type (default: "DATAFLOW_LAST_RUN")`;
+  --type           Condition type (default: "DATAFLOW_LAST_RUN")
+  --description    Version description recorded on the dataflow. {value} and {unit}
+                   are replaced with the condition value/unit
+                   (default: "Updated the schedule settings to limit triggers to {value}")`;
 
 const CONDITION_TO_ADD = {
 	value: argv.value !== undefined ? argv.value : 1440,
@@ -65,7 +71,7 @@ function hasMatchingCondition(triggerConditions) {
 	);
 }
 
-function addTriggerConditions(definition) {
+function addTriggerConditions(definition, description) {
 	const triggers = definition.triggerSettings?.triggers;
 	if (!Array.isArray(triggers) || triggers.length === 0) {
 		return { modified: false, triggersUpdated: 0 };
@@ -79,17 +85,13 @@ function addTriggerConditions(definition) {
 		}
 
 		if (hasMatchingCondition(trigger.triggerConditions)) {
-			console.log(
-				`    Trigger "${trigger.title || trigger.triggerId}" already has condition, skipping`
-			);
+			console.log(`    Trigger "${trigger.title || trigger.triggerId}" already has condition, skipping`);
 			continue;
 		}
 
 		trigger.triggerConditions.push({ ...CONDITION_TO_ADD });
 		triggersUpdated++;
-		console.log(
-			`    Added condition to trigger "${trigger.title || trigger.triggerId}"`
-		);
+		console.log(`    Added condition to trigger "${trigger.title || trigger.triggerId}"`);
 	}
 
 	if (triggersUpdated > 0) {
@@ -110,7 +112,7 @@ function addTriggerConditions(definition) {
 			}
 		}
 		definition.onboardFlowVersion = {
-			description: 'Updated the scheduled settings.',
+			description,
 			onboardFlowId: definition.id
 		};
 	}
@@ -127,6 +129,14 @@ async function main() {
 		process.exit(1);
 	}
 
+	const descriptionTemplate =
+		typeof argv.description === 'string' && argv.description
+			? argv.description
+			: 'Updated the schedule settings to limit trigger';
+	const description = descriptionTemplate
+		.replaceAll('{value}', CONDITION_TO_ADD.value)
+		.replaceAll('{unit}', CONDITION_TO_ADD.unit);
+
 	const { ids: dataflowIds, debugMode } = resolveIds(argv, {
 		name: 'dataflow',
 		columnDefault: 'DataFlow ID'
@@ -137,14 +147,13 @@ async function main() {
 		runMeta: {
 			file: argv.file || argv.f || null,
 			column: argv.column || argv.c || 'DataFlow ID',
+			description,
 			totalDataflows: dataflowIds.length
 		}
 	});
 
 	if (debugMode) {
-		console.log(
-			`Processing single dataflow ${dataflowIds[0]} (debug log enabled)\n`
-		);
+		console.log(`Processing single dataflow ${dataflowIds[0]} (debug log enabled)\n`);
 	} else {
 		console.log(`Found ${dataflowIds.length} dataflow(s) to process\n`);
 	}
@@ -158,43 +167,32 @@ async function main() {
 		const progress = `[${i + 1}/${dataflowIds.length}]`;
 		console.log(`${progress} Processing dataflow ${dataflowId}...`);
 
-		const debugLog = debugMode
-			? { dataflowId, timestamp: new Date().toISOString() }
-			: null;
+		const debugLog = debugMode ? { dataflowId, timestamp: new Date().toISOString() } : null;
 
 		const entry = { dataflowId, status: null, name: null, error: null };
 
 		try {
 			console.log('  Fetching dataflow definition...');
-			const definition = await api.get(
-				`/dataprocessing/v2/dataflows/${dataflowId}`
-			);
+			const definition = await api.get(`/dataprocessing/v2/dataflows/${dataflowId}`);
 			entry.name = definition.name;
 			console.log(`  Name: "${definition.name}"`);
 
 			if (debugLog) {
 				debugLog.originalDefinition = JSON.parse(JSON.stringify(definition));
-				debugLog.originalTriggerSettings = JSON.parse(
-					JSON.stringify(definition.triggerSettings || null)
-				);
+				debugLog.originalTriggerSettings = JSON.parse(JSON.stringify(definition.triggerSettings || null));
 			}
 
-			const { modified, triggersUpdated } = addTriggerConditions(definition);
+			const { modified, triggersUpdated } = addTriggerConditions(definition, description);
 
 			if (debugLog) {
 				debugLog.modified = modified;
 				debugLog.triggersUpdated = triggersUpdated;
-				debugLog.modifiedTriggerSettings = JSON.parse(
-					JSON.stringify(definition.triggerSettings || null)
-				);
+				debugLog.modifiedTriggerSettings = JSON.parse(JSON.stringify(definition.triggerSettings || null));
 			}
 
 			if (modified) {
 				console.log('  Updating dataflow...');
-				const putResult = await api.put(
-					`/dataprocessing/v1/dataflows/${dataflowId}`,
-					definition
-				);
+				const putResult = await api.put(`/dataprocessing/v1/dataflows/${dataflowId}`, definition);
 				console.log('  Successfully updated\n');
 				entry.status = 'updated';
 				entry.triggersUpdated = triggersUpdated;
@@ -236,9 +234,7 @@ async function main() {
 	logger.writeRunLog({ successCount, skipCount, errorCount });
 
 	if (errorCount > 0) {
-		console.error(
-			'\nSome dataflows failed to update. Check the error messages above.'
-		);
+		console.error('\nSome dataflows failed to update. Check the error messages above.');
 		process.exit(1);
 	} else {
 		console.log('\nAll dataflows processed successfully!');
