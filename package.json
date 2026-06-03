@@ -3,8 +3,28 @@
   "version": "1.0.0",
   "description": "CLI tools for Domo administration and automation",
   "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brycewc/domo-scripts.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cli.js",
+    "commands/",
+    "lib/",
+    ".env.example",
+    "README.md"
+  ],
   "bin": {
-    "domo": "./cli.js"
+    "domo-scripts": "./cli.js"
   },
   "scripts": {
     "lint": "eslint .",
@@ -20,5 +40,5 @@
     "eslint": "^10.2.1",
     "eslint-plugin-perfectionist": "^4.0.0"
   },
-  "packageManager": "yarn@4.14.1"
+  "packageManager": "yarn@4.16.0"
 }
