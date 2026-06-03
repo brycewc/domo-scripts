@@ -489,13 +489,17 @@ async function runType(type, ids, ctx) {
 	return handler(fromUserId, toUserId, ids, ctx);
 }
 
-async function safe(label, fn) {
+async function safe(label, fn, context) {
 	try {
 		return await fn();
 	} catch (err) {
 		const message = err.message || String(err);
 		console.error(`  ✗ ${label}: ${message}`);
-		failures.push({ type: activeType, label, message, time: new Date().toISOString() });
+		const failure = { type: activeType, label, message, time: new Date().toISOString() };
+		// Bulk calls act on many IDs at once; record what was sent so a failed
+		// batch shows which objects were affected instead of just the count.
+		if (context !== undefined) failure.context = context;
+		failures.push(failure);
 		return null;
 	}
 }
@@ -691,52 +695,6 @@ async function transferAppDbCollections(fromUserId, toUserId, filteredIds, { dry
 
 	for (const id of ids) {
 		await safe(`update collection ${id}`, () => api.put(`/datastores/v1/collections/${id}`, { id, owner: toUserId }));
-	}
-	return { transferred: ids };
-}
-
-async function transferAppStudioApps(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner }) {
-	let ids = filteredIds.map(String);
-	if (ids.length === 0) {
-		const limit = 30;
-		let skip = 0;
-		while (true) {
-			const res = await safe(`list app studio apps skip=${skip}`, () =>
-				api.post(`/content/v1/dataapps/adminsummary?limit=${limit}&skip=${skip}`, {
-					ascending: true,
-					includeOwnerClause: true,
-					includeTitleClause: true,
-					orderBy: 'title',
-					ownerIds: [fromUserId],
-					titleSearchText: '',
-					type: 'app'
-				})
-			);
-			const summaries = res && res.dataAppAdminSummaries;
-			if (!summaries || summaries.length === 0) break;
-			ids.push(...summaries.map((s) => String(s.dataAppId)));
-			if (summaries.length < limit) break;
-			skip += limit;
-		}
-	}
-	if (ids.length === 0) return { transferred: [] };
-	if (dryRun) return { transferred: ids };
-
-	await safe('add app studio owners', () =>
-		api.put('/content/v1/dataapps/bulk/owners', {
-			note: '',
-			entityIds: ids,
-			owners: [{ type: 'USER', id: parseInt(toUserId, 10) }],
-			sendEmail: false
-		})
-	);
-	if (fromUserId && !keepPreviousOwner) {
-		await safe('remove old app studio owners', () =>
-			api.post('/content/v1/dataapps/bulk/owners/remove', {
-				entityIds: ids,
-				owners: [{ type: 'USER', id: fromUserId }]
-			})
-		);
 	}
 	return { transferred: ids };
 }
@@ -942,6 +900,58 @@ async function transferApprovalTemplates(fromUserId, toUserId, filteredIds, { dr
 	return { transferred: templateIds };
 }
 
+async function transferAppStudioApps(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner }) {
+	let ids = filteredIds.map(String);
+	if (ids.length === 0) {
+		const limit = 30;
+		let skip = 0;
+		while (true) {
+			const res = await safe(`list app studio apps skip=${skip}`, () =>
+				api.post(`/content/v1/dataapps/adminsummary?limit=${limit}&skip=${skip}`, {
+					ascending: true,
+					includeOwnerClause: true,
+					includeTitleClause: true,
+					orderBy: 'title',
+					ownerIds: [fromUserId],
+					titleSearchText: '',
+					type: 'app'
+				})
+			);
+			const summaries = res && res.dataAppAdminSummaries;
+			if (!summaries || summaries.length === 0) break;
+			ids.push(...summaries.map((s) => String(s.dataAppId)));
+			if (summaries.length < limit) break;
+			skip += limit;
+		}
+	}
+	if (ids.length === 0) return { transferred: [] };
+	if (dryRun) return { transferred: ids };
+
+	await safe(
+		'add app studio owners',
+		() =>
+			api.put('/content/v1/dataapps/bulk/owners', {
+				note: '',
+				entityIds: ids,
+				owners: [{ type: 'USER', id: parseInt(toUserId, 10) }],
+				sendEmail: false
+			}),
+		{ entityIds: ids }
+	);
+	if (fromUserId && !keepPreviousOwner) {
+		await safe(
+			'remove old app studio owners',
+			() =>
+				api.post('/content/v1/dataapps/bulk/owners/remove', {
+					entityIds: ids,
+					owners: [{ type: 'USER', id: fromUserId }]
+				}),
+			{ entityIds: ids }
+		);
+	}
+	return { transferred: ids };
+}
+
 async function transferCards(fromUserId, toUserId, filteredIds, { dryRun }) {
 	let ids = filteredIds;
 	if (ids.length === 0) {
@@ -975,13 +985,16 @@ async function transferCards(fromUserId, toUserId, filteredIds, { dryRun }) {
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
-	await safe('add card owner', () =>
-		api.post('/content/v1/cards/owners/add', {
-			cardIds: ids,
-			cardOwners: [{ id: toUserId, type: 'USER' }],
-			note: '',
-			sendEmail: false
-		})
+	await safe(
+		'add card owner',
+		() =>
+			api.post('/content/v1/cards/owners/add', {
+				cardIds: ids,
+				cardOwners: [{ id: toUserId, type: 'USER' }],
+				note: '',
+				sendEmail: false
+			}),
+		{ cardIds: ids }
 	);
 	return { transferred: ids };
 }
@@ -1098,22 +1111,28 @@ async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fr
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
-	await safe('reassign dataflows', () =>
-		api.put('/dataprocessing/v1/dataflows/bulk/patch', {
-			dataFlowIds: ids,
-			responsibleUserId: toUserId
-		})
+	await safe(
+		'reassign dataflows',
+		() =>
+			api.put('/dataprocessing/v1/dataflows/bulk/patch', {
+				dataFlowIds: ids,
+				responsibleUserId: toUserId
+			}),
+		{ dataFlowIds: ids }
 	);
 
 	if (fromUserName) {
 		const batchSize = 50;
 		for (let i = 0; i < ids.length; i += batchSize) {
 			const chunk = ids.slice(i, i + batchSize);
-			await safe(`tag dataflows ${i + 1}-${i + chunk.length}`, () =>
-				api.put('/dataprocessing/v1/dataflows/bulk/tag', {
-					dataFlowIds: chunk,
-					tagNames: [`From ${fromUserName}`]
-				})
+			await safe(
+				`tag dataflows ${i + 1}-${i + chunk.length}`,
+				() =>
+					api.put('/dataprocessing/v1/dataflows/bulk/tag', {
+						dataFlowIds: chunk,
+						tagNames: [`From ${fromUserName}`]
+					}),
+				{ dataFlowIds: chunk }
 			);
 		}
 	}
@@ -1137,19 +1156,25 @@ async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fro
 	const batchSize = 50;
 	for (let i = 0; i < ids.length; i += batchSize) {
 		const chunk = ids.slice(i, i + batchSize);
-		await safe(`reassign datasets ${i + 1}-${i + chunk.length}`, () =>
-			api.post('/data/v1/ui/bulk/reassign', {
-				type: 'DATA_SOURCE',
-				ids: chunk,
-				userId: toUserId
-			})
+		await safe(
+			`reassign datasets ${i + 1}-${i + chunk.length}`,
+			() =>
+				api.post('/data/v1/ui/bulk/reassign', {
+					type: 'DATA_SOURCE',
+					ids: chunk,
+					userId: toUserId
+				}),
+			{ ids: chunk }
 		);
 		if (fromUserName) {
-			await safe(`tag datasets ${i + 1}-${i + chunk.length}`, () =>
-				api.post('/data/v1/ui/bulk/tag', {
-					bulkItems: { ids: chunk, type: 'DATA_SOURCE' },
-					tags: [`From ${fromUserName}`]
-				})
+			await safe(
+				`tag datasets ${i + 1}-${i + chunk.length}`,
+				() =>
+					api.post('/data/v1/ui/bulk/tag', {
+						bulkItems: { ids: chunk, type: 'DATA_SOURCE' },
+						tags: [`From ${fromUserName}`]
+					}),
+				{ ids: chunk }
 			);
 		}
 	}
@@ -1215,7 +1240,9 @@ async function transferFunctions(fromUserId, toUserId, filteredIds, { dryRun }) 
 		for (const bucket of ['beastMode', 'variable']) {
 			for (let i = 0; i < updates[bucket].length; i += 100) {
 				const chunk = updates[bucket].slice(i, i + 100);
-				await safe(`bulk update ${bucket} ${i + 1}-${i + chunk.length}`, () => api.post(bulkUrl, { update: chunk }));
+				await safe(`bulk update ${bucket} ${i + 1}-${i + chunk.length}`, () => api.post(bulkUrl, { update: chunk }), {
+					ids: chunk.map((u) => u.id)
+				});
 			}
 			transferred[bucket].push(...updates[bucket].map((u) => u.id));
 		}
@@ -1241,8 +1268,10 @@ async function transferFunctions(fromUserId, toUserId, filteredIds, { dryRun }) 
 				for (const bucket of ['beastMode', 'variable']) {
 					for (let i = 0; i < updates[bucket].length; i += 100) {
 						const chunk = updates[bucket].slice(i, i + 100);
-						await safe(`bulk update ${bucket} ${i + 1}-${i + chunk.length}`, () =>
-							api.post(bulkUrl, { update: chunk })
+						await safe(
+							`bulk update ${bucket} ${i + 1}-${i + chunk.length}`,
+							() => api.post(bulkUrl, { update: chunk }),
+							{ ids: chunk.map((u) => u.id) }
 						);
 					}
 					transferred[bucket].push(...updates[bucket].map((u) => u.id));
@@ -1332,15 +1361,18 @@ async function transferGroups(fromUserId, toUserId, filteredIds, { dryRun, keepP
 	if (dryRun) return { transferred: ids };
 
 	const removeOldOwner = fromUserId && !keepPreviousOwner;
-	await safe('update group owners', () =>
-		api.put(
-			'/content/v2/groups/access',
-			ids.map((gid) => ({
-				groupId: gid,
-				addOwners: [{ type: 'USER', id: toUserId }],
-				...(removeOldOwner && { removeOwners: [{ type: 'USER', id: fromUserId }] })
-			}))
-		)
+	await safe(
+		'update group owners',
+		() =>
+			api.put(
+				'/content/v2/groups/access',
+				ids.map((gid) => ({
+					groupId: gid,
+					addOwners: [{ type: 'USER', id: toUserId }],
+					...(removeOldOwner && { removeOwners: [{ type: 'USER', id: fromUserId }] })
+				}))
+			),
+		{ groupIds: ids }
 	);
 	return { transferred: ids };
 }
@@ -1437,18 +1469,24 @@ async function transferPages(fromUserId, toUserId, filteredIds, { dryRun, keepPr
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
-	await safe('add page owners', () =>
-		api.put('/content/v1/pages/bulk/owners', {
-			owners: [{ id: toUserId, type: 'USER' }],
-			pageIds: ids
-		})
+	await safe(
+		'add page owners',
+		() =>
+			api.put('/content/v1/pages/bulk/owners', {
+				owners: [{ id: toUserId, type: 'USER' }],
+				pageIds: ids
+			}),
+		{ pageIds: ids }
 	);
 	if (fromUserId && !keepPreviousOwner) {
-		await safe('remove old page owners', () =>
-			api.post('/content/v1/pages/bulk/owners/remove', {
-				owners: [{ id: parseInt(fromUserId, 10), type: 'USER' }],
-				pageIds: ids
-			})
+		await safe(
+			'remove old page owners',
+			() =>
+				api.post('/content/v1/pages/bulk/owners/remove', {
+					owners: [{ id: parseInt(fromUserId, 10), type: 'USER' }],
+					pageIds: ids
+				}),
+			{ pageIds: ids }
 		);
 	}
 	return { transferred: ids };
@@ -1785,20 +1823,26 @@ async function transferWorksheets(fromUserId, toUserId, filteredIds, { dryRun, k
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
-	await safe('add worksheet owners', () =>
-		api.put('/content/v1/dataapps/bulk/owners', {
-			note: '',
-			entityIds: ids,
-			owners: [{ type: 'USER', id: parseInt(toUserId, 10) }],
-			sendEmail: false
-		})
+	await safe(
+		'add worksheet owners',
+		() =>
+			api.put('/content/v1/dataapps/bulk/owners', {
+				note: '',
+				entityIds: ids,
+				owners: [{ type: 'USER', id: parseInt(toUserId, 10) }],
+				sendEmail: false
+			}),
+		{ entityIds: ids }
 	);
 	if (fromUserId && !keepPreviousOwner) {
-		await safe('remove old worksheet owners', () =>
-			api.post('/content/v1/dataapps/bulk/owners/remove', {
-				entityIds: ids,
-				owners: [{ type: 'USER', id: fromUserId }]
-			})
+		await safe(
+			'remove old worksheet owners',
+			() =>
+				api.post('/content/v1/dataapps/bulk/owners/remove', {
+					entityIds: ids,
+					owners: [{ type: 'USER', id: fromUserId }]
+				}),
+			{ entityIds: ids }
 		);
 	}
 	return { transferred: ids };
