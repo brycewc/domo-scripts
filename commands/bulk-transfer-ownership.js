@@ -403,6 +403,25 @@ async function _main() {
 // `perfectionist/sort-modules` in eslint.config.js.
 // -----------------------------------------------------------------------------
 
+// Core of safe(): runs fn, and on error logs it + records it in `failures`,
+// returning an explicit { ok, value }. The ok flag is needed where a caller
+// must distinguish a real failure from a successful empty-body response — the
+// API client returns null for both, so safe()'s null return alone is ambiguous.
+async function attempt(label, fn, context) {
+	try {
+		return { ok: true, value: await fn() };
+	} catch (err) {
+		const message = err.message || String(err);
+		console.error(`  ✗ ${label}: ${message}`);
+		const failure = { type: activeType, label, message, time: new Date().toISOString() };
+		// Bulk calls act on many IDs at once; record what was sent so a failed
+		// batch shows which objects were affected instead of just the count.
+		if (context !== undefined) failure.context = context;
+		failures.push(failure);
+		return { ok: false, value: null };
+	}
+}
+
 async function getUserName(fromUserId) {
 	const res = await safe(`get user ${fromUserId}`, () => api.get(`/content/v3/users/${fromUserId}`));
 	return (res && res.displayName) || `User ${fromUserId}`;
@@ -490,18 +509,8 @@ async function runType(type, ids, ctx) {
 }
 
 async function safe(label, fn, context) {
-	try {
-		return await fn();
-	} catch (err) {
-		const message = err.message || String(err);
-		console.error(`  ✗ ${label}: ${message}`);
-		const failure = { type: activeType, label, message, time: new Date().toISOString() };
-		// Bulk calls act on many IDs at once; record what was sent so a failed
-		// batch shows which objects were affected instead of just the count.
-		if (context !== undefined) failure.context = context;
-		failures.push(failure);
-		return null;
-	}
+	const { value } = await attempt(label, fn, context);
+	return value;
 }
 
 async function sanitizeLinks(links) {
@@ -1111,20 +1120,36 @@ async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fr
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
-	await safe(
-		'reassign dataflows',
-		() =>
-			api.put('/dataprocessing/v1/dataflows/bulk/patch', {
-				dataFlowIds: ids,
-				responsibleUserId: toUserId
-			}),
-		{ dataFlowIds: ids }
-	);
+	const reassignBulk = (dataFlowIds) =>
+		api.put('/dataprocessing/v1/dataflows/bulk/patch', {
+			dataFlowIds,
+			responsibleUserId: toUserId
+		});
+	const reassignOne = (id) =>
+		api.put(`/dataprocessing/v1/dataflows/${id}/patch`, {
+			responsibleUserId: toUserId
+		});
 
-	if (fromUserName) {
+	// Try the whole set in one bulk patch first. If that fails, retry each
+	// dataflow on its own via the per-dataflow endpoint — a different code path
+	// that can succeed where the bulk call choked, and the per-ID failures
+	// pinpoint exactly which dataflows are the problem.
+	let transferred = ids;
+	const bulk = await attempt('reassign dataflows', () => reassignBulk(ids), { dataFlowIds: ids });
+	if (!bulk.ok) {
+		console.log(`  Bulk reassign failed — retrying ${ids.length} dataflow(s) individually...`);
+		transferred = [];
+		for (const id of ids) {
+			const one = await attempt(`reassign dataflow ${id}`, () => reassignOne(id), { dataFlowId: id });
+			if (one.ok) transferred.push(id);
+		}
+		console.log(`  Individual retry: ${transferred.length}/${ids.length} succeeded`);
+	}
+
+	if (fromUserName && transferred.length > 0) {
 		const batchSize = 50;
-		for (let i = 0; i < ids.length; i += batchSize) {
-			const chunk = ids.slice(i, i + batchSize);
+		for (let i = 0; i < transferred.length; i += batchSize) {
+			const chunk = transferred.slice(i, i + batchSize);
 			await safe(
 				`tag dataflows ${i + 1}-${i + chunk.length}`,
 				() =>
@@ -1136,7 +1161,7 @@ async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fr
 			);
 		}
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fromUserName }) {
@@ -1153,20 +1178,46 @@ async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fro
 
 	if (dryRun) return { transferred: ids };
 
+	const reassignBatch = (dsIds) =>
+		api.post('/data/v1/ui/bulk/reassign', {
+			type: 'DATA_SOURCE',
+			ids: dsIds,
+			userId: toUserId
+		});
+	const reassignOne = (id) =>
+		api.put(`/data/v2/datasources/${id}/responsibleUsers`, {
+			responsibleUserId: String(toUserId)
+		});
+
+	// Reassign in batches. When a batch fails, retry each dataset on its own via
+	// the per-dataset endpoint — a different code path that can succeed where the
+	// batch choked, and the per-ID failures pinpoint which datasets are the
+	// problem. transferred tracks only what actually went through, so the count
+	// and tagging stay honest.
 	const batchSize = 50;
+	const transferred = [];
 	for (let i = 0; i < ids.length; i += batchSize) {
 		const chunk = ids.slice(i, i + batchSize);
-		await safe(
-			`reassign datasets ${i + 1}-${i + chunk.length}`,
-			() =>
-				api.post('/data/v1/ui/bulk/reassign', {
-					type: 'DATA_SOURCE',
-					ids: chunk,
-					userId: toUserId
-				}),
-			{ ids: chunk }
-		);
-		if (fromUserName) {
+		const bulk = await attempt(`reassign datasets ${i + 1}-${i + chunk.length}`, () => reassignBatch(chunk), {
+			ids: chunk
+		});
+		if (bulk.ok) {
+			transferred.push(...chunk);
+		} else {
+			console.log(`  Batch ${i + 1}-${i + chunk.length} failed — retrying ${chunk.length} dataset(s) individually...`);
+			for (const id of chunk) {
+				const one = await attempt(`reassign dataset ${id}`, () => reassignOne(id), { id });
+				if (one.ok) transferred.push(id);
+			}
+		}
+	}
+	if (transferred.length < ids.length) {
+		console.log(`  Datasets reassigned: ${transferred.length}/${ids.length}`);
+	}
+
+	if (fromUserName && transferred.length > 0) {
+		for (let i = 0; i < transferred.length; i += batchSize) {
+			const chunk = transferred.slice(i, i + batchSize);
 			await safe(
 				`tag datasets ${i + 1}-${i + chunk.length}`,
 				() =>
@@ -1178,7 +1229,7 @@ async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fro
 			);
 		}
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferFilesets(fromUserId, toUserId, filteredIds, { dryRun }) {
