@@ -6,6 +6,7 @@ const commands = {
 	'bulk-add-dataset-tags': './commands/bulk-add-dataset-tags',
 	'bulk-apply-pdp-policies': './commands/bulk-apply-pdp-policies',
 	'bulk-delete-accounts': './commands/bulk-delete-accounts',
+	'bulk-delete-content': './commands/bulk-delete-content',
 	'bulk-delete-dataflow-triggers': './commands/bulk-delete-dataflow-triggers',
 	'bulk-delete-datasets': './commands/bulk-delete-datasets',
 	'bulk-delete-users': './commands/bulk-delete-users',
