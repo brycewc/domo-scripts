@@ -162,6 +162,12 @@ const HANDLERS = {
 // Types handled outside the per-type loop because they share an underlying API.
 const COALESCED_TYPES = new Set(['beast-mode', 'variable', 'project', 'project-task']);
 
+// Errors swallowed by safe() are collected here so they make it into the run
+// log instead of only being printed to the console. activeType tags each
+// failure with the type being processed when it occurred.
+const failures = [];
+let activeType = null;
+
 // -----------------------------------------------------------------------------
 // Entry point — pinned to the top by the `entry` custom group in
 // eslint.config.js. Renamed from `main` to `_main` so perfectionist's sort
@@ -278,7 +284,7 @@ async function _main() {
 	if (dryRun) console.log('DRY RUN — no write calls will be made.');
 
 	const ctx = { fromUserId, toUserId, fromUserName, toUserName, dryRun, keepPreviousOwner };
-	const summary = { totals: {}, skipped: [] };
+	const summary = { totals: {}, skipped: [], errors: failures };
 
 	for (const type of typesToProcess) {
 		const filtered = objectsByType ? objectsByType[type] || [] : [];
@@ -299,12 +305,14 @@ async function _main() {
 			const res = await runType(type, filtered, ctx);
 			const transferred = (res && res.transferred) || [];
 			summary.totals[type] = transferred.length;
-			logger.addResult({ type, transferred, details: res });
+			const typeErrors = failures.filter((f) => f.type === type);
+			logger.addResult({ type, transferred, errors: typeErrors, details: res });
+			if (typeErrors.length) console.log(`  ⚠ ${typeErrors.length} error(s) logged — see run log`);
 			console.log(`  → ${transferred.length} transferred`);
 		} catch (err) {
 			console.error(`  ✗ ${type} failed: ${err.message}`);
 			summary.totals[type] = 0;
-			logger.addResult({ type, error: err.message });
+			logger.addResult({ type, error: err.message, errors: failures.filter((f) => f.type === type) });
 		}
 	}
 
@@ -313,17 +321,20 @@ async function _main() {
 	const varSelected = typesToProcess.includes('variable');
 	if (beastSelected || varSelected) {
 		console.log(`\n=== beast-mode / variable ===`);
+		activeType = 'beast-mode/variable';
 		const combinedIds = [
 			...((objectsByType && objectsByType['beast-mode']) || []),
 			...((objectsByType && objectsByType['variable']) || [])
 		];
 		try {
 			const res = await transferFunctions(fromUserId, toUserId, combinedIds, ctx);
+			const coalescedErrors = failures.filter((f) => f.type === 'beast-mode/variable');
 			if (beastSelected) {
 				summary.totals['beast-mode'] = (res.beastModes || []).length;
 				logger.addResult({
 					type: 'beast-mode',
 					transferred: res.beastModes,
+					errors: coalescedErrors,
 					details: { deleted: res.deletedBeastModes }
 				});
 				console.log(`  → ${(res.beastModes || []).length} beast modes transferred`);
@@ -333,10 +344,12 @@ async function _main() {
 				logger.addResult({
 					type: 'variable',
 					transferred: res.variables,
+					errors: coalescedErrors,
 					details: { deleted: res.deletedVariables }
 				});
 				console.log(`  → ${(res.variables || []).length} variables transferred`);
 			}
+			if (coalescedErrors.length) console.log(`  ⚠ ${coalescedErrors.length} error(s) logged — see run log`);
 		} catch (err) {
 			console.error(`  ✗ beast-mode/variable failed: ${err.message}`);
 		}
@@ -347,20 +360,23 @@ async function _main() {
 	const taskSelected = typesToProcess.includes('project-task');
 	if (projectsSelected || taskSelected) {
 		console.log(`\n=== project / project-task ===`);
+		activeType = 'project/project-task';
 		const projectIds = (objectsByType && objectsByType['project']) || [];
 		const taskIds = (objectsByType && objectsByType['project-task']) || [];
 		try {
 			const res = await transferProjectsAndTasks(fromUserId, toUserId, projectIds, taskIds, ctx);
+			const coalescedErrors = failures.filter((f) => f.type === 'project/project-task');
 			if (projectsSelected) {
 				summary.totals['project'] = (res.projects || []).length;
-				logger.addResult({ type: 'project', transferred: res.projects, details: res });
+				logger.addResult({ type: 'project', transferred: res.projects, errors: coalescedErrors, details: res });
 				console.log(`  → ${(res.projects || []).length} projects transferred`);
 			}
 			if (taskSelected) {
 				summary.totals['project-task'] = (res.tasks || []).length;
-				logger.addResult({ type: 'project-task', transferred: res.tasks, details: res });
+				logger.addResult({ type: 'project-task', transferred: res.tasks, errors: coalescedErrors, details: res });
 				console.log(`  → ${(res.tasks || []).length} tasks transferred`);
 			}
+			if (coalescedErrors.length) console.log(`  ⚠ ${coalescedErrors.length} error(s) logged — see run log`);
 		} catch (err) {
 			console.error(`  ✗ projects/tasks failed: ${err.message}`);
 		}
@@ -375,6 +391,9 @@ async function _main() {
 		for (const s of summary.skipped) {
 			console.log(`  ${s.type} (${s.reason}): ${s.ids.length}`);
 		}
+	}
+	if (failures.length > 0) {
+		console.log(`Errors:    ${failures.length} (see run log for details)`);
 	}
 	logger.writeRunLog(summary);
 }
@@ -460,6 +479,7 @@ async function resourceExists(type, id) {
 
 async function runType(type, ids, ctx) {
 	console.log(`\n=== ${type} ===`);
+	activeType = type;
 	const { fromUserId, toUserId } = ctx;
 	const handler = HANDLERS[type];
 	if (!handler) {
@@ -473,7 +493,9 @@ async function safe(label, fn) {
 	try {
 		return await fn();
 	} catch (err) {
-		console.error(`  ✗ ${label}: ${err.message || err}`);
+		const message = err.message || String(err);
+		console.error(`  ✗ ${label}: ${message}`);
+		failures.push({ type: activeType, label, message, time: new Date().toISOString() });
 		return null;
 	}
 }
@@ -1858,14 +1880,21 @@ async function transferWorkspaces(fromUserId, toUserId, filteredIds, { dryRun, k
 				try {
 					await api.del(`/nav/v1/workspaces/${id}/members/${sourceMember.id}`);
 				} catch (delErr) {
-					console.warn(
-						`  ⚠ workspace ${id}: promoted new OWNER but failed to remove previous owner — workspace may now have two owners (${delErr.message})`
-					);
+					const message = `promoted new OWNER but failed to remove previous owner — workspace may now have two owners (${delErr.message})`;
+					console.warn(`  ⚠ workspace ${id}: ${message}`);
+					failures.push({
+						type: activeType,
+						label: `remove previous owner from workspace ${id}`,
+						message,
+						time: new Date().toISOString()
+					});
 				}
 			}
 			transferred.push(id);
 		} catch (err) {
-			console.error(`  ✗ workspace ${id}: ${err.message}`);
+			const message = err.message || String(err);
+			console.error(`  ✗ workspace ${id}: ${message}`);
+			failures.push({ type: activeType, label: `transfer workspace ${id}`, message, time: new Date().toISOString() });
 		}
 	}
 	return { transferred };
