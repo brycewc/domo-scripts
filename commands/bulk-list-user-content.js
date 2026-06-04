@@ -1006,7 +1006,9 @@ async function _main() {
 	}
 
 	const ts = new Date().toISOString().replace(/[:.]/g, '-');
-	const defaultOutDir = path.join(__dirname, '..', 'logs', 'bulk-list-user-content');
+	// Default output lands under the consuming project's working directory, not
+	// this package's install location, matching how logs are written.
+	const defaultOutDir = path.join(process.cwd(), 'logs', 'bulk-list-user-content');
 	const outputFile = argv.output || path.join(defaultOutDir, `user_content_${ts}.csv`);
 	fs.mkdirSync(path.dirname(outputFile), { recursive: true });
 	fs.writeFileSync(outputFile, csvRow(['User ID', 'User Name', 'Object Type', 'Object ID', 'Object Name']));
