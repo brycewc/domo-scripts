@@ -24,6 +24,7 @@ const commands = {
 	'bulk-update-stream-schedules': './commands/bulk-update-stream-schedules',
 	'bulk-update-stream-update-method': './commands/bulk-update-stream-update-method',
 	'bulk-update-users': './commands/bulk-update-users',
+	'build-activity-log-type-map': './commands/build-activity-log-type-map',
 	'check-credentials': './commands/check-credentials',
 	'clear-logs': './commands/clear-logs',
 	'extract-card-ids': './commands/extract-card-ids',
