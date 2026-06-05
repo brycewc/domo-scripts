@@ -8,8 +8,8 @@
  * Usage:
  *   node cli.js bulk-list-user-content --file users.csv
  *   node cli.js bulk-list-user-content --file users.csv --column "User ID"
- *   node cli.js bulk-list-user-content --user-id 12345
- *   node cli.js bulk-list-user-content --user-ids 12345,67890 --output owned.csv
+ *   node cli.js bulk-list-user-content --id 12345
+ *   node cli.js bulk-list-user-content --ids 12345,67890 --output owned.csv
  *   node cli.js bulk-list-user-content --file users.csv --object-types "dataset,card,dataflow"
  */
 
@@ -22,13 +22,13 @@ const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage: node cli.js bulk-list-user-content [options]
 
-For every user in --file (or --user-id/--user-ids), call all discovery endpoints
+For every user in --file (or --id/--ids), call all discovery endpoints
 from bulk-transfer-ownership and write a CSV with one row per (user, object).
 
 ID source (one of):
   --file <path>          CSV with user IDs (default column: "User ID")
-  --user-id <id>         Single user ID
-  --user-ids <a,b,c>     Comma-separated user IDs
+  --id <id>              Single user ID
+  --ids <a,b,c>          Comma-separated user IDs
 
 Optional:
   --column <name>        CSV column with user IDs (default: "User ID")
@@ -990,7 +990,11 @@ async function listForUserAndType(type, userId, caches, userCache) {
 async function _main() {
 	showHelp(argv, HELP_TEXT);
 
-	const { ids: userIds } = resolveIds(argv, { name: 'user', columnDefault: 'User ID' });
+	const { ids: userIds } = resolveIds(argv, {
+		idFlag: 'id',
+		idsFlag: 'ids',
+		columnDefault: 'User ID'
+	});
 
 	let types = ALL_TYPES;
 	if (argv['object-types']) {

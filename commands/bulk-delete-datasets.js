@@ -9,13 +9,13 @@
  *   node cli.js bulk-delete-datasets --file "datasets.csv" --column "My Column"
  *   node cli.js bulk-delete-datasets --file "datasets.csv" --dry-run
  *   node cli.js bulk-delete-datasets --file "datasets.csv" --batch-size 25
- *   node cli.js bulk-delete-datasets --dataset-id "00000000-0000-0000-0000-000000000000"
- *   node cli.js bulk-delete-datasets --dataset-ids "id1,id2,id3"
+ *   node cli.js bulk-delete-datasets --id "00000000-0000-0000-0000-000000000000"
+ *   node cli.js bulk-delete-datasets --ids "id1,id2,id3"
  *
  * Options:
  *   --file, -f     CSV file with dataset IDs
- *   --dataset-id   Single dataset ID (enables debug logging)
- *   --dataset-ids  Comma-separated dataset IDs
+ *   --id           Single dataset ID (enables debug logging)
+ *   --ids          Comma-separated dataset IDs
  *   --column, -c   CSV column name containing dataset IDs (default: "DataSet ID")
  *   --batch-size   Number of datasets per bulk API call (default: 50)
  *   --dry-run      Preview which datasets would be deleted without actually deleting
@@ -30,8 +30,8 @@ WARNING: This is a destructive operation.
 
 Options:
   --file, -f     CSV file with dataset IDs
-  --dataset-id   Single dataset ID
-  --dataset-ids  Comma-separated dataset IDs
+  --id           Single dataset ID
+  --ids          Comma-separated dataset IDs
   --column, -c   CSV column with dataset IDs (default: "DataSet ID")
   --batch-size   Datasets per bulk API call (default: 50)
   --dry-run      Preview without deleting`;
@@ -54,7 +54,8 @@ async function main() {
 	const dryRun = argv['dry-run'] || argv.dry || false;
 
 	const { ids: datasetIds, debugMode } = resolveIds(argv, {
-		name: 'dataset',
+		idFlag: 'id',
+		idsFlag: 'ids',
 		columnDefault: 'DataSet ID'
 	});
 

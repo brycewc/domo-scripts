@@ -8,14 +8,14 @@
  * Usage:
  *   node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv"
  *   node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv" --column "id"
- *   node cli.js bulk-add-dataflow-trigger-condition --dataflow-id 123
- *   node cli.js bulk-add-dataflow-trigger-condition --dataflow-ids "123,456,789"
+ *   node cli.js bulk-add-dataflow-trigger-condition --id 123
+ *   node cli.js bulk-add-dataflow-trigger-condition --ids "123,456,789"
  *
  * Options:
  *   --file, -f       CSV file with dataflow IDs
  *   --column, -c     CSV column name containing dataflow IDs (default: "DataFlow ID")
- *   --dataflow-id    Single dataflow ID (enables debug logging)
- *   --dataflow-ids   Comma-separated dataflow IDs
+ *   --id             Single dataflow ID (enables debug logging)
+ *   --ids            Comma-separated dataflow IDs
  *   --filter-column  CSV column to filter on (optional, requires --filter-value)
  *   --filter-value   Value the filter-column must equal to include the row
  *   --value          Condition value (default: 1440)
@@ -36,14 +36,14 @@ const argv = require('minimist')(process.argv.slice(2));
 const HELP_TEXT = `Usage:
   node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv"
   node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv" --column "id"
-  node cli.js bulk-add-dataflow-trigger-condition --dataflow-id 123
-  node cli.js bulk-add-dataflow-trigger-condition --dataflow-ids "123,456,789"
+  node cli.js bulk-add-dataflow-trigger-condition --id 123
+  node cli.js bulk-add-dataflow-trigger-condition --ids "123,456,789"
 
 Options:
   --file, -f       CSV file with dataflow IDs
   --column, -c     CSV column name containing dataflow IDs (default: "DataFlow ID")
-  --dataflow-id    Single dataflow ID (enables debug logging)
-  --dataflow-ids   Comma-separated dataflow IDs
+  --id             Single dataflow ID (enables debug logging)
+  --ids            Comma-separated dataflow IDs
   --filter-column  CSV column to filter on
   --filter-value   Value the filter-column must equal
   --value          Condition value (default: 1440)
@@ -123,8 +123,8 @@ function addTriggerConditions(definition, description) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	if (!argv.file && !argv.f && !argv['dataflow-id'] && !argv['dataflow-ids']) {
-		console.error('Error: --file, --dataflow-id, or --dataflow-ids is required\n');
+	if (!argv.file && !argv.f && !argv.id && !argv.ids) {
+		console.error('Error: --file, --id, or --ids is required\n');
 		console.error(HELP_TEXT);
 		process.exit(1);
 	}
@@ -138,7 +138,8 @@ async function main() {
 		.replaceAll('{unit}', CONDITION_TO_ADD.unit);
 
 	const { ids: dataflowIds, debugMode } = resolveIds(argv, {
-		name: 'dataflow',
+		idFlag: 'id',
+		idsFlag: 'ids',
 		columnDefault: 'DataFlow ID'
 	});
 

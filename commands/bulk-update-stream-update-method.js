@@ -4,13 +4,13 @@
  * Usage:
  *   node cli.js bulk-update-stream-update-method --file "stream-ids.csv"
  *   node cli.js bulk-update-stream-update-method --file "stream-ids.csv" --column "streamId"
- *   node cli.js bulk-update-stream-update-method --stream-id 12345
- *   node cli.js bulk-update-stream-update-method --stream-ids "123,456,789"
+ *   node cli.js bulk-update-stream-update-method --id 12345
+ *   node cli.js bulk-update-stream-update-method --ids "123,456,789"
  *
  * Options:
  *   --file, -f        CSV file with stream IDs
- *   --stream-id       Single stream ID
- *   --stream-ids      Comma-separated stream IDs
+ *   --id              Single stream ID
+ *   --ids             Comma-separated stream IDs
  *   --column, -c      CSV column containing stream IDs (default: "streamId")
  *   --filter-column   CSV column to filter on (optional, requires --filter-value)
  *   --filter-value    Value the filter-column must equal to include the row
@@ -25,8 +25,8 @@ Bulk update Domo streams to change update mode from Replace to Append.
 
 Options:
   --file, -f        CSV file with stream IDs
-  --stream-id       Single stream ID
-  --stream-ids      Comma-separated stream IDs
+  --id              Single stream ID
+  --ids             Comma-separated stream IDs
   --column, -c      CSV column containing stream IDs (default: "streamId")
   --filter-column   CSV column to filter on (optional, requires --filter-value)
   --filter-value    Value the filter-column must equal to include the row`;
@@ -74,7 +74,8 @@ async function main() {
 	showHelp(argv, HELP_TEXT);
 
 	const { ids: streamIds, debugMode } = resolveIds(argv, {
-		name: 'stream',
+		idFlag: 'id',
+		idsFlag: 'ids',
 		columnDefault: 'streamId'
 	});
 

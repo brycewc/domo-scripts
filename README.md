@@ -109,7 +109,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --start-hour 6 --e
 node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv" --column "DataFlow ID"
 
 # Or pass a single ID for debug logging
-node cli.js bulk-add-dataflow-trigger-condition --dataflow-id 123
+node cli.js bulk-add-dataflow-trigger-condition --id 123
 
 # Upload data to a dataset in batches
 node cli.js upload-dataset --file "data.csv" --dataset-id "abc-123" --batch-size 50000
