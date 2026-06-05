@@ -7,13 +7,24 @@
  *   bulk-transfer-ownership (used)  +  bulk-delete-content (unused)
  *
  * Supported types (native bulk endpoints used where they exist):
- *   dataflow   PUT    /dataprocessing/v1/dataflows/bulk/delete   (bulk)
- *   card       DELETE /content/v1/cards/bulk                     (bulk)
- *   dataset    POST   /data/v1/ui/bulk/delete                    (bulk)
- *   page       DELETE /content/v1/pages/{id}                     (per-item)
- *   app-studio DELETE /content/v1/dataapps/{appId}               (per-item)
- *   collection DELETE /datastores/v1/collections/{id}            (per-item)
- *   account    DELETE /accounts/v1/accounts/{id}                 (per-item)
+ *   dataflow     PUT    /dataprocessing/v1/dataflows/bulk/delete           (bulk)
+ *   card         DELETE /content/v1/cards/bulk                             (bulk)
+ *   dataset      POST   /data/v1/ui/bulk/delete                            (bulk)
+ *   group        DELETE /content/v2/groups                                 (bulk)
+ *   page         DELETE /content/v1/pages/{id}                             (per-item)
+ *   app-studio   DELETE /content/v1/dataapps/{appId}                       (per-item)
+ *   jupyter      DELETE /datascience/v1/workspaces/{id}                    (per-item)
+ *   ai-project   DELETE /datascience/ml/v1/projects/{id}                   (per-item)
+ *   workflow     DELETE /workflow/v1/models/{id}                           (per-item)
+ *   project      DELETE /content/v1/projects/{id}                          (per-item)
+ *   project-task DELETE /content/v1/projects/{projectId}/tasks/{id}        (per-item)
+ *   collection   DELETE /datastores/v1/collections/{id}                    (per-item)
+ *   account      DELETE /accounts/v1/accounts/{id}                         (per-item)
+ *
+ * project-task has no standalone delete endpoint — the parent projectId is
+ * resolved first via GET /content/v1/tasks/{id}, then the task is deleted under
+ * its project. jupyter is the activity-log DATA_SCIENCE_NOTEBOOK type (the API
+ * calls these Jupyter workspaces).
  *
  * Users are intentionally NOT handled here — delete them with bulk-delete-users.
  *
@@ -43,15 +54,17 @@
  *                    this restricts deletion to the listed types. When there is no type
  *                    column (or for --id/--ids), it must be exactly one type and is
  *                    applied to every row.
- *   --batch-size     IDs per native bulk call for dataflow/card/dataset (default: 50)
- *   --concurrency    Parallel per-item deletes within a type for page/app-studio/
- *                    collection/account (default: 5). Types are still deleted one
- *                    at a time, in dependency order.
+ *   --batch-size     IDs per native bulk call for dataflow/card/dataset/group (default: 50)
+ *   --concurrency    Parallel per-item deletes within a type (page, app-studio,
+ *                    jupyter, ai-project, workflow, project, project-task,
+ *                    collection, account) (default: 5). Types are still deleted
+ *                    one at a time, in dependency order.
  *   --dry-run        Preview which objects would be deleted without deleting
  *
  * Types are deleted in a fixed dependency-safe order (card, page, app-studio,
- * dataset, dataflow, account, collection) so dependents go before what they
- * reference. Deletes within a single type run concurrently; types do not overlap.
+ * jupyter, ai-project, workflow, project-task, project, dataset, dataflow,
+ * account, collection, group) so dependents go before what they reference.
+ * Deletes within a single type run concurrently; types do not overlap.
  */
 
 const { api, readCSV, createLogger, showHelp } = require('../lib');
@@ -64,7 +77,8 @@ WARNING: This is a destructive operation. Deleted content cannot be recovered.
 Routes each row to the correct DELETE endpoint by object type. Consumes the CSV
 that bulk-list-user-content emits ("Object Type" + "Object ID" columns).
 
-Supported types: dataflow, card, dataset, page, app-studio, collection, account.
+Supported types: dataflow, card, dataset, group, page, app-studio, jupyter,
+ai-project, workflow, project, project-task, collection, account.
 (Users are not handled here — use bulk-delete-users.)
 
 ID source:
@@ -77,35 +91,48 @@ Optional:
   --object-types   Comma-separated canonical types. With a type column, restricts
                    deletion to those types. Without a type column (or for --id/--ids),
                    must be exactly one type and is applied to every row.
-  --batch-size     IDs per native bulk call for dataflow/card/dataset (default: 50)
+  --batch-size     IDs per native bulk call for dataflow/card/dataset/group (default: 50)
   --concurrency    Parallel per-item deletes within a type (default: 5)
   --dry-run        Preview without deleting
 
 Types are deleted in a fixed dependency-safe order: card, page, app-studio,
-dataset, dataflow, account, collection. Deletes within a type run concurrently;
-types never overlap.
+jupyter, ai-project, workflow, project-task, project, dataset, dataflow,
+account, collection, group. Deletes within a type run concurrently; types
+never overlap.
 
 Accepted type names (case-insensitive, '-' and '_' interchangeable). The
 activity-log labels emitted by bulk-list-user-content are accepted too:
-  dataflow   (DATAFLOW_TYPE)
-  card       (CARD)
-  dataset    (DATA_SOURCE)
-  page       (PAGE)
-  app-studio (DATA_APP, data-app)
-  collection (MAGNUM_COLLECTION, appdb-collection)
-  account    (ACCOUNT)`;
+  dataflow     (DATAFLOW_TYPE)
+  card         (CARD)
+  dataset      (DATA_SOURCE)
+  group        (GROUP)
+  page         (PAGE)
+  app-studio   (DATA_APP, data-app)
+  jupyter      (DATA_SCIENCE_NOTEBOOK, jupyter-workspace)
+  ai-project   (AI_PROJECT)
+  workflow     (WORKFLOW_MODEL)
+  project      (PROJECT)
+  project-task (PROJECT_TASK)
+  collection   (MAGNUM_COLLECTION, appdb-collection)
+  account      (ACCOUNT)`;
 
 // Canonical type → accepted aliases. Includes the activity-log labels that
 // bulk-list-user-content writes into its "Object Type" column, normalized to
 // lower-case with underscores → hyphens (see normalizeType).
 const TYPE_ALIASES = {
 	account: ['account'],
+	'ai-project': ['ai-project'],
 	'app-studio': ['app-studio', 'appstudio', 'data-app', 'dataapp'],
 	card: ['card'],
 	collection: ['collection', 'appdb-collection', 'magnum-collection'],
 	dataflow: ['dataflow', 'dataflow-type'],
 	dataset: ['dataset', 'datasource', 'data-source'],
-	page: ['page']
+	group: ['group'],
+	jupyter: ['jupyter', 'jupyter-workspace', 'data-science-notebook'],
+	page: ['page'],
+	project: ['project'],
+	'project-task': ['project-task'],
+	workflow: ['workflow', 'workflow-model']
 };
 
 const ALIAS_TO_CANONICAL = {};
@@ -132,6 +159,11 @@ const DELETERS = {
 		bulk: (ids) => api.post('/data/v1/ui/bulk/delete', { ids, type: 'DATA_SOURCE' }),
 		single: (id) => api.del(`/data/v3/datasources/${id}`)
 	},
+	group: {
+		label: 'group',
+		bulk: (ids) => api.del('/content/v2/groups', ids.map((id) => Number(id))),
+		single: (id) => api.del(`/content/v2/groups/${id}`)
+	},
 	page: {
 		label: 'page',
 		single: (id) => api.del(`/content/v1/pages/${id}`)
@@ -139,6 +171,34 @@ const DELETERS = {
 	'app-studio': {
 		label: 'app studio app',
 		single: (id) => api.del(`/content/v1/dataapps/${id}`)
+	},
+	jupyter: {
+		label: 'Jupyter workspace',
+		single: (id) => api.del(`/datascience/v1/workspaces/${id}`)
+	},
+	'ai-project': {
+		label: 'AI project',
+		single: (id) => api.del(`/datascience/ml/v1/projects/${id}`)
+	},
+	workflow: {
+		label: 'workflow',
+		single: (id) => api.del(`/workflow/v1/models/${id}`)
+	},
+	project: {
+		label: 'project',
+		single: (id) => api.del(`/content/v1/projects/${id}`)
+	},
+	'project-task': {
+		// Tasks have no standalone delete endpoint (DELETE /content/v1/tasks/{id}
+		// is 405). Resolve the parent projectId from the task, then delete it
+		// scoped under its project.
+		label: 'project task',
+		single: async (id) => {
+			const task = await api.get(`/content/v1/tasks/${id}`);
+			const projectId = task && task.projectId;
+			if (projectId == null) throw new Error(`could not resolve parent projectId for task ${id}`);
+			return api.del(`/content/v1/projects/${projectId}/tasks/${id}`);
+		}
 	},
 	collection: {
 		label: 'AppDB collection',
@@ -151,11 +211,28 @@ const DELETERS = {
 };
 
 // Order types are deleted in. This is dependency-safe, not cosmetic: dependents
-// are removed before the things they reference (e.g. cards/pages/apps before the
-// datasets they sit on, datasets before the dataflows that produce them), so we
-// never orphan or block a downstream delete. Types are processed strictly in
-// this order; only the deletes WITHIN a type may run concurrently.
-const TYPE_ORDER = ['card', 'page', 'app-studio', 'dataset', 'dataflow', 'account', 'collection'];
+// are removed before the things they reference (e.g. cards/pages/apps/notebooks
+// before the datasets they sit on, datasets before the dataflows that produce
+// them, project tasks before their parent project — which would otherwise take
+// the tasks with it and 404 the per-task deletes), so we never orphan or block a
+// downstream delete. Groups go last, since other content references them for
+// access. Types are processed strictly in this order; only the deletes WITHIN a
+// type may run concurrently.
+const TYPE_ORDER = [
+	'card',
+	'page',
+	'app-studio',
+	'jupyter',
+	'ai-project',
+	'workflow',
+	'project-task',
+	'project',
+	'dataset',
+	'dataflow',
+	'account',
+	'collection',
+	'group'
+];
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
