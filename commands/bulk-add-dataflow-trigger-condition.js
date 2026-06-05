@@ -142,7 +142,7 @@ async function main() {
 		columnDefault: 'DataFlow ID'
 	});
 
-	const logger = createLogger('bulkAddDataflowTriggerConditions', {
+	const logger = createLogger('bulk-add-dataflow-trigger-condition', {
 		debugMode,
 		runMeta: {
 			file: argv.file || argv.f || null,

@@ -142,7 +142,7 @@ async function main() {
 		columnDefault: 'DataFlow ID'
 	});
 
-	const logger = createLogger('bulkDeleteDataflowTriggers', {
+	const logger = createLogger('bulk-delete-dataflow-triggers', {
 		debugMode,
 		dryRun,
 		runMeta: {

@@ -325,7 +325,7 @@ async function main() {
 		}));
 	}
 
-	const logger = createLogger('updateStreamSchedules', {
+	const logger = createLogger('bulk-update-stream-schedules', {
 		debugMode,
 		dryRun,
 		runMeta: {

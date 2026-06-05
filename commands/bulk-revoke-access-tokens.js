@@ -200,7 +200,7 @@ async function main() {
 				: `file=${argv.file || argv.f}`;
 	}
 
-	const logger = createLogger('revokeAccessTokens', {
+	const logger = createLogger('bulk-revoke-access-tokens', {
 		debugMode,
 		dryRun,
 		runMeta: {
