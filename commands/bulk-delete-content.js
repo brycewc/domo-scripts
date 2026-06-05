@@ -33,6 +33,12 @@
  * WARNING: This is a destructive operation. Deleted content cannot be recovered.
  * Use --dry-run to preview which objects would be deleted before committing.
  *
+ * Objects that are already gone (HTTP 404/410 — stale CSV row, duplicate id,
+ * re-run after a partial failure, or cascade removal) are reported as "already
+ * gone" and skipped, not counted as errors. (Some Domo endpoints return 403/400
+ * for a non-existent id; those stay genuine errors since they're ambiguous with
+ * real auth/validation failures.)
+ *
  * Usage:
  *   # Mixed CSV straight from bulk-list-user-content (has an "Object Type" column)
  *   node cli.js bulk-delete-content --file "unused.csv" --dry-run
@@ -103,6 +109,9 @@ Types are deleted in a fixed dependency-safe order: alert, card, page,
 app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
 dataset, dataflow, account, collection, group. Deletes within a type run
 concurrently; types never overlap.
+
+Objects already gone (HTTP 404/410) are reported as "already gone" and skipped,
+not counted as errors, so re-runs and stale rows don't fail the command.
 
 Accepted type names (case-insensitive, '-' and '_' interchangeable). The
 activity-log labels emitted by bulk-list-user-content are accepted too:
@@ -256,6 +265,13 @@ const TYPE_ORDER = [
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 404/410 mean the object is already gone (stale row, duplicate id, re-run, or
+// cascade removal) — a success for our purposes, not a failure. Note: per past
+// findings, some Domo DELETE endpoints return 403/400 for a non-existent id;
+// those are deliberately NOT treated as "gone" since they're ambiguous with
+// real auth/validation errors. Only 405 means the verb is unsupported.
+const isAlreadyGone = (err) => err && (err.status === 404 || err.status === 410);
+
 // Run `worker` over `items` with at most `limit` in flight at once, preserving
 // nothing about order (callers that care order their types, not their items).
 async function mapWithConcurrency(items, limit, worker) {
@@ -360,11 +376,12 @@ async function deleteType(type, ids, { dryRun, batchSize, concurrency, logger })
 			console.log(`  [DRY RUN] Would delete ${deleter.label} ${id}`);
 			logger.addResult({ objectType: type, objectId: id, status: 'dry-run' });
 		}
-		return { deleted: ids.length, errors: 0 };
+		return { deleted: ids.length, errors: 0, skipped: 0 };
 	}
 
 	let deleted = 0;
 	let errors = 0;
+	let skipped = 0;
 
 	if (deleter.bulk) {
 		const totalBatches = Math.ceil(ids.length / batchSize);
@@ -387,9 +404,15 @@ async function deleteType(type, ids, { dryRun, batchSize, concurrency, logger })
 						logger.addResult({ objectType: type, objectId: id, status: 'deleted', batch: batchNumber, retried: true });
 						deleted++;
 					} catch (singleError) {
-						console.error(`      ✗ ${deleter.label} ${id} failed: ${singleError.message}`);
-						logger.addResult({ objectType: type, objectId: id, status: 'error', error: singleError.message, batch: batchNumber });
-						errors++;
+						if (isAlreadyGone(singleError)) {
+							console.log(`      ↷ ${deleter.label} ${id} already gone (skipped)`);
+							logger.addResult({ objectType: type, objectId: id, status: 'skipped', reason: 'already-deleted', batch: batchNumber });
+							skipped++;
+						} else {
+							console.error(`      ✗ ${deleter.label} ${id} failed: ${singleError.message}`);
+							logger.addResult({ objectType: type, objectId: id, status: 'error', error: singleError.message, batch: batchNumber });
+							errors++;
+						}
 					}
 					await delay(150);
 				}
@@ -407,14 +430,20 @@ async function deleteType(type, ids, { dryRun, batchSize, concurrency, logger })
 				deleted++;
 				console.log(`  ✓ [${++done}/${ids.length}] ${deleter.label} ${id} deleted`);
 			} catch (error) {
-				logger.addResult({ objectType: type, objectId: id, status: 'error', error: error.message });
-				errors++;
-				console.error(`  ✗ [${++done}/${ids.length}] ${deleter.label} ${id} failed: ${error.message}`);
+				if (isAlreadyGone(error)) {
+					logger.addResult({ objectType: type, objectId: id, status: 'skipped', reason: 'already-deleted' });
+					skipped++;
+					console.log(`  ↷ [${++done}/${ids.length}] ${deleter.label} ${id} already gone (skipped)`);
+				} else {
+					logger.addResult({ objectType: type, objectId: id, status: 'error', error: error.message });
+					errors++;
+					console.error(`  ✗ [${++done}/${ids.length}] ${deleter.label} ${id} failed: ${error.message}`);
+				}
 			}
 		});
 	}
 
-	return { deleted, errors };
+	return { deleted, errors, skipped };
 }
 
 async function main() {
@@ -457,24 +486,27 @@ async function main() {
 	console.log(`Objects:     ${totalObjects}`);
 	for (const t of typesToProcess) console.log(`  ${t}: ${objectsByType[t].length}`);
 
-	const summary = { totals: {}, deleted: 0, errors: 0 };
+	const summary = { totals: {}, deleted: 0, errors: 0, skipped: 0 };
 	for (const type of typesToProcess) {
-		const { deleted, errors } = await deleteType(type, objectsByType[type], { dryRun, batchSize, concurrency, logger });
-		summary.totals[type] = { deleted, errors };
+		const { deleted, errors, skipped } = await deleteType(type, objectsByType[type], { dryRun, batchSize, concurrency, logger });
+		summary.totals[type] = { deleted, errors, skipped };
 		summary.deleted += deleted;
 		summary.errors += errors;
+		summary.skipped += skipped;
 	}
 
 	const verb = dryRun ? 'would delete' : 'deleted';
 	console.log('\n=== Summary ===');
 	for (const type of typesToProcess) {
 		const t = summary.totals[type];
-		console.log(`  ${type}: ${t.deleted} ${verb}${t.errors ? `, ${t.errors} errors` : ''}`);
+		const extras = [t.skipped ? `${t.skipped} already gone` : null, t.errors ? `${t.errors} errors` : null].filter(Boolean);
+		console.log(`  ${type}: ${t.deleted} ${verb}${extras.length ? `, ${extras.join(', ')}` : ''}`);
 	}
 	console.log(`Total ${verb}: ${summary.deleted}`);
+	if (summary.skipped > 0) console.log(`Total already gone: ${summary.skipped}`);
 	console.log(`Total errors:  ${summary.errors}`);
 
-	logger.writeRunLog({ total: totalObjects, deleted: summary.deleted, errors: summary.errors, byType: summary.totals });
+	logger.writeRunLog({ total: totalObjects, deleted: summary.deleted, errors: summary.errors, skipped: summary.skipped, byType: summary.totals });
 
 	if (dryRun) {
 		console.log('\nRe-run without --dry-run to execute the deletion.');
