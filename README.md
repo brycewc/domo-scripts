@@ -128,6 +128,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 
 | Command | Description |
 |---------|-------------|
+| `build-activity-log-type-map` | Build a map of activity-log object types to their available event types (actions), written to a dated JSON file |
 | `bulk-add-dataflow-tags` | Add tags to dataflows from a CSV or by owner |
 | `bulk-add-dataflow-trigger-condition` | Add DATAFLOW_LAST_RUN trigger conditions to dataflow triggers |
 | `bulk-add-dataset-tags` | Add tags to datasets from a CSV or by owner |
@@ -149,9 +150,11 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-update-column-pdp-policy` | Update users/groups on a column-based PDP policy |
 | `bulk-update-stream-schedules` | Change stream schedules to daily (randomized times), manual, or restore arbitrary schedules from a CSV (`--mode from-file`) |
 | `bulk-update-stream-update-method` | Change stream update mode from Replace to Append |
+| `bulk-update-users` | Bulk update user attributes from a CSV via PATCH (one row per user) |
 | `check-credentials` | Validate the configured API credentials against the selected instance |
 | `clear-logs` | Delete every log file under `logs/` (supports `--dry-run` and `--command` filter) |
 | `extract-card-ids` | Extract card IDs from a page export JSON |
+| `run-workflow-from-csv` | Convert a CSV to workflow input format and run a Domo workflow |
 | `swap-input-in-dataflows` | Replace a dataset input across all consuming dataflows |
 | `transfer-stream` | Copy a stream (and its input dataset) from one instance to another |
 | `upload-dataset` | Upload CSV data to a dataset in configurable batches |
@@ -182,7 +185,7 @@ domo-scripts/
 │   ├── csv.js          # CSV parsing with optional filtering
 │   ├── input.js        # Resolve IDs from CSV/flags
 │   └── log.js          # Debug and run log utilities
-├── commands/           # One file per command (17 total)
+├── commands/           # One file per command (30 total)
 ├── logs/               # Generated run/debug logs (git-ignored)
 ├── .env                # Your credentials (git-ignored)
 ├── .env.<name>         # Per-environment credentials, selected with --env (git-ignored)

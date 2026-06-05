@@ -9,16 +9,21 @@ Every command in this repo is a standalone async script in [commands/](../../../
 
 ## Required steps
 
+A new command is only "done" when it is registered in **two** places: the `cli.js` dispatch map AND the README command table. These are a pair — skipping either one leaves the command half-added (it either won't run, or won't be discoverable). Both are mandatory on every single command, including tiny utility/one-off commands.
+
 1. **Create the command file** at `commands/<kebab-name>.js`. The filename must match the command name passed to `node cli.js <name>` exactly (e.g. `bulk-disable-alerts` → `commands/bulk-disable-alerts.js`).
-2. **Register it** in the `commands` map in [cli.js](../../../cli.js). Keep the existing alphabetical-ish grouping if the user has one; otherwise add it in a sensible spot. The value is `'./commands/<kebab-name>'` (no `.js`).
+2. **Register it in BOTH places** (do both now, before moving on — don't defer the README to "later"):
+   - a. The `commands` map in [cli.js](../../../cli.js). Keep the existing alphabetical-ish grouping if the user has one; otherwise add it in a sensible spot. The value is `'./commands/<kebab-name>'` (no `.js`).
+   - b. The command table in the `## Commands` section of [README.md](../../../README.md). Add a row: `` | `<kebab-name>` | <one-line description> | ``, placed to match the table's existing alphabetical order. One-line description, match the tense/style of neighboring rows.
 3. **Use shared libs** — never re-implement them:
    - `api` — authenticated `get/put/post/patch/del` against the Domo API
    - `resolveIds` — handles `--file`/`--<name>-id`/`--<name>-ids` + filtering uniformly
    - `createLogger` — debug logs (single-ID mode) and run logs (bulk mode), with dry-run prefixing
    - `showHelp` — exits early on `--help`/`-h` so users can see options without a `.env`
 4. **Add `--help` handling first**, before any auth or API call. `showHelp(argv, HELP_TEXT)` calls `process.exit(0)` if the flag is set.
-5. **Update [README.md](../../../README.md)** — add a row to the command table (the `## Commands` section). One-line description, present tense, lowercase first letter ("Add tags to..." not "Adds tags to..." style varies, match neighbors).
-6. **Run `node cli.js <name> --help`** to confirm it loads and the help text renders.
+5. **Run `node cli.js <name> --help`** to confirm it loads and the help text renders.
+
+> ⚠️ The README command table is the single most commonly forgotten step. Before you consider the task complete, re-open [README.md](../../../README.md) and confirm the new row is actually present.
 
 ## Standard command skeleton
 
@@ -192,6 +197,6 @@ Skip the logger only for commands that don't iterate over items, or whose output
 - [ ] Uses `lib/api`, `lib/input`, `lib/log` as appropriate (not custom replacements)
 - [ ] Banner, progress lines, summary block, exit code
 - [ ] Rate-limit delay between iterations
-- [ ] Registered in [cli.js](../../../cli.js) `commands` map
-- [ ] Row added to README.md command table
+- [ ] **Registered in [cli.js](../../../cli.js) `commands` map** ← registration site 1 of 2
+- [ ] **Row added to [README.md](../../../README.md) command table** ← registration site 2 of 2 (most-forgotten step)
 - [ ] `node cli.js <name> --help` prints help and exits 0
