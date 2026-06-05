@@ -12,7 +12,9 @@
  *   dataset      POST   /data/v1/ui/bulk/delete                            (bulk)
  *   group        DELETE /content/v2/groups                                 (bulk)
  *   page         DELETE /content/v1/pages/{id}                             (per-item)
+ *   alert        DELETE /social/v4/alerts/{id}                             (per-item)
  *   app-studio   DELETE /content/v1/dataapps/{appId}                       (per-item)
+ *   custom-app   DELETE /apps/v1/designs/{id}                              (per-item)
  *   jupyter      DELETE /datascience/v1/workspaces/{id}                    (per-item)
  *   ai-project   DELETE /datascience/ml/v1/projects/{id}                   (per-item)
  *   workflow     DELETE /workflow/v1/models/{id}                           (per-item)
@@ -61,10 +63,11 @@
  *                    one at a time, in dependency order.
  *   --dry-run        Preview which objects would be deleted without deleting
  *
- * Types are deleted in a fixed dependency-safe order (card, page, app-studio,
- * jupyter, ai-project, workflow, project-task, project, dataset, dataflow,
- * account, collection, group) so dependents go before what they reference.
- * Deletes within a single type run concurrently; types do not overlap.
+ * Types are deleted in a fixed dependency-safe order (alert, card, page,
+ * app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
+ * dataset, dataflow, account, collection, group) so dependents go before what
+ * they reference. Deletes within a single type run concurrently; types do not
+ * overlap.
  */
 
 const { api, readCSV, createLogger, showHelp } = require('../lib');
@@ -77,8 +80,9 @@ WARNING: This is a destructive operation. Deleted content cannot be recovered.
 Routes each row to the correct DELETE endpoint by object type. Consumes the CSV
 that bulk-list-user-content emits ("Object Type" + "Object ID" columns).
 
-Supported types: dataflow, card, dataset, group, page, app-studio, jupyter,
-ai-project, workflow, project, project-task, collection, account.
+Supported types: dataflow, card, dataset, group, page, alert, app-studio,
+custom-app, jupyter, ai-project, workflow, project, project-task, collection,
+account.
 (Users are not handled here — use bulk-delete-users.)
 
 ID source:
@@ -95,10 +99,10 @@ Optional:
   --concurrency    Parallel per-item deletes within a type (default: 5)
   --dry-run        Preview without deleting
 
-Types are deleted in a fixed dependency-safe order: card, page, app-studio,
-jupyter, ai-project, workflow, project-task, project, dataset, dataflow,
-account, collection, group. Deletes within a type run concurrently; types
-never overlap.
+Types are deleted in a fixed dependency-safe order: alert, card, page,
+app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
+dataset, dataflow, account, collection, group. Deletes within a type run
+concurrently; types never overlap.
 
 Accepted type names (case-insensitive, '-' and '_' interchangeable). The
 activity-log labels emitted by bulk-list-user-content are accepted too:
@@ -107,7 +111,9 @@ activity-log labels emitted by bulk-list-user-content are accepted too:
   dataset      (DATA_SOURCE)
   group        (GROUP)
   page         (PAGE)
+  alert        (ALERT)
   app-studio   (DATA_APP, data-app)
+  custom-app   (RYUU_APP, app, ryuu)
   jupyter      (DATA_SCIENCE_NOTEBOOK, jupyter-workspace)
   ai-project   (AI_PROJECT)
   workflow     (WORKFLOW_MODEL)
@@ -122,9 +128,11 @@ activity-log labels emitted by bulk-list-user-content are accepted too:
 const TYPE_ALIASES = {
 	account: ['account'],
 	'ai-project': ['ai-project'],
+	alert: ['alert'],
 	'app-studio': ['app-studio', 'appstudio', 'data-app', 'dataapp'],
 	card: ['card'],
 	collection: ['collection', 'appdb-collection', 'magnum-collection'],
+	'custom-app': ['custom-app', 'app', 'ryuu', 'ryuu-app'],
 	dataflow: ['dataflow', 'dataflow-type'],
 	dataset: ['dataset', 'datasource', 'data-source'],
 	group: ['group'],
@@ -168,9 +176,19 @@ const DELETERS = {
 		label: 'page',
 		single: (id) => api.del(`/content/v1/pages/${id}`)
 	},
+	alert: {
+		label: 'alert',
+		single: (id) => api.del(`/social/v4/alerts/${id}`)
+	},
 	'app-studio': {
 		label: 'app studio app',
 		single: (id) => api.del(`/content/v1/dataapps/${id}`)
+	},
+	'custom-app': {
+		// "Custom apps" (activity-log RYUU_APP) are app designs. deleteDesign is a
+		// soft-delete — recoverable via PUT /apps/v1/designs/{id}/undelete.
+		label: 'custom app',
+		single: (id) => api.del(`/apps/v1/designs/${id}`)
 	},
 	jupyter: {
 		label: 'Jupyter workspace',
@@ -211,17 +229,19 @@ const DELETERS = {
 };
 
 // Order types are deleted in. This is dependency-safe, not cosmetic: dependents
-// are removed before the things they reference (e.g. cards/pages/apps/notebooks
-// before the datasets they sit on, datasets before the dataflows that produce
-// them, project tasks before their parent project — which would otherwise take
-// the tasks with it and 404 the per-task deletes), so we never orphan or block a
-// downstream delete. Groups go last, since other content references them for
-// access. Types are processed strictly in this order; only the deletes WITHIN a
-// type may run concurrently.
+// are removed before the things they reference (e.g. alerts before the cards and
+// datasets they watch, cards/pages/apps/notebooks before the datasets they sit
+// on, datasets before the dataflows that produce them, project tasks before
+// their parent project — which would otherwise take the tasks with it and 404
+// the per-task deletes), so we never orphan or block a downstream delete. Groups
+// go last, since other content references them for access. Types are processed
+// strictly in this order; only the deletes WITHIN a type may run concurrently.
 const TYPE_ORDER = [
+	'alert',
 	'card',
 	'page',
 	'app-studio',
+	'custom-app',
 	'jupyter',
 	'ai-project',
 	'workflow',
