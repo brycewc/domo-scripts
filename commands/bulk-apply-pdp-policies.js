@@ -3,7 +3,12 @@
  * to every DataSet listed in a CSV file.
  *
  * The script reads all non-open PDP policies from the source DataSet, then
- * enables PDP and creates matching policies on each target DataSet.
+ * enables PDP and applies matching policies on each target DataSet.
+ *
+ * By default, policies are added on top of whatever already exists on the
+ * target — a policy whose name matches an existing one is updated in place,
+ * and any others are created. Pass --clean to instead delete all existing
+ * custom policies first and write only the source set.
  *
  * Usage:
  *   node cli.js bulk-apply-pdp-policies --file "datasets.csv" --source-dataset-id "SRC_ID" --allowed-columns "ae_email,sc_email"
@@ -18,9 +23,10 @@
  *   --dataset-ids       Comma-separated target dataset IDs
  *   --column, -c        CSV column name containing dataset IDs (default: "DataSet ID")
  *   --source-dataset-id Source dataset to copy PDP policies from (required)
- *   --allowed-columns   Comma-separated list of allowed PDP filter columns (required)
+ *   --allowed-columns   Comma-separated list of allowed PDP filter columns (optional; copies all policies if omitted)
  *   --all-rows-users    Comma-separated user IDs to assign to the All Rows policy
  *   --all-rows-groups   Comma-separated group IDs to assign to the All Rows policy
+ *   --clean             Delete all existing custom policies before writing the new set
  */
 
 const { api, resolveIds, createLogger, showHelp } = require('../lib');
@@ -34,9 +40,10 @@ Options:
   --dataset-ids       Comma-separated target dataset IDs
   --column, -c        CSV column with dataset IDs (default: "DataSet ID")
   --source-dataset-id Source dataset to copy policies from (required)
-  --allowed-columns   Allowed PDP filter columns, comma-separated (required)
+  --allowed-columns   Allowed PDP filter columns, comma-separated (optional; copies all policies if omitted)
   --all-rows-users    User IDs for the All Rows policy
-  --all-rows-groups   Group IDs for the All Rows policy`;
+  --all-rows-groups   Group IDs for the All Rows policy
+  --clean             Delete existing custom policies first (default: add/update in place)`;
 
 
 async function getPdpPolicies(datasetId) {
@@ -67,8 +74,8 @@ async function deletePdpPolicy(datasetId, policyId) {
 	);
 }
 
-async function createPdpPolicy(datasetId, policy) {
-	const body = {
+function buildPolicyBody(datasetId, policy) {
+	return {
 		dataSourceId: datasetId,
 		dataSourcePermissions: policy.dataSourcePermissions || false,
 		name: policy.name,
@@ -83,10 +90,12 @@ async function createPdpPolicy(datasetId, policy) {
 		groupIds: policy.groupIds || [],
 		virtualUserIds: policy.virtualUserIds || []
 	};
+}
 
+async function createPdpPolicy(datasetId, policy) {
 	return api.post(
 		`/query/v1/data-control/${datasetId}/filter-groups`,
-		body
+		buildPolicyBody(datasetId, policy)
 	);
 }
 
@@ -99,14 +108,13 @@ async function main() {
 		process.exit(1);
 	}
 
-	if (!argv['allowed-columns']) {
-		console.error('Error: --allowed-columns is required (comma-separated column names).');
-		process.exit(1);
-	}
-	const allowedColumns = String(argv['allowed-columns'])
-		.split(',')
-		.map((c) => c.trim())
-		.filter(Boolean);
+	const clean = Boolean(argv.clean);
+	const allowedColumns = argv['allowed-columns']
+		? String(argv['allowed-columns'])
+				.split(',')
+				.map((c) => c.trim())
+				.filter(Boolean)
+		: [];
 	const allRowsUserIds = argv['all-rows-users']
 		? String(argv['all-rows-users'])
 				.split(',')
@@ -127,7 +135,7 @@ async function main() {
 
 	const logger = createLogger('bulk-apply-pdp-policies', {
 		debugMode,
-		runMeta: { sourceDatasetId, allowedColumns, allRowsUserIds, allRowsGroupIds }
+		runMeta: { sourceDatasetId, allowedColumns, allRowsUserIds, allRowsGroupIds, clean }
 	});
 
 	console.log('Bulk Apply PDP Policies');
@@ -137,16 +145,24 @@ async function main() {
 	console.log(`Fetching PDP policies from source dataset: ${sourceDatasetId}`);
 	const sourcePolicies = await getPdpPolicies(sourceDatasetId);
 
-	// Keep only custom policies that filter on the allowed columns
+	// The source "All Rows" (open) policy — used as the fallback assignment for
+	// the target's All Rows policy when no --all-rows-users/-groups are given.
+	const sourceAllRows = sourcePolicies.find((p) => !p.dataSourcePermissions);
+
+	// Keep custom policies. If allowed columns were specified, restrict to
+	// policies that filter on one of those columns; otherwise copy all of them.
 	const policiesToCopy = sourcePolicies.filter((p) => {
 		if (!p.dataSourcePermissions) return false;
+		if (allowedColumns.length === 0) return true;
 		const paramColumns = (p.parameters || []).map((param) => param.name);
 		return paramColumns.some((col) => allowedColumns.includes(col));
 	});
 
 	if (policiesToCopy.length === 0) {
 		console.log(
-			`\nNo PDP policies found matching columns [${allowedColumns.join(', ')}]. Nothing to copy.`
+			allowedColumns.length > 0
+				? `\nNo PDP policies found matching columns [${allowedColumns.join(', ')}]. Nothing to copy.`
+				: '\nNo custom PDP policies found on the source dataset. Nothing to copy.'
 		);
 		logger.writeRunLog({ total: datasetIds.length, applied: 0, errors: 0 });
 		process.exit(0);
@@ -185,13 +201,17 @@ async function main() {
 			await enablePdp(targetId);
 			console.log('  PDP enabled');
 
-			// Fetch existing policies and delete all custom ones
+			// Fetch existing policies. In clean mode, delete all custom ones so
+			// the target ends up with exactly the source set. Otherwise leave
+			// them in place and update/create by name below.
 			const policies = await getPdpPolicies(targetId);
 			const existingCustom = policies.filter((p) => p.dataSourcePermissions);
-			for (const old of existingCustom) {
-				await deletePdpPolicy(targetId, old.filterGroupId);
-				console.log(`  Deleted existing policy: "${old.name}"`);
-				await new Promise((resolve) => setTimeout(resolve, 150));
+			if (clean) {
+				for (const old of existingCustom) {
+					await deletePdpPolicy(targetId, old.filterGroupId);
+					console.log(`  Deleted existing policy: "${old.name}"`);
+					await new Promise((resolve) => setTimeout(resolve, 150));
+				}
 			}
 
 			// Update the "All Rows" policy to assign the designated group
@@ -205,22 +225,52 @@ async function main() {
 				...allRowsPolicy,
 				dataSourceId: targetId
 			};
-			if (allRowsUserIds.length > 0) allRowsUpdate.userIds = allRowsUserIds;
-			if (allRowsGroupIds.length > 0) allRowsUpdate.groupIds = allRowsGroupIds;
+			// Assignment precedence: explicit flags win; otherwise in default
+			// (non-clean) mode fall back to the source dataset's All Rows
+			// assignment so it carries over.
+			let effectiveAllRowsUsers = allRowsUserIds;
+			let effectiveAllRowsGroups = allRowsGroupIds;
+			if (
+				!clean &&
+				allRowsUserIds.length === 0 &&
+				allRowsGroupIds.length === 0 &&
+				sourceAllRows
+			) {
+				effectiveAllRowsUsers = sourceAllRows.userIds || [];
+				effectiveAllRowsGroups = sourceAllRows.groupIds || [];
+			}
+			if (effectiveAllRowsUsers.length > 0)
+				allRowsUpdate.userIds = effectiveAllRowsUsers;
+			if (effectiveAllRowsGroups.length > 0)
+				allRowsUpdate.groupIds = effectiveAllRowsGroups;
 			await updatePdpPolicy(
 				targetId,
 				allRowsPolicy.filterGroupId,
 				allRowsUpdate
 			);
 			console.log(
-				`  Updated "All Rows" policy — users: [${allRowsUserIds}], groups: [${allRowsGroupIds}]`
+				`  Updated "All Rows" policy — users: [${effectiveAllRowsUsers}], groups: [${effectiveAllRowsGroups}]`
 			);
 			await new Promise((resolve) => setTimeout(resolve, 150));
 
-			// Create each filtered policy
+			// Apply each policy. In clean mode the custom policies were just
+			// deleted, so everything is created fresh. Otherwise, update any
+			// existing policy with a matching name and create the rest.
+			const existingByName = new Map(
+				(clean ? [] : existingCustom).map((p) => [p.name, p])
+			);
 			for (const policy of policiesToCopy) {
-				await createPdpPolicy(targetId, policy);
-				console.log(`  Created policy: "${policy.name}"`);
+				const match = existingByName.get(policy.name);
+				if (match) {
+					await updatePdpPolicy(targetId, match.filterGroupId, {
+						...buildPolicyBody(targetId, policy),
+						filterGroupId: match.filterGroupId
+					});
+					console.log(`  Updated policy: "${policy.name}"`);
+				} else {
+					await createPdpPolicy(targetId, policy);
+					console.log(`  Created policy: "${policy.name}"`);
+				}
 				await new Promise((resolve) => setTimeout(resolve, 150));
 			}
 
@@ -253,7 +303,9 @@ async function main() {
 	console.log(`Successfully applied:  ${successCount}`);
 	console.log(`Errors:                ${errorCount}`);
 	console.log(
-		`Policies per dataset:  ${policiesToCopy.length + 1} (${policiesToCopy.length} filtered + All Rows)`
+		clean
+			? `Policies per dataset:  ${policiesToCopy.length + 1} (${policiesToCopy.length} filtered + All Rows)`
+			: `Policies applied/dataset: ${policiesToCopy.length} (added or updated by name) + All Rows`
 	);
 
 	logger.writeRunLog({
