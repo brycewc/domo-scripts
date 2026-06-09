@@ -83,6 +83,41 @@ function normalizeContentType(raw) {
 	return VALID_CONTENT_TYPES.includes(lower) ? lower : null;
 }
 
+function buildDatasetUnshareBody(ids, recipientId, recipientType) {
+	return {
+		bulkItems: {
+			ids: ids.map((id) => String(id)),
+			type: 'DATA_SOURCE'
+		},
+		dataSourceShareEntity: {
+			permissions: [
+				{
+					accessLevel: 'NONE',
+					id: String(recipientId),
+					type: recipientType.toUpperCase()
+				}
+			],
+			sendEmail: false,
+			message: 'Bulk unsharing from script.'
+		}
+	};
+}
+
+async function unshareSingleDataset(id, recipientId, recipientType) {
+	const result = await api.post(
+		'/data/v1/ui/bulk/share',
+		buildDatasetUnshareBody([id], recipientId, recipientType)
+	);
+	const failed = (result && result.failed) || {};
+	const reason = failed[String(id)];
+	if (reason !== undefined) {
+		throw new Error(
+			typeof reason === 'string' ? reason : JSON.stringify(reason)
+		);
+	}
+	return result;
+}
+
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
@@ -263,23 +298,11 @@ async function main() {
 				`  Processing dataset batch ${batchNumber}/${totalBatches} (${batch.length} datasets)...`
 			);
 
-			const body = {
-				bulkItems: {
-					ids: batch.map((it) => String(it.id)),
-					type: 'DATA_SOURCE'
-				},
-				dataSourceShareEntity: {
-					permissions: [
-						{
-							accessLevel: 'NONE',
-							id: String(recipientId),
-							type: recipientType.toUpperCase()
-						}
-					],
-					sendEmail: false,
-					message: 'Bulk unsharing from script.'
-				}
-			};
+			const body = buildDatasetUnshareBody(
+				batch.map((it) => it.id),
+				recipientId,
+				recipientType
+			);
 
 			try {
 				const result = await api.post('/data/v1/ui/bulk/share', body);
@@ -322,17 +345,51 @@ async function main() {
 				}
 			} catch (error) {
 				console.error(`  Dataset batch ${batchNumber} error: ${error.message}`);
-				errorCount++;
-				logger.addResult({
-					kind: 'dataset',
-					recipient,
-					accessLevel: 'NONE',
-					batchNumber,
-					totalBatches,
-					items: batch,
-					status: 'error',
-					error: error.message
-				});
+				console.log(
+					`  Retrying ${batch.length} dataset(s) individually...`
+				);
+
+				for (const it of batch) {
+					try {
+						const result = await unshareSingleDataset(
+							it.id,
+							recipientId,
+							recipientType
+						);
+						console.log(`    Dataset ${it.id} unshared`);
+						successCount++;
+						if (verbose) {
+							logger.addResult({
+								kind: 'dataset',
+								recipient,
+								accessLevel: 'NONE',
+								batchNumber,
+								totalBatches,
+								items: [it],
+								status: 'success',
+								retried: true,
+								response: result
+							});
+						}
+					} catch (singleError) {
+						console.error(
+							`    Dataset ${it.id} failed: ${singleError.message}`
+						);
+						errorCount++;
+						logger.addResult({
+							kind: 'dataset',
+							recipient,
+							accessLevel: 'NONE',
+							batchNumber,
+							totalBatches,
+							items: [it],
+							status: 'error',
+							error: singleError.message,
+							retried: true
+						});
+					}
+					await new Promise((resolve) => setTimeout(resolve, 150));
+				}
 			}
 
 			if (start + batchSize < datasetItems.length) {
