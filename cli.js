@@ -27,6 +27,7 @@ const commands = {
 	'build-activity-log-type-map': './commands/build-activity-log-type-map',
 	'check-credentials': './commands/check-credentials',
 	'clear-logs': './commands/clear-logs',
+	'delete-unused-beast-modes': './commands/delete-unused-beast-modes',
 	'extract-card-ids': './commands/extract-card-ids',
 	'swap-input-in-dataflows': './commands/swap-input-in-dataflows',
 	'transfer-stream': './commands/transfer-stream',
