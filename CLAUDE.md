@@ -22,7 +22,7 @@ There is no build step, test suite, or linter configured.
 ```bash
 node cli.js upload-dataset --file "data.csv" --dataset-id "<id>" --batch-size 50000
 node cli.js bulk-update-stream-schedules --file "streams.csv" --start-hour 6 --end-hour 20 --timezone "America/Denver"
-node cli.js bulk-add-dataflow-trigger-condition --dataflow-id 123
+node cli.js bulk-add-dataflow-trigger-condition --id 123
 node cli.js bulk-share-content --file "content.csv" --user "<userId>" --content-type "card"
 node cli.js bulk-delete-datasets --file "datasets.csv" --column "DataSet ID" --dry-run
 ```

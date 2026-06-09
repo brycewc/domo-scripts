@@ -13,13 +13,13 @@
  *   node cli.js bulk-delete-accounts --file "accounts.csv"
  *   node cli.js bulk-delete-accounts --file "accounts.csv" --column "My Column"
  *   node cli.js bulk-delete-accounts --file "accounts.csv" --dry-run
- *   node cli.js bulk-delete-accounts --account-id "12345"
- *   node cli.js bulk-delete-accounts --account-ids "id1,id2,id3"
+ *   node cli.js bulk-delete-accounts --id "12345"
+ *   node cli.js bulk-delete-accounts --ids "id1,id2,id3"
  *
  * Options:
  *   --file, -f     CSV file with account IDs
- *   --account-id   Single account ID (enables debug logging)
- *   --account-ids  Comma-separated account IDs
+ *   --id           Single account ID (enables debug logging)
+ *   --ids          Comma-separated account IDs
  *   --column, -c   CSV column name containing account IDs (default: "Account ID")
  *   --dry-run      Preview which accounts would be deleted without actually deleting
  */
@@ -33,8 +33,8 @@ WARNING: This is a destructive operation.
 
 Options:
   --file, -f     CSV file with account IDs
-  --account-id   Single account ID
-  --account-ids  Comma-separated account IDs
+  --id           Single account ID
+  --ids          Comma-separated account IDs
   --column, -c   CSV column with account IDs (default: "Account ID")
   --dry-run      Preview without deleting`;
 
@@ -48,7 +48,8 @@ async function main() {
 	const dryRun = argv['dry-run'] || argv.dry || false;
 
 	const { ids: accountIds, debugMode } = resolveIds(argv, {
-		name: 'account',
+		idFlag: 'id',
+		idsFlag: 'ids',
 		columnDefault: 'Account ID'
 	});
 

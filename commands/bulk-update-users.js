@@ -83,7 +83,7 @@ async function main() {
 	if (dryRun) console.log('DRY RUN (no changes will be made)');
 	console.log(`Found ${records.length} user row(s) to process\n`);
 
-	const logger = createLogger('updateUsers', {
+	const logger = createLogger('bulk-update-users', {
 		debugMode: false,
 		dryRun,
 		runMeta: {

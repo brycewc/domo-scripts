@@ -19,15 +19,15 @@
  * Usage:
  *   node cli.js bulk-delete-dataflow-triggers --file "dataflows.csv"
  *   node cli.js bulk-delete-dataflow-triggers --file "dataflows.csv" --column "id"
- *   node cli.js bulk-delete-dataflow-triggers --dataflow-id 123
- *   node cli.js bulk-delete-dataflow-triggers --dataflow-ids "123,456,789"
+ *   node cli.js bulk-delete-dataflow-triggers --id 123
+ *   node cli.js bulk-delete-dataflow-triggers --ids "123,456,789"
  *   node cli.js bulk-delete-dataflow-triggers --file "dataflows.csv" --dry-run
  *
  * Options:
  *   --file, -f       CSV file with dataflow IDs
  *   --column, -c     CSV column name containing dataflow IDs (default: "DataFlow ID")
- *   --dataflow-id    Single dataflow ID (enables debug logging)
- *   --dataflow-ids   Comma-separated dataflow IDs
+ *   --id             Single dataflow ID (enables debug logging)
+ *   --ids            Comma-separated dataflow IDs
  *   --filter-column  CSV column to filter on (optional, requires --filter-value)
  *   --filter-value   Value the filter-column must equal to include the row
  *   --description    Version description recorded on the dataflow (default: "Removed all triggers via script")
@@ -43,8 +43,8 @@ const argv = require('minimist')(process.argv.slice(2));
 const HELP_TEXT = `Usage:
   node cli.js bulk-delete-dataflow-triggers --file "dataflows.csv"
   node cli.js bulk-delete-dataflow-triggers --file "dataflows.csv" --column "id"
-  node cli.js bulk-delete-dataflow-triggers --dataflow-id 123
-  node cli.js bulk-delete-dataflow-triggers --dataflow-ids "123,456,789"
+  node cli.js bulk-delete-dataflow-triggers --id 123
+  node cli.js bulk-delete-dataflow-triggers --ids "123,456,789"
   node cli.js bulk-delete-dataflow-triggers --file "dataflows.csv" --dry-run
 
 WARNING: This removes all triggers from each dataflow. They will no longer
@@ -53,8 +53,8 @@ run automatically on any schedule or input update.
 Options:
   --file, -f       CSV file with dataflow IDs
   --column, -c     CSV column name containing dataflow IDs (default: "DataFlow ID")
-  --dataflow-id    Single dataflow ID (enables debug logging)
-  --dataflow-ids   Comma-separated dataflow IDs
+  --id             Single dataflow ID (enables debug logging)
+  --ids            Comma-separated dataflow IDs
   --filter-column  CSV column to filter on
   --filter-value   Value the filter-column must equal
   --description    Version description recorded on the dataflow (default: "Removed all triggers via script")
@@ -128,8 +128,8 @@ function clearTriggers(definition, description) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	if (!argv.file && !argv.f && !argv['dataflow-id'] && !argv['dataflow-ids']) {
-		console.error('Error: --file, --dataflow-id, or --dataflow-ids is required\n');
+	if (!argv.file && !argv.f && !argv.id && !argv.ids) {
+		console.error('Error: --file, --id, or --ids is required\n');
 		console.error(HELP_TEXT);
 		process.exit(1);
 	}
@@ -138,11 +138,12 @@ async function main() {
 	const description = argv.description || 'Removed all triggers via script';
 
 	const { ids: dataflowIds, debugMode } = resolveIds(argv, {
-		name: 'dataflow',
+		idFlag: 'id',
+		idsFlag: 'ids',
 		columnDefault: 'DataFlow ID'
 	});
 
-	const logger = createLogger('bulkDeleteDataflowTriggers', {
+	const logger = createLogger('bulk-delete-dataflow-triggers', {
 		debugMode,
 		dryRun,
 		runMeta: {

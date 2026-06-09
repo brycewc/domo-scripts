@@ -16,17 +16,24 @@
  *   node cli.js bulk-update-stream-schedules --file "streams.csv" --start-hour 6 --end-hour 20
  *   node cli.js bulk-update-stream-schedules --file "streams.csv" --column "id" --start-hour 6 --end-hour 20 --timezone "America/Denver"
  *   node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "status" --filter-value "ACTIVE" --start-hour 6 --end-hour 20
- *   node cli.js bulk-update-stream-schedules --stream-id 119533 --start-hour 6 --end-hour 20
- *   node cli.js bulk-update-stream-schedules --stream-ids "119533,110462" --start-hour 6 --end-hour 20
+ *   node cli.js bulk-update-stream-schedules --id 119533 --start-hour 6 --end-hour 20
+ *   node cli.js bulk-update-stream-schedules --ids "119533,110462" --start-hour 6 --end-hour 20
+ *   node cli.js bulk-update-stream-schedules --file "datasets.csv" --dataset --start-hour 6 --end-hour 20
+ *   node cli.js bulk-update-stream-schedules --ids "00000000-0000-0000-0000-000000000000" --dataset --mode manual
  *   node cli.js bulk-update-stream-schedules --file "streams.csv" --start-hour 6 --end-hour 20 --include-manual
  *   node cli.js bulk-update-stream-schedules --file "streams.csv" --mode manual
  *   node cli.js bulk-update-stream-schedules --mode from-file --file "restore.csv" --column "Stream ID" --schedule-expression-column "Schedule Expression" --schedule-json-column "advancedScheduleJson"
  *
  * Options:
- *   --file, -f                       CSV file with stream IDs (and schedules in from-file mode)
- *   --stream-id                      Single stream ID (enables debug logging)
- *   --stream-ids                     Comma-separated stream IDs
- *   --column, -c                     Column name containing stream IDs (default: "streamId")
+ *   --file, -f                       CSV file with IDs (and schedules in from-file mode)
+ *   --id                             Single ID (enables debug logging)
+ *   --ids                            Comma-separated IDs
+ *   --dataset                        Treat the --id/--ids/--file IDs as DataSet IDs and look them
+ *                                      up in batches of 50 to resolve their underlying stream IDs.
+ *                                      Changes the default --column to "DataSet ID". Datasets with
+ *                                      no backing stream are skipped.
+ *   --column, -c                     Column name containing the IDs (default: "streamId", or
+ *                                      "DataSet ID" with --dataset)
  *   --mode                           "daily" (default), "manual", or "from-file"
  *   --start-hour                     Start of hour range, 0-23 (default: 0, daily mode only)
  *   --end-hour                       End of hour range, 0-23 (default: 23, daily mode only)
@@ -51,10 +58,12 @@ const argv = require('minimist')(process.argv.slice(2));
 const HELP_TEXT = `Usage: node cli.js bulk-update-stream-schedules [options]
 
 Options:
-  --file, -f                    CSV file with stream IDs (and schedules in from-file mode)
-  --stream-id                   Single stream ID (enables debug logging)
-  --stream-ids                  Comma-separated stream IDs
-  --column, -c                  CSV column with stream IDs (default: "streamId")
+  --file, -f                    CSV file with IDs (and schedules in from-file mode)
+  --id                          Single ID (enables debug logging)
+  --ids                         Comma-separated IDs
+  --dataset                     Treat --id/--ids/--file IDs as DataSet IDs; look them up in
+                                  batches of 50 to resolve stream IDs (default --column "DataSet ID")
+  --column, -c                  CSV column with the IDs (default: "streamId", or "DataSet ID" with --dataset)
   --mode                        "daily" (default), "manual", or "from-file"
   --start-hour                  Start of hour range, 0-23 (default: 0)
   --end-hour                    End of hour range, 0-23 (default: 23)
@@ -253,6 +262,94 @@ function loadSchedulesFromFile(filePath, opts) {
 	return { ids, schedules };
 }
 
+// -- DataSet → stream resolution --------------------------------------------
+
+const DATASET_BATCH_SIZE = 50;
+
+/**
+ * Translate DataSet IDs to their underlying stream IDs via the bulk datasources
+ * endpoint (POST /data/v3/datasources/bulk), looked up in batches of 50.
+ *
+ * Datasets that aren't found, or that aren't backed by a stream (DataFlow
+ * outputs and federated datasets have a null streamId), are reported and
+ * skipped. If two datasets point at the same stream, it's only processed once.
+ *
+ * @param {string[]} datasetIds
+ * @returns {Promise<{
+ *   streamIds: string[],
+ *   datasetByStream: Map<string, string>,
+ *   noStream: Array<{ datasetId: string, reason: string }>
+ * }>}
+ */
+async function resolveStreamsFromDatasets(datasetIds) {
+	const streamIds = [];
+	const datasetByStream = new Map(); // streamId -> originating datasetId
+	const seenStreams = new Set();
+	const noStream = [];
+
+	const batchCount = Math.ceil(datasetIds.length / DATASET_BATCH_SIZE);
+	console.log(
+		`Resolving ${datasetIds.length} dataset(s) to streams in ${batchCount} batch(es) of up to ${DATASET_BATCH_SIZE}...`
+	);
+
+	for (let i = 0; i < datasetIds.length; i += DATASET_BATCH_SIZE) {
+		const batch = datasetIds.slice(i, i + DATASET_BATCH_SIZE);
+		const batchNum = Math.floor(i / DATASET_BATCH_SIZE) + 1;
+		console.log(
+			`  Batch ${batchNum}/${batchCount}: looking up ${batch.length} dataset(s)...`
+		);
+
+		const results = await api.post('/data/v3/datasources/bulk', batch);
+		const dataSources = Array.isArray(results)
+			? results
+			: results?.dataSources || [];
+		const byId = new Map();
+		for (const ds of dataSources) byId.set(String(ds.id), ds);
+
+		for (const datasetId of batch) {
+			const ds = byId.get(String(datasetId));
+			if (!ds) {
+				noStream.push({ datasetId, reason: 'dataset not found' });
+				continue;
+			}
+			if (ds.streamId == null) {
+				noStream.push({
+					datasetId,
+					reason: 'dataset has no backing stream'
+				});
+				continue;
+			}
+			const streamId = String(ds.streamId);
+			if (seenStreams.has(streamId)) continue; // two datasets, same stream
+			seenStreams.add(streamId);
+			streamIds.push(streamId);
+			datasetByStream.set(streamId, String(datasetId));
+		}
+
+		if (i + DATASET_BATCH_SIZE < datasetIds.length) {
+			await new Promise((resolve) => setTimeout(resolve, 150));
+		}
+	}
+
+	console.log(
+		`  Resolved ${streamIds.length} stream(s) from ${datasetIds.length} dataset(s)`
+	);
+	if (noStream.length) {
+		console.log(
+			`  ${noStream.length} dataset(s) skipped (no backing stream or not found):`
+		);
+		for (const { datasetId, reason } of noStream.slice(0, 10)) {
+			console.log(`    - ${datasetId}: ${reason}`);
+		}
+		if (noStream.length > 10) {
+			console.log(`    ...and ${noStream.length - 10} more`);
+		}
+	}
+	console.log('');
+
+	return { streamIds, datasetByStream, noStream };
+}
+
 // -- Main --------------------------------------------------------------------
 
 async function main() {
@@ -284,7 +381,9 @@ async function main() {
 		process.exit(1);
 	}
 
-	const idColumn = argv.column || argv.c || 'streamId';
+	const datasetMode = Boolean(argv.dataset);
+	const idColumn =
+		argv.column || argv.c || (datasetMode ? 'DataSet ID' : 'streamId');
 	const jsonColumn =
 		argv['schedule-json-column'] || 'advancedScheduleJson';
 	const expressionColumn =
@@ -294,6 +393,8 @@ async function main() {
 	let streamIds;
 	let debugMode;
 	let scheduleMap = null;
+	let datasetByStream = null; // streamId -> datasetId, dataset mode only
+	let datasetsWithoutStream = 0;
 
 	if (mode === 'from-file') {
 		const filePath = argv.file || argv.f;
@@ -301,9 +402,9 @@ async function main() {
 			console.error('Error: --file is required when --mode from-file');
 			process.exit(1);
 		}
-		if (argv['stream-id'] || argv['stream-ids']) {
+		if (argv.id || argv.ids) {
 			console.error(
-				'Error: --stream-id and --stream-ids are not supported in from-file mode (the file provides both IDs and schedules)'
+				'Error: --id/--ids are not supported in from-file mode (the file provides both IDs and schedules). Use --dataset with --file to read DataSet IDs from the file.'
 			);
 			process.exit(1);
 		}
@@ -315,22 +416,50 @@ async function main() {
 			filterColumn: argv['filter-column'],
 			filterValue: argv['filter-value']
 		});
-		streamIds = loaded.ids;
-		scheduleMap = loaded.schedules;
+		if (datasetMode) {
+			const resolved = await resolveStreamsFromDatasets(loaded.ids);
+			datasetByStream = resolved.datasetByStream;
+			datasetsWithoutStream = resolved.noStream.length;
+			streamIds = resolved.streamIds;
+			// loaded.schedules is keyed by DataSet ID — re-key it by stream ID.
+			scheduleMap = new Map();
+			for (const streamId of streamIds) {
+				const datasetId = datasetByStream.get(streamId);
+				scheduleMap.set(streamId, loaded.schedules.get(datasetId));
+			}
+		} else {
+			streamIds = loaded.ids;
+			scheduleMap = loaded.schedules;
+		}
 		debugMode = streamIds.length === 1;
 	} else {
-		({ ids: streamIds, debugMode } = resolveIds(argv, {
-			name: 'stream',
-			columnDefault: 'streamId'
-		}));
+		const resolved = resolveIds(argv, {
+			idFlag: 'id',
+			idsFlag: 'ids',
+			columnDefault: datasetMode ? 'DataSet ID' : 'streamId'
+		});
+		if (datasetMode) {
+			const mapped = await resolveStreamsFromDatasets(resolved.ids);
+			datasetByStream = mapped.datasetByStream;
+			datasetsWithoutStream = mapped.noStream.length;
+			streamIds = mapped.streamIds;
+			debugMode = streamIds.length === 1;
+		} else {
+			streamIds = resolved.ids;
+			debugMode = resolved.debugMode;
+		}
 	}
 
-	const logger = createLogger('updateStreamSchedules', {
+	const logger = createLogger('bulk-update-stream-schedules', {
 		debugMode,
 		dryRun,
 		runMeta: {
 			file: argv.file || argv.f || null,
 			column: idColumn,
+			dataset: datasetMode || undefined,
+			datasetsWithoutStream: datasetMode
+				? datasetsWithoutStream
+				: undefined,
 			mode,
 			startHour: mode === 'daily' ? startHour : undefined,
 			endHour: mode === 'daily' ? endHour : undefined,
@@ -354,6 +483,11 @@ async function main() {
 	console.log(`Bulk Update Stream Schedules to ${modeLabel}`);
 	console.log('==========================================\n');
 	console.log(`Mode: ${mode}`);
+	if (datasetMode) {
+		console.log(
+			'Input: DataSet IDs (resolved to streams via /data/v3/datasources/bulk)'
+		);
+	}
 	if (mode === 'daily') {
 		console.log(
 			`Random time range: ${startHour}:00 - ${endHour}:59 ${timezone}`
@@ -382,13 +516,21 @@ async function main() {
 	for (let i = 0; i < streamIds.length; i++) {
 		const streamId = streamIds[i];
 		const progress = `[${i + 1}/${streamIds.length}]`;
-		console.log(`${progress} Processing stream ${streamId}...`);
+		const datasetId =
+			datasetMode && datasetByStream
+				? datasetByStream.get(String(streamId)) || null
+				: null;
+		console.log(
+			`${progress} Processing stream ${streamId}${datasetId ? ` (dataset ${datasetId})` : ''}...`
+		);
 
 		const debugLog = debugMode
 			? { streamId, timestamp: new Date().toISOString() }
 			: null;
+		if (debugLog && datasetId) debugLog.datasetId = datasetId;
 
 		const entry = { streamId, status: null, name: null, error: null };
+		if (datasetId) entry.datasetId = datasetId;
 
 		try {
 			console.log('  Fetching stream definition...');

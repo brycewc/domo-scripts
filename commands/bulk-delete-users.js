@@ -7,8 +7,8 @@
  * their content.
  *
  * Usage:
- *   node cli.js bulk-delete-users --user-id 12345
- *   node cli.js bulk-delete-users --user-ids 12345,67890
+ *   node cli.js bulk-delete-users --id 12345
+ *   node cli.js bulk-delete-users --ids 12345,67890
  *   node cli.js bulk-delete-users --file users.csv [--column "User ID"]
  *   node cli.js bulk-delete-users --file users.csv --dry-run
  *   node cli.js bulk-delete-users --file users.csv --yes      # non-interactive
@@ -24,8 +24,8 @@ After deletion, any datasets, cards, pages, dataflows, etc. they own will be
 orphaned. Run bulk-transfer-ownership first if you want to preserve content.
 
 ID source (one of):
-  --user-id <id>        Single user ID (enables debug logging)
-  --user-ids <a,b,c>    Comma-separated user IDs
+  --id <id>             Single user ID (enables debug logging)
+  --ids <a,b,c>         Comma-separated user IDs
   --file <path>         CSV with user IDs (default column: "User ID")
 
 Optional:
@@ -57,7 +57,8 @@ async function main() {
 	const skipPrompt = Boolean(argv.yes);
 
 	const { ids: userIds, debugMode } = resolveIds(argv, {
-		name: 'user',
+		idFlag: 'id',
+		idsFlag: 'ids',
 		columnDefault: 'User ID'
 	});
 

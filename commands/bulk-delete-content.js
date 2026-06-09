@@ -7,18 +7,37 @@
  *   bulk-transfer-ownership (used)  +  bulk-delete-content (unused)
  *
  * Supported types (native bulk endpoints used where they exist):
- *   dataflow   PUT    /dataprocessing/v1/dataflows/bulk/delete   (bulk)
- *   card       DELETE /content/v1/cards/bulk                     (bulk)
- *   dataset    POST   /data/v1/ui/bulk/delete                    (bulk)
- *   page       DELETE /content/v1/pages/{id}                     (per-item)
- *   app-studio DELETE /content/v1/dataapps/{appId}               (per-item)
- *   collection DELETE /datastores/v1/collections/{id}            (per-item)
- *   account    DELETE /accounts/v1/accounts/{id}                 (per-item)
+ *   dataflow     PUT    /dataprocessing/v1/dataflows/bulk/delete           (bulk)
+ *   card         DELETE /content/v1/cards/bulk                             (bulk)
+ *   dataset      POST   /data/v1/ui/bulk/delete                            (bulk)
+ *   group        DELETE /content/v2/groups                                 (bulk)
+ *   page         DELETE /content/v1/pages/{id}                             (per-item)
+ *   alert        DELETE /social/v4/alerts/{id}                             (per-item)
+ *   app-studio   DELETE /content/v1/dataapps/{appId}                       (per-item)
+ *   custom-app   DELETE /apps/v1/designs/{id}                              (per-item)
+ *   jupyter      DELETE /datascience/v1/workspaces/{id}                    (per-item)
+ *   ai-project   DELETE /datascience/ml/v1/projects/{id}                   (per-item)
+ *   workflow     DELETE /workflow/v1/models/{id}                           (per-item)
+ *   project      DELETE /content/v1/projects/{id}                          (per-item)
+ *   project-task DELETE /content/v1/projects/{projectId}/tasks/{id}        (per-item)
+ *   collection   DELETE /datastores/v1/collections/{id}                    (per-item)
+ *   account      DELETE /accounts/v1/accounts/{id}                         (per-item)
+ *
+ * project-task has no standalone delete endpoint — the parent projectId is
+ * resolved first via GET /content/v1/tasks/{id}, then the task is deleted under
+ * its project. jupyter is the activity-log DATA_SCIENCE_NOTEBOOK type (the API
+ * calls these Jupyter workspaces).
  *
  * Users are intentionally NOT handled here — delete them with bulk-delete-users.
  *
  * WARNING: This is a destructive operation. Deleted content cannot be recovered.
  * Use --dry-run to preview which objects would be deleted before committing.
+ *
+ * Objects that are already gone (HTTP 404/410 — stale CSV row, duplicate id,
+ * re-run after a partial failure, or cascade removal) are reported as "already
+ * gone" and skipped, not counted as errors. (Some Domo endpoints return 403/400
+ * for a non-existent id; those stay genuine errors since they're ambiguous with
+ * real auth/validation failures.)
  *
  * Usage:
  *   # Mixed CSV straight from bulk-list-user-content (has an "Object Type" column)
@@ -43,15 +62,18 @@
  *                    this restricts deletion to the listed types. When there is no type
  *                    column (or for --id/--ids), it must be exactly one type and is
  *                    applied to every row.
- *   --batch-size     IDs per native bulk call for dataflow/card/dataset (default: 50)
- *   --concurrency    Parallel per-item deletes within a type for page/app-studio/
- *                    collection/account (default: 5). Types are still deleted one
- *                    at a time, in dependency order.
+ *   --batch-size     IDs per native bulk call for dataflow/card/dataset/group (default: 50)
+ *   --concurrency    Parallel per-item deletes within a type (page, app-studio,
+ *                    jupyter, ai-project, workflow, project, project-task,
+ *                    collection, account) (default: 5). Types are still deleted
+ *                    one at a time, in dependency order.
  *   --dry-run        Preview which objects would be deleted without deleting
  *
- * Types are deleted in a fixed dependency-safe order (card, page, app-studio,
- * dataset, dataflow, account, collection) so dependents go before what they
- * reference. Deletes within a single type run concurrently; types do not overlap.
+ * Types are deleted in a fixed dependency-safe order (alert, card, page,
+ * app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
+ * dataset, dataflow, account, collection, group) so dependents go before what
+ * they reference. Deletes within a single type run concurrently; types do not
+ * overlap.
  */
 
 const { api, readCSV, createLogger, showHelp } = require('../lib');
@@ -64,7 +86,9 @@ WARNING: This is a destructive operation. Deleted content cannot be recovered.
 Routes each row to the correct DELETE endpoint by object type. Consumes the CSV
 that bulk-list-user-content emits ("Object Type" + "Object ID" columns).
 
-Supported types: dataflow, card, dataset, page, app-studio, collection, account.
+Supported types: dataflow, card, dataset, group, page, alert, app-studio,
+custom-app, jupyter, ai-project, workflow, project, project-task, collection,
+account.
 (Users are not handled here — use bulk-delete-users.)
 
 ID source:
@@ -77,35 +101,55 @@ Optional:
   --object-types   Comma-separated canonical types. With a type column, restricts
                    deletion to those types. Without a type column (or for --id/--ids),
                    must be exactly one type and is applied to every row.
-  --batch-size     IDs per native bulk call for dataflow/card/dataset (default: 50)
+  --batch-size     IDs per native bulk call for dataflow/card/dataset/group (default: 50)
   --concurrency    Parallel per-item deletes within a type (default: 5)
   --dry-run        Preview without deleting
 
-Types are deleted in a fixed dependency-safe order: card, page, app-studio,
-dataset, dataflow, account, collection. Deletes within a type run concurrently;
-types never overlap.
+Types are deleted in a fixed dependency-safe order: alert, card, page,
+app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
+dataset, dataflow, account, collection, group. Deletes within a type run
+concurrently; types never overlap.
+
+Objects already gone (HTTP 404/410) are reported as "already gone" and skipped,
+not counted as errors, so re-runs and stale rows don't fail the command.
 
 Accepted type names (case-insensitive, '-' and '_' interchangeable). The
 activity-log labels emitted by bulk-list-user-content are accepted too:
-  dataflow   (DATAFLOW_TYPE)
-  card       (CARD)
-  dataset    (DATA_SOURCE)
-  page       (PAGE)
-  app-studio (DATA_APP, data-app)
-  collection (MAGNUM_COLLECTION, appdb-collection)
-  account    (ACCOUNT)`;
+  dataflow     (DATAFLOW_TYPE)
+  card         (CARD)
+  dataset      (DATA_SOURCE)
+  group        (GROUP)
+  page         (PAGE)
+  alert        (ALERT)
+  app-studio   (DATA_APP, data-app)
+  custom-app   (RYUU_APP, app, ryuu)
+  jupyter      (DATA_SCIENCE_NOTEBOOK, jupyter-workspace)
+  ai-project   (AI_PROJECT)
+  workflow     (WORKFLOW_MODEL)
+  project      (PROJECT)
+  project-task (PROJECT_TASK)
+  collection   (MAGNUM_COLLECTION, appdb-collection)
+  account      (ACCOUNT)`;
 
 // Canonical type → accepted aliases. Includes the activity-log labels that
 // bulk-list-user-content writes into its "Object Type" column, normalized to
 // lower-case with underscores → hyphens (see normalizeType).
 const TYPE_ALIASES = {
 	account: ['account'],
+	'ai-project': ['ai-project'],
+	alert: ['alert'],
 	'app-studio': ['app-studio', 'appstudio', 'data-app', 'dataapp'],
 	card: ['card'],
 	collection: ['collection', 'appdb-collection', 'magnum-collection'],
+	'custom-app': ['custom-app', 'app', 'ryuu', 'ryuu-app'],
 	dataflow: ['dataflow', 'dataflow-type'],
 	dataset: ['dataset', 'datasource', 'data-source'],
-	page: ['page']
+	group: ['group'],
+	jupyter: ['jupyter', 'jupyter-workspace', 'data-science-notebook'],
+	page: ['page'],
+	project: ['project'],
+	'project-task': ['project-task'],
+	workflow: ['workflow', 'workflow-model']
 };
 
 const ALIAS_TO_CANONICAL = {};
@@ -132,13 +176,56 @@ const DELETERS = {
 		bulk: (ids) => api.post('/data/v1/ui/bulk/delete', { ids, type: 'DATA_SOURCE' }),
 		single: (id) => api.del(`/data/v3/datasources/${id}`)
 	},
+	group: {
+		label: 'group',
+		bulk: (ids) => api.del('/content/v2/groups', ids.map((id) => Number(id))),
+		single: (id) => api.del(`/content/v2/groups/${id}`)
+	},
 	page: {
 		label: 'page',
 		single: (id) => api.del(`/content/v1/pages/${id}`)
 	},
+	alert: {
+		label: 'alert',
+		single: (id) => api.del(`/social/v4/alerts/${id}`)
+	},
 	'app-studio': {
 		label: 'app studio app',
 		single: (id) => api.del(`/content/v1/dataapps/${id}`)
+	},
+	'custom-app': {
+		// "Custom apps" (activity-log RYUU_APP) are app designs. deleteDesign is a
+		// soft-delete — recoverable via PUT /apps/v1/designs/{id}/undelete.
+		label: 'custom app',
+		single: (id) => api.del(`/apps/v1/designs/${id}`)
+	},
+	jupyter: {
+		label: 'Jupyter workspace',
+		single: (id) => api.del(`/datascience/v1/workspaces/${id}`)
+	},
+	'ai-project': {
+		label: 'AI project',
+		single: (id) => api.del(`/datascience/ml/v1/projects/${id}`)
+	},
+	workflow: {
+		label: 'workflow',
+		single: (id) => api.del(`/workflow/v1/models/${id}`)
+	},
+	project: {
+		label: 'project',
+		single: (id) => api.del(`/content/v1/projects/${id}`)
+	},
+	'project-task': {
+		// Tasks have no standalone delete endpoint (DELETE /content/v1/tasks/{id}
+		// is 405). Resolve the parent projectId from the task, then delete it
+		// scoped under its project.
+		label: 'project task',
+		single: async (id) => {
+			const task = await api.get(`/content/v1/tasks/${id}`);
+			const projectId = task && task.projectId;
+			if (projectId == null) throw new Error(`could not resolve parent projectId for task ${id}`);
+			return api.del(`/content/v1/projects/${projectId}/tasks/${id}`);
+		}
 	},
 	collection: {
 		label: 'AppDB collection',
@@ -151,13 +238,39 @@ const DELETERS = {
 };
 
 // Order types are deleted in. This is dependency-safe, not cosmetic: dependents
-// are removed before the things they reference (e.g. cards/pages/apps before the
-// datasets they sit on, datasets before the dataflows that produce them), so we
-// never orphan or block a downstream delete. Types are processed strictly in
-// this order; only the deletes WITHIN a type may run concurrently.
-const TYPE_ORDER = ['card', 'page', 'app-studio', 'dataset', 'dataflow', 'account', 'collection'];
+// are removed before the things they reference (e.g. alerts before the cards and
+// datasets they watch, cards/pages/apps/notebooks before the datasets they sit
+// on, datasets before the dataflows that produce them, project tasks before
+// their parent project — which would otherwise take the tasks with it and 404
+// the per-task deletes), so we never orphan or block a downstream delete. Groups
+// go last, since other content references them for access. Types are processed
+// strictly in this order; only the deletes WITHIN a type may run concurrently.
+const TYPE_ORDER = [
+	'alert',
+	'card',
+	'page',
+	'app-studio',
+	'custom-app',
+	'jupyter',
+	'ai-project',
+	'workflow',
+	'project-task',
+	'project',
+	'dataset',
+	'dataflow',
+	'account',
+	'collection',
+	'group'
+];
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 404/410 mean the object is already gone (stale row, duplicate id, re-run, or
+// cascade removal) — a success for our purposes, not a failure. Note: per past
+// findings, some Domo DELETE endpoints return 403/400 for a non-existent id;
+// those are deliberately NOT treated as "gone" since they're ambiguous with
+// real auth/validation errors. Only 405 means the verb is unsupported.
+const isAlreadyGone = (err) => err && (err.status === 404 || err.status === 410);
 
 // Run `worker` over `items` with at most `limit` in flight at once, preserving
 // nothing about order (callers that care order their types, not their items).
@@ -263,11 +376,12 @@ async function deleteType(type, ids, { dryRun, batchSize, concurrency, logger })
 			console.log(`  [DRY RUN] Would delete ${deleter.label} ${id}`);
 			logger.addResult({ objectType: type, objectId: id, status: 'dry-run' });
 		}
-		return { deleted: ids.length, errors: 0 };
+		return { deleted: ids.length, errors: 0, skipped: 0 };
 	}
 
 	let deleted = 0;
 	let errors = 0;
+	let skipped = 0;
 
 	if (deleter.bulk) {
 		const totalBatches = Math.ceil(ids.length / batchSize);
@@ -290,9 +404,15 @@ async function deleteType(type, ids, { dryRun, batchSize, concurrency, logger })
 						logger.addResult({ objectType: type, objectId: id, status: 'deleted', batch: batchNumber, retried: true });
 						deleted++;
 					} catch (singleError) {
-						console.error(`      ✗ ${deleter.label} ${id} failed: ${singleError.message}`);
-						logger.addResult({ objectType: type, objectId: id, status: 'error', error: singleError.message, batch: batchNumber });
-						errors++;
+						if (isAlreadyGone(singleError)) {
+							console.log(`      ↷ ${deleter.label} ${id} already gone (skipped)`);
+							logger.addResult({ objectType: type, objectId: id, status: 'skipped', reason: 'already-deleted', batch: batchNumber });
+							skipped++;
+						} else {
+							console.error(`      ✗ ${deleter.label} ${id} failed: ${singleError.message}`);
+							logger.addResult({ objectType: type, objectId: id, status: 'error', error: singleError.message, batch: batchNumber });
+							errors++;
+						}
 					}
 					await delay(150);
 				}
@@ -310,14 +430,20 @@ async function deleteType(type, ids, { dryRun, batchSize, concurrency, logger })
 				deleted++;
 				console.log(`  ✓ [${++done}/${ids.length}] ${deleter.label} ${id} deleted`);
 			} catch (error) {
-				logger.addResult({ objectType: type, objectId: id, status: 'error', error: error.message });
-				errors++;
-				console.error(`  ✗ [${++done}/${ids.length}] ${deleter.label} ${id} failed: ${error.message}`);
+				if (isAlreadyGone(error)) {
+					logger.addResult({ objectType: type, objectId: id, status: 'skipped', reason: 'already-deleted' });
+					skipped++;
+					console.log(`  ↷ [${++done}/${ids.length}] ${deleter.label} ${id} already gone (skipped)`);
+				} else {
+					logger.addResult({ objectType: type, objectId: id, status: 'error', error: error.message });
+					errors++;
+					console.error(`  ✗ [${++done}/${ids.length}] ${deleter.label} ${id} failed: ${error.message}`);
+				}
 			}
 		});
 	}
 
-	return { deleted, errors };
+	return { deleted, errors, skipped };
 }
 
 async function main() {
@@ -360,24 +486,27 @@ async function main() {
 	console.log(`Objects:     ${totalObjects}`);
 	for (const t of typesToProcess) console.log(`  ${t}: ${objectsByType[t].length}`);
 
-	const summary = { totals: {}, deleted: 0, errors: 0 };
+	const summary = { totals: {}, deleted: 0, errors: 0, skipped: 0 };
 	for (const type of typesToProcess) {
-		const { deleted, errors } = await deleteType(type, objectsByType[type], { dryRun, batchSize, concurrency, logger });
-		summary.totals[type] = { deleted, errors };
+		const { deleted, errors, skipped } = await deleteType(type, objectsByType[type], { dryRun, batchSize, concurrency, logger });
+		summary.totals[type] = { deleted, errors, skipped };
 		summary.deleted += deleted;
 		summary.errors += errors;
+		summary.skipped += skipped;
 	}
 
 	const verb = dryRun ? 'would delete' : 'deleted';
 	console.log('\n=== Summary ===');
 	for (const type of typesToProcess) {
 		const t = summary.totals[type];
-		console.log(`  ${type}: ${t.deleted} ${verb}${t.errors ? `, ${t.errors} errors` : ''}`);
+		const extras = [t.skipped ? `${t.skipped} already gone` : null, t.errors ? `${t.errors} errors` : null].filter(Boolean);
+		console.log(`  ${type}: ${t.deleted} ${verb}${extras.length ? `, ${extras.join(', ')}` : ''}`);
 	}
 	console.log(`Total ${verb}: ${summary.deleted}`);
+	if (summary.skipped > 0) console.log(`Total already gone: ${summary.skipped}`);
 	console.log(`Total errors:  ${summary.errors}`);
 
-	logger.writeRunLog({ total: totalObjects, deleted: summary.deleted, errors: summary.errors, byType: summary.totals });
+	logger.writeRunLog({ total: totalObjects, deleted: summary.deleted, errors: summary.errors, skipped: summary.skipped, byType: summary.totals });
 
 	if (dryRun) {
 		console.log('\nRe-run without --dry-run to execute the deletion.');

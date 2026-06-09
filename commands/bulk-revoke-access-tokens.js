@@ -2,16 +2,16 @@
  * Revoke (delete) Domo developer access tokens in bulk.
  *
  * Pick one source for the token list:
- *   --token-id          Single token ID (enables debug logging)
- *   --token-ids         Comma-separated token IDs
+ *   --id                Single token ID (enables debug logging)
+ *   --ids               Comma-separated token IDs
  *   --file              CSV with token IDs (default column: "Token ID")
  *   --owner             User ID — fetches all tokens and revokes those owned by that user
  *   --expired           Fetches all tokens and revokes those whose expiry is in the past
  *   --deleted-owners    Fetches all tokens and revokes those whose owner has been deleted
  *
  * Usage:
- *   node cli.js bulk-revoke-access-tokens --token-id 42
- *   node cli.js bulk-revoke-access-tokens --token-ids "42,43,44"
+ *   node cli.js bulk-revoke-access-tokens --id 42
+ *   node cli.js bulk-revoke-access-tokens --ids "42,43,44"
  *   node cli.js bulk-revoke-access-tokens --file "tokens.csv"
  *   node cli.js bulk-revoke-access-tokens --file "tokens.csv" --column "id"
  *   node cli.js bulk-revoke-access-tokens --owner 1250228141
@@ -19,8 +19,8 @@
  *   node cli.js bulk-revoke-access-tokens --deleted-owners --dry-run
  *
  * Options:
- *   --token-id        Single token ID (enables debug logging)
- *   --token-ids       Comma-separated token IDs
+ *   --id              Single token ID (enables debug logging)
+ *   --ids             Comma-separated token IDs
  *   --file, -f        CSV with token IDs
  *   --column, -c      CSV column with token IDs (default: "Token ID")
  *   --filter-column   CSV column to filter on
@@ -41,8 +41,8 @@ const HELP_TEXT = `Usage: node cli.js bulk-revoke-access-tokens [options]
 Revoke (delete) Domo developer access tokens in bulk.
 
 Token source (one of):
-  --token-id <id>        Single token ID (enables debug logging)
-  --token-ids <a,b,c>    Comma-separated token IDs
+  --id <id>              Single token ID (enables debug logging)
+  --ids <a,b,c>          Comma-separated token IDs
   --file, -f <path>      CSV with token IDs
   --owner <userId>       Revoke every token owned by this user ID
   --expired              Revoke every token whose expiry is in the past
@@ -143,16 +143,16 @@ async function main() {
 	}
 
 	const fetchSource = fetchModes.length === 1;
-	const idSource = argv['token-id'] || argv['token-ids'] || argv.file || argv.f;
+	const idSource = argv.id || argv.ids || argv.file || argv.f;
 
 	if (fetchSource && idSource) {
 		throw new Error(
-			'Use either --owner / --expired / --deleted-owners (fetch mode) OR --token-id / --token-ids / --file (list mode), not both'
+			'Use either --owner / --expired / --deleted-owners (fetch mode) OR --id / --ids / --file (list mode), not both'
 		);
 	}
 	if (!fetchSource && !idSource) {
 		throw new Error(
-			'One of --token-id, --token-ids, --file, --owner, --expired, or --deleted-owners is required'
+			'One of --id, --ids, --file, --owner, --expired, or --deleted-owners is required'
 		);
 	}
 
@@ -190,17 +190,21 @@ async function main() {
 		tokenIds = matches.map((t) => String(t.id));
 		for (const t of matches) tokenById[String(t.id)] = t;
 	} else {
-		const resolved = resolveIds(argv, { name: 'token', columnDefault: 'Token ID' });
+		const resolved = resolveIds(argv, {
+			idFlag: 'id',
+			idsFlag: 'ids',
+			columnDefault: 'Token ID'
+		});
 		tokenIds = resolved.ids;
 		debugMode = resolved.debugMode;
-		source = argv['token-id']
-			? `token-id=${argv['token-id']}`
-			: argv['token-ids']
-				? `token-ids=${argv['token-ids']}`
+		source = argv.id
+			? `id=${argv.id}`
+			: argv.ids
+				? `ids=${argv.ids}`
 				: `file=${argv.file || argv.f}`;
 	}
 
-	const logger = createLogger('revokeAccessTokens', {
+	const logger = createLogger('bulk-revoke-access-tokens', {
 		debugMode,
 		dryRun,
 		runMeta: {
