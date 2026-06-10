@@ -1179,11 +1179,12 @@ async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fro
 	if (dryRun) return { transferred: ids };
 
 	const reassignBatch = (dsIds) =>
-		api.post('/data/v1/ui/bulk/reassign', {
-			type: 'DATA_SOURCE',
-			ids: dsIds,
-			userId: toUserId
-		});
+		api.put('/data/ui/v3/datasources/ownedBy', [
+			{
+				entityIdentifier: { id: parseInt(toUserId, 10), type: 'USER' },
+				dataSourceIds: dsIds
+			}
+		]);
 	const reassignOne = (id) =>
 		api.put(`/data/v2/datasources/${id}/responsibleUsers`, {
 			responsibleUserId: String(toUserId)
