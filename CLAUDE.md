@@ -24,7 +24,7 @@ node cli.js upload-dataset --file "data.csv" --dataset-id "<id>" --batch-size 50
 node cli.js bulk-update-stream-schedules --file "streams.csv" --start-hour 6 --end-hour 20 --timezone "America/Denver"
 node cli.js bulk-add-dataflow-trigger-condition --id 123
 node cli.js bulk-share-content --file "content.csv" --user "<userId>" --content-type "card"
-node cli.js bulk-delete-datasets --file "datasets.csv" --column "DataSet ID" --dry-run
+node cli.js bulk-delete-content --file "datasets.csv" --object-types "dataset" --id-column "DataSet ID" --dry-run
 ```
 
 ## Architecture
@@ -60,7 +60,7 @@ const { api, config, readCSV, resolveIds, createLogger } = require('../lib');
 
 ### Commands (commands/)
 
-19 command modules, each a standalone async script loaded by `cli.js`. Filenames are kebab-case matching the command name (e.g. `node cli.js bulk-update-stream-schedules` loads `commands/bulk-update-stream-schedules.js`).
+One module per command, each a standalone async script loaded by `cli.js`. Filenames are kebab-case matching the command name (e.g. `node cli.js bulk-update-stream-schedules` loads `commands/bulk-update-stream-schedules.js`).
 
 **When adding a new command:**
 
@@ -72,7 +72,7 @@ const { api, config, readCSV, resolveIds, createLogger } = require('../lib');
 Key categories:
 
 - **Bulk tagging/triggers**: `bulk-add-dataflow-tags`, `bulk-add-dataset-tags`, `bulk-add-dataflow-trigger-condition`
-- **Bulk deletion**: `bulk-delete-datasets`
+- **Bulk deletion**: `bulk-delete-content` (mixed types incl. datasets and accounts, routed by object type), `bulk-delete-users`, `bulk-delete-dataflow-triggers`, `delete-unused-beast-modes`
 - **Bulk rename**: `bulk-rename-dataflows`, `bulk-rename-datasets`
 - **PDP policies**: `bulk-apply-pdp-policies`, `bulk-update-column-pdp-policy`
 - **Content access**: `bulk-share-content`, `bulk-unshare-content`

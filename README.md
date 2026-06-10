@@ -118,7 +118,7 @@ node cli.js upload-dataset --file "data.csv" --dataset-id "abc-123" --batch-size
 node cli.js bulk-share-content --file "content.csv" --user "12345" --content-type "card"
 
 # Preview destructive changes with dry run
-node cli.js bulk-delete-datasets --file "datasets.csv" --dry-run
+node cli.js bulk-delete-content --file "datasets.csv" --object-types "dataset" --id-column "DataSet ID" --dry-run
 
 # Filter CSV input before processing
 node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "status" --filter-value "ACTIVE"
@@ -134,10 +134,8 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-add-dataset-tags` | Add tags to datasets from a CSV or by owner |
 | `bulk-apply-pdp-policies` | Copy PDP policies from a source dataset to target datasets |
 | `bulk-convert-stream-provider` | Convert streams from one connector type to another |
-| `bulk-delete-accounts` | Delete data connection accounts listed in a CSV |
-| `bulk-delete-content` | Delete mixed content (dataflows, cards, datasets, groups, pages, alerts, app-studio apps, custom apps, Jupyter workspaces, AI projects, workflows, projects, project tasks, AppDB collections, accounts) from a CSV, routing each row to the right endpoint by type — consumes the `bulk-list-user-content` CSV directly |
+| `bulk-delete-content` | Delete mixed content (dataflows, cards, datasets, groups, pages, alerts, app-studio apps, custom apps, Jupyter workspaces, AI projects, workflows, projects, project tasks, AppDB collections, accounts) from a CSV, routing each row to the right endpoint by type — consumes the `bulk-list-user-content` CSV directly; `--delete-output-datasets` also deletes each dataflow's output datasets |
 | `bulk-delete-dataflow-triggers` | Remove all triggers from dataflows listed in a CSV |
-| `bulk-delete-datasets` | Delete datasets listed in a CSV |
 | `bulk-delete-users` | Delete users listed in a CSV. Does not check or transfer ownership — prompts for confirmation. |
 | `bulk-export-dataset-versions` | Export historical versions of a dataset |
 | `bulk-list-user-content` | List everything a set of users own (datasets, cards, pages, etc.) into a single CSV — one row per (user, object) |
@@ -186,7 +184,7 @@ domo-scripts/
 │   ├── csv.js          # CSV parsing with optional filtering
 │   ├── input.js        # Resolve IDs from CSV/flags
 │   └── log.js          # Debug and run log utilities
-├── commands/           # One file per command (30 total)
+├── commands/           # One file per command (29 total)
 ├── logs/               # Generated run/debug logs (git-ignored)
 ├── .env                # Your credentials (git-ignored)
 ├── .env.<name>         # Per-environment credentials, selected with --env (git-ignored)

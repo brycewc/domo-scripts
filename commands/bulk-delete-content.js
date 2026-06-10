@@ -53,6 +53,9 @@
  *   node cli.js bulk-delete-content --object-types "dataflow" --ids "123,456"
  *   node cli.js bulk-delete-content --object-types "page" --id 789
  *
+ *   # Delete dataflows AND the datasets they output
+ *   node cli.js bulk-delete-content --object-types "dataflow" --ids "123,456" --delete-output-datasets
+ *
  * Options:
  *   --file, -f       CSV file with object IDs (and optionally a type column)
  *   --id, --ids      Single ID / comma-separated IDs (requires a single --object-types)
@@ -67,6 +70,15 @@
  *                    jupyter, ai-project, workflow, project, project-task,
  *                    collection, account) (default: 5). Types are still deleted
  *                    one at a time, in dependency order.
+ *   --delete-output-datasets
+ *                    Dataflows only: also delete every output dataset of each
+ *                    dataflow being deleted. Each dataflow definition is fetched
+ *                    (a read-only GET, done even under --dry-run so the preview
+ *                    is complete) to enumerate its outputs; the outputs join the
+ *                    normal dataset pass, which already runs before the dataflow
+ *                    pass. A dataflow whose outputs cannot be listed is NOT
+ *                    deleted — deleting it would orphan output datasets with no
+ *                    remaining way to find them — and is counted as an error.
  *   --dry-run        Preview which objects would be deleted without deleting
  *
  * Types are deleted in a fixed dependency-safe order (alert, card, page,
@@ -103,6 +115,13 @@ Optional:
                    must be exactly one type and is applied to every row.
   --batch-size     IDs per native bulk call for dataflow/card/dataset/group (default: 50)
   --concurrency    Parallel per-item deletes within a type (default: 5)
+  --delete-output-datasets
+                   Dataflows only: also delete each dataflow's output datasets.
+                   Fetches every dataflow definition (even with --dry-run, so the
+                   preview lists the datasets) and deletes the outputs in the
+                   normal dataset pass, before the dataflows. A dataflow whose
+                   outputs can't be listed is skipped and counted as an error
+                   rather than deleted without its outputs.
   --dry-run        Preview without deleting
 
 Types are deleted in a fixed dependency-safe order: alert, card, page,
@@ -367,6 +386,63 @@ function buildObjectsByType(requestedTypes) {
 	return objectsByType;
 }
 
+// --delete-output-datasets: fetch each dataflow's definition and append its
+// output dataset IDs to the dataset work list (deduped against datasets already
+// listed), so the outputs are deleted in the normal dataset pass — which
+// TYPE_ORDER already runs before the dataflow pass. Runs even under --dry-run
+// (the GETs are read-only) so the preview shows the datasets that would go.
+// A dataflow that is already gone (404/410) stays in the work list for the
+// delete pass to report as such. Any other fetch failure REMOVES the dataflow
+// from the work list: deleting it blind would orphan output datasets with no
+// remaining way to find them. Failures are returned for the caller to count as
+// errors. Mutates objectsByType in place.
+async function expandDataflowOutputs(objectsByType, concurrency) {
+	const dataflowIds = objectsByType.dataflow;
+	const datasetIds = new Set((objectsByType.dataset || []).map(String));
+	const added = [];
+	const outputsByDataflow = {};
+	const failures = [];
+
+	console.log(`Listing output datasets for ${dataflowIds.length} dataflow(s)...`);
+	await mapWithConcurrency(dataflowIds, concurrency, async (dataflowId) => {
+		try {
+			const definition = await api.get(`/dataprocessing/v2/dataflows/${dataflowId}`);
+			const outputs = (definition.outputs || [])
+				.map((output) => output && output.dataSourceId)
+				.filter(Boolean)
+				.map(String);
+			outputsByDataflow[dataflowId] = outputs;
+			for (const datasetId of outputs) {
+				if (!datasetIds.has(datasetId)) {
+					datasetIds.add(datasetId);
+					added.push(datasetId);
+				}
+			}
+			console.log(`  dataflow ${dataflowId}: ${outputs.length} output dataset(s)`);
+		} catch (error) {
+			if (isAlreadyGone(error)) {
+				console.log(`  ↷ dataflow ${dataflowId} already gone — no outputs to list`);
+			} else {
+				failures.push({ dataflowId: String(dataflowId), error: error.message });
+				console.error(`  ✗ dataflow ${dataflowId}: could not list outputs — ${error.message}`);
+			}
+		}
+		await delay(100);
+	});
+
+	if (added.length > 0) {
+		objectsByType.dataset = (objectsByType.dataset || []).concat(added);
+	}
+	if (failures.length > 0) {
+		const failed = new Set(failures.map((f) => f.dataflowId));
+		objectsByType.dataflow = dataflowIds.filter((id) => !failed.has(String(id)));
+		console.warn(`  Skipping ${failed.size} dataflow(s) whose outputs could not be listed — they will NOT be deleted.`);
+	}
+	console.log(`  ${added.length} output dataset(s) added to the delete list.\n`);
+
+	return { added, outputsByDataflow, failures };
+}
+
 async function deleteType(type, ids, { dryRun, batchSize, concurrency, logger }) {
 	const deleter = DELETERS[type];
 	console.log(`\n=== ${type} (${ids.length}) ===`);
@@ -452,14 +528,29 @@ async function main() {
 	const dryRun = argv['dry-run'] || argv.dry || false;
 	const batchSize = parseInt(argv['batch-size'] || argv.b || '50', 10);
 	const concurrency = Math.max(1, parseInt(argv.concurrency || '5', 10));
+	const deleteOutputDatasets = argv['delete-output-datasets'] || false;
 
 	const requestedTypes = parseRequestedTypes();
 	const objectsByType = buildObjectsByType(requestedTypes);
 
+	console.log('Bulk Delete Content');
+	console.log('===================\n');
+	if (dryRun) console.log('*** DRY RUN — no content will be deleted ***\n');
+
+	let outputExpansion = null;
+	if (deleteOutputDatasets) {
+		if ((objectsByType.dataflow || []).length > 0) {
+			outputExpansion = await expandDataflowOutputs(objectsByType, concurrency);
+		} else {
+			console.warn('--delete-output-datasets: no dataflows in the work list, nothing to expand.\n');
+		}
+	}
+	const expansionFailures = outputExpansion ? outputExpansion.failures : [];
+
 	const typesToProcess = TYPE_ORDER.filter((t) => objectsByType[t] && objectsByType[t].length > 0);
 	const totalObjects = typesToProcess.reduce((n, t) => n + objectsByType[t].length, 0);
 
-	if (totalObjects === 0) {
+	if (totalObjects === 0 && expansionFailures.length === 0) {
 		console.log('No supported objects to delete.');
 		process.exit(0);
 	}
@@ -474,19 +565,26 @@ async function main() {
 			requestedTypes: requestedTypes || 'all',
 			batchSize,
 			concurrency,
+			deleteOutputDatasets,
 			countsByType: Object.fromEntries(typesToProcess.map((t) => [t, objectsByType[t].length]))
 		}
 	});
 
-	console.log('Bulk Delete Content');
-	console.log('===================\n');
-	if (dryRun) console.log('*** DRY RUN — no content will be deleted ***\n');
 	console.log(`Batch Size:  ${batchSize}`);
 	console.log(`Concurrency: ${concurrency}`);
 	console.log(`Objects:     ${totalObjects}`);
 	for (const t of typesToProcess) console.log(`  ${t}: ${objectsByType[t].length}`);
 
 	const summary = { totals: {}, deleted: 0, errors: 0, skipped: 0 };
+	for (const f of expansionFailures) {
+		logger.addResult({
+			objectType: 'dataflow',
+			objectId: f.dataflowId,
+			status: 'error',
+			error: `not deleted — could not list output datasets: ${f.error}`
+		});
+		summary.errors++;
+	}
 	for (const type of typesToProcess) {
 		const { deleted, errors, skipped } = await deleteType(type, objectsByType[type], { dryRun, batchSize, concurrency, logger });
 		summary.totals[type] = { deleted, errors, skipped };
@@ -502,15 +600,31 @@ async function main() {
 		const extras = [t.skipped ? `${t.skipped} already gone` : null, t.errors ? `${t.errors} errors` : null].filter(Boolean);
 		console.log(`  ${type}: ${t.deleted} ${verb}${extras.length ? `, ${extras.join(', ')}` : ''}`);
 	}
+	if (expansionFailures.length > 0) {
+		console.log(`  dataflow: ${expansionFailures.length} not deleted (output datasets could not be listed)`);
+	}
 	console.log(`Total ${verb}: ${summary.deleted}`);
 	if (summary.skipped > 0) console.log(`Total already gone: ${summary.skipped}`);
 	console.log(`Total errors:  ${summary.errors}`);
 
-	logger.writeRunLog({ total: totalObjects, deleted: summary.deleted, errors: summary.errors, skipped: summary.skipped, byType: summary.totals });
+	logger.writeRunLog({
+		total: totalObjects,
+		deleted: summary.deleted,
+		errors: summary.errors,
+		skipped: summary.skipped,
+		byType: summary.totals,
+		...(outputExpansion
+			? {
+					outputDatasetsAdded: outputExpansion.added.length,
+					outputDatasetsByDataflow: outputExpansion.outputsByDataflow,
+					outputExpansionFailures: outputExpansion.failures
+				}
+			: {})
+	});
 
 	if (dryRun) {
 		console.log('\nRe-run without --dry-run to execute the deletion.');
-		process.exit(0);
+		process.exit(summary.errors > 0 ? 1 : 0);
 	}
 	if (summary.errors > 0) {
 		console.error('\nSome deletions failed. Check the error messages above.');
