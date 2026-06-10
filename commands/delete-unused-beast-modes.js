@@ -3,8 +3,9 @@
  *
  * Searches /query/v1/functions/search for top-level (not nested), inactive
  * functions — i.e. beast modes with no active links to cards, views, etc. —
- * and deletes them in batches. Optionally restricted to one or more owners.
- * Variables are excluded unless --include-variables is passed.
+ * and deletes them in batches. Optionally restricted to one or more owners
+ * and/or one or more datasets. Variables are excluded unless
+ * --include-variables is passed.
  *
  * WARNING: This is a destructive operation. Deleted beast modes cannot be
  * recovered. Use --dry-run to preview what would be deleted first.
@@ -13,11 +14,13 @@
  *   node cli.js delete-unused-beast-modes --dry-run
  *   node cli.js delete-unused-beast-modes --owner 123456789
  *   node cli.js delete-unused-beast-modes --owner "123,456" --max 500
+ *   node cli.js delete-unused-beast-modes --dataset "<datasetId>"
  *   node cli.js delete-unused-beast-modes --created-before "2024-01-01"
  *   node cli.js delete-unused-beast-modes --include-locked --include-variables
  *
  * Options:
  *   --owner, -o          Only delete beast modes owned by these user ID(s) (comma-separated)
+ *   --dataset, -d        Only delete beast modes on these dataset ID(s) (comma-separated)
  *   --created-before     Only delete beast modes created before this ISO date
  *                        (filtered client-side; the API has no created filter)
  *   --max, -m            Stop after finding this many beast modes to delete
@@ -43,6 +46,7 @@ and deletes them after confirmation.
 
 Options:
   --owner, -o          Only delete beast modes owned by these user ID(s) (comma-separated)
+  --dataset, -d        Only delete beast modes on these dataset ID(s) (comma-separated)
   --created-before     Only delete beast modes created before this ISO date (e.g. "2024-01-01")
   --max, -m            Stop after finding this many beast modes to delete
   --batch-size, -b     Beast modes per bulk delete call (default: 50)
@@ -63,13 +67,16 @@ function ask(question) {
 	);
 }
 
-async function searchFunctions(ownerIds, includeVariables, limit, offset) {
+async function searchFunctions(ownerIds, datasetIds, includeVariables, limit, offset) {
 	const filters = [{ field: 'notNested' }, { field: 'inactive', value: true }];
 	if (!includeVariables) {
 		filters.push({ field: 'notvariable' });
 	}
 	if (ownerIds.length > 0) {
 		filters.push({ field: 'owner', idList: ownerIds });
+	}
+	if (datasetIds.length > 0) {
+		filters.push({ field: 'dataset', idList: datasetIds });
 	}
 	// The sort is required — the API returns zero results without it.
 	// Sorting by created ascending lets --created-before stop paginating
@@ -94,13 +101,13 @@ async function deleteSingleFunction(id) {
 	return api.del(`/query/v1/functions/template/${id}`);
 }
 
-async function findUnusedBeastModes(ownerIds, includeVariables, includeLocked, createdBeforeMs, max) {
+async function findUnusedBeastModes(ownerIds, datasetIds, includeVariables, includeLocked, createdBeforeMs, max) {
 	const candidates = [];
 	let lockedSkipped = 0;
 	let offset = 0;
 
 	while (true) {
-		const result = await searchFunctions(ownerIds, includeVariables, PAGE_SIZE, offset);
+		const result = await searchFunctions(ownerIds, datasetIds, includeVariables, PAGE_SIZE, offset);
 		const functions = result.results || [];
 		if (functions.length === 0) break;
 
@@ -151,6 +158,13 @@ async function main() {
 				.map((s) => s.trim())
 				.filter(Boolean)
 		: [];
+	const datasetArg = argv.dataset || argv.d;
+	const datasetIds = datasetArg
+		? String(datasetArg)
+				.split(',')
+				.map((s) => s.trim())
+				.filter(Boolean)
+		: [];
 	const max = parseInt(argv.max || argv.m || '0', 10) || 0;
 	const batchSize = parseInt(argv['batch-size'] || argv.b || '50', 10);
 	const includeLocked = argv['include-locked'] || false;
@@ -173,6 +187,7 @@ async function main() {
 		dryRun,
 		runMeta: {
 			owners: ownerIds.length > 0 ? ownerIds : null,
+			datasets: datasetIds.length > 0 ? datasetIds : null,
 			createdBefore: createdBeforeMs ? new Date(createdBeforeMs).toISOString() : null,
 			max: max || null,
 			batchSize,
@@ -188,6 +203,7 @@ async function main() {
 	}
 	console.log(`Instance:       ${config.instanceUrl}`);
 	console.log(`Owner filter:   ${ownerIds.length > 0 ? ownerIds.join(', ') : '(none)'}`);
+	console.log(`Dataset filter: ${datasetIds.length > 0 ? datasetIds.join(', ') : '(none)'}`);
 	console.log(`Created before: ${createdBeforeMs ? new Date(createdBeforeMs).toISOString() : '(any)'}`);
 	console.log(`Max to delete:  ${max || '(no limit)'}`);
 	console.log(`Batch size:     ${batchSize}`);
@@ -197,6 +213,7 @@ async function main() {
 	console.log('Searching for unused beast modes...\n');
 	const { candidates, lockedSkipped } = await findUnusedBeastModes(
 		ownerIds,
+		datasetIds,
 		includeVariables,
 		includeLocked,
 		createdBeforeMs,

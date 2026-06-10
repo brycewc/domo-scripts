@@ -153,7 +153,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-update-users` | Bulk update user attributes from a CSV via PATCH (one row per user) |
 | `check-credentials` | Validate the configured API credentials against the selected instance |
 | `clear-logs` | Delete every log file under `logs/` (supports `--dry-run` and `--command` filter) |
-| `delete-unused-beast-modes` | Find and bulk-delete beast modes with no active links (not used in any card or view), optionally filtered by owner or creation date; variables excluded unless `--include-variables` |
+| `delete-unused-beast-modes` | Find and bulk-delete beast modes with no active links (not used in any card or view), optionally filtered by owner, dataset, or creation date; variables excluded unless `--include-variables` |
 | `extract-card-ids` | Extract card IDs from a page export JSON |
 | `run-workflow-from-csv` | Convert a CSV to workflow input format and run a Domo workflow |
 | `swap-input-in-dataflows` | Replace a dataset input across all consuming dataflows |
