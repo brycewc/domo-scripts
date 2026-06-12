@@ -26,6 +26,10 @@
  *   # Assign ownership for a CSV without specifying a previous owner
  *   node cli.js bulk-transfer-ownership --to-user 67890 --file datasets.csv --object-types "dataset" --keep-previous-owner
  *
+ * When dataflows are transferred, the new owner is granted access to any input
+ * dataset they can't already reach (directly or via a group). Control the grant
+ * level with --input-access-level (default CAN_VIEW).
+ *
  * Object types (aliases accepted: DATA_SOURCE, dataflow_type, beast_mode_formula, data_app, etc.):
  *   account, ai-model, ai-project, alert, app-studio, approval, beast-mode, card,
  *   code-engine, collection, custom-app, dataflow, dataset, fileset, goal, group,
@@ -64,6 +68,10 @@ Optional:
                        owners (app-studio, page, worksheet, group, repository, workspace).
                        Required when --from-user is omitted (only valid with --file). Useful
                        when the listed objects have no current owner assigned.
+  --input-access-level <level> Access level granted to the new owner on a transferred
+                       dataflow's input datasets when they don't already have access
+                       (directly or via group). One of CAN_VIEW, CAN_EDIT, CAN_SHARE, OWNER.
+                       Default: CAN_VIEW.
   --dry-run            Print what would be transferred without calling any write endpoints
   --help               Show this help
 
@@ -75,6 +83,9 @@ Object types (case-insensitive, hyphens or underscores both accepted):
   worksheet, workspace
 
 Notes:
+  - When a dataflow is transferred, the new owner is checked for access to each of the
+    dataflow's input datasets (direct USER grant or inherited via group membership). Any
+    input they can't reach is shared with them directly (see --input-access-level).
   - "publication" is never actually transferred (platform limitation); it is only reported.
   - "approval" and "template" only discover from the --from-user; they ignore filtered IDs.
   - "goal" only discovers from the --from-user; it ignores filtered IDs.
@@ -127,6 +138,10 @@ const ALL_TYPES = Object.keys(TYPE_ALIASES);
 
 // Types that only work in "from --from-user" mode (filteredIds is not supported).
 const DISCOVERY_ONLY_TYPES = new Set(['approval', 'template', 'goal']);
+
+// Dataset access levels accepted by --input-access-level (used when granting the
+// new owner access to a transferred dataflow's input datasets).
+const DATASET_ACCESS_LEVELS = ['CAN_VIEW', 'CAN_EDIT', 'CAN_SHARE', 'OWNER'];
 
 const HANDLERS = {
 	dataset: transferDatasets,
@@ -184,6 +199,11 @@ async function _main() {
 	const idColumn = argv['id-column'] || 'Object ID';
 	const dryRun = Boolean(argv['dry-run']);
 	const keepPreviousOwner = Boolean(argv['keep-previous-owner']);
+	const inputAccessLevel = String(argv['input-access-level'] || 'CAN_VIEW').toUpperCase();
+
+	if (!DATASET_ACCESS_LEVELS.includes(inputAccessLevel)) {
+		throw new Error(`Invalid --input-access-level. Must be one of: ${DATASET_ACCESS_LEVELS.join(', ')}`);
+	}
 
 	if (!toUserId) throw new Error('--to-user is required');
 	if (!fromUserId) {
@@ -283,7 +303,7 @@ async function _main() {
 	if (keepPreviousOwner) console.log('Keep previous owner: previous owner will NOT be removed for multi-owner types.');
 	if (dryRun) console.log('DRY RUN — no write calls will be made.');
 
-	const ctx = { fromUserId, toUserId, fromUserName, toUserName, dryRun, keepPreviousOwner };
+	const ctx = { fromUserId, toUserId, fromUserName, toUserName, dryRun, keepPreviousOwner, inputAccessLevel };
 	const summary = { totals: {}, skipped: [], errors: failures };
 
 	for (const type of typesToProcess) {
@@ -465,6 +485,113 @@ async function captureDatasetOwnerNames(ids, fromUserName) {
 		if (owner.name) map[id] = owner.name;
 	}
 	return map;
+}
+
+// For each transferred dataflow, make sure the new owner can actually read the
+// flow's input datasets — otherwise the reassigned dataflow can't run. Access
+// may be direct (a USER grant on the dataset) or inherited (a GROUP grant on a
+// group the new owner belongs to). Any input the new owner can't already reach
+// is shared with them directly as a USER grant. Mirrors the read model:
+//   bulk dataset permissions → new owner's group IDs → per-dataset USER/GROUP match.
+async function ensureDataflowInputAccess(dataflowIds, toUserId, { dryRun, inputAccessLevel }) {
+	// Collect the unique input dataset IDs across every transferred dataflow.
+	const datasetIds = new Set();
+	for (const dfId of dataflowIds) {
+		const df = await safe(`get dataflow inputs ${dfId}`, () => api.get(`/dataprocessing/v1/dataflows/${dfId}`));
+		for (const input of (df && df.inputs) || []) {
+			if (input && input.dataSourceId) datasetIds.add(String(input.dataSourceId));
+		}
+	}
+	if (datasetIds.size === 0) return { shared: [], alreadyHadAccess: [] };
+
+	const ids = [...datasetIds];
+	const [groupIds, permsByDataset] = await Promise.all([getUserGroupIds(toUserId), getDatasetPermissions(ids)]);
+
+	const needsShare = [];
+	const alreadyHadAccess = [];
+	for (const dsId of ids) {
+		const grants = permsByDataset.get(dsId) || [];
+		const hasAccess = grants.some(
+			(g) =>
+				(g.type === 'USER' && String(g.id) === String(toUserId)) ||
+				(g.type === 'GROUP' && groupIds.has(String(g.id)))
+		);
+		if (hasAccess) alreadyHadAccess.push(dsId);
+		else needsShare.push(dsId);
+	}
+
+	if (needsShare.length === 0) {
+		console.log(`  Input dataset access: all ${ids.length} input dataset(s) already reachable by the new owner.`);
+		return { shared: [], alreadyHadAccess };
+	}
+
+	console.log(
+		`  Input dataset access: ${needsShare.length}/${ids.length} not reachable by the new owner` +
+			(dryRun ? ' (dry run — not sharing).' : ` — sharing @ ${inputAccessLevel}.`)
+	);
+	if (dryRun) return { shared: needsShare, alreadyHadAccess };
+
+	const batchSize = 50;
+	const shared = [];
+	for (let i = 0; i < needsShare.length; i += batchSize) {
+		const chunk = needsShare.slice(i, i + batchSize);
+		const res = await safe(
+			`share input datasets ${i + 1}-${i + chunk.length} with new owner`,
+			() =>
+				api.post('/data/v1/ui/bulk/share', {
+					bulkItems: { ids: chunk, type: 'DATA_SOURCE' },
+					dataSourceShareEntity: {
+						permissions: [{ accessLevel: inputAccessLevel, id: String(toUserId), type: 'USER' }],
+						sendEmail: false,
+						message: 'Granting new dataflow owner access to input dataset.'
+					}
+				}),
+			{ ids: chunk }
+		);
+		// bulk/share reports per-id failures under res.failed; the rest went through.
+		const failed = (res && res.failed) || {};
+		shared.push(...chunk.filter((id) => !failed[id]));
+	}
+	console.log(`  → ${shared.length} input dataset(s) shared with the new owner`);
+	return { shared, alreadyHadAccess };
+}
+
+// Grant rows for a set of datasets, keyed by dataset ID. Prefers the single
+// bulk call; if that endpoint is unavailable (some instances gate it) or omits
+// a dataset, falls back to the per-dataset permissions endpoint. Each value is
+// an array of { type, id, accessLevel, name } rows.
+async function getDatasetPermissions(datasetIds) {
+	const byDataset = new Map();
+	let bulk = null;
+	try {
+		bulk = await api.post('/data/v3/datasources/bulk/permissions', datasetIds);
+	} catch (_e) {
+		// Some instances gate the bulk endpoint; fall back to per-dataset below.
+	}
+	if (bulk && typeof bulk === 'object') {
+		for (const [dsId, val] of Object.entries(bulk)) {
+			const grants = Array.isArray(val) ? val : (val && val.list) || [];
+			byDataset.set(String(dsId), grants);
+		}
+	}
+	// Fill in any datasets the bulk call didn't cover (or all of them, if it failed).
+	for (const dsId of datasetIds) {
+		if (byDataset.has(String(dsId))) continue;
+		const res = await safe(`get permissions for dataset ${dsId}`, () =>
+			api.get(`/data/v3/datasources/${dsId}/permissions`)
+		);
+		byDataset.set(String(dsId), (res && res.list) || []);
+	}
+	return byDataset;
+}
+
+// New owner's group IDs (as strings) — one call, used to detect inherited
+// dataset access. Returns an empty Set on failure so callers degrade to
+// "no inherited access" rather than throwing.
+async function getUserGroupIds(userId) {
+	const res = await safe(`get groups for user ${userId}`, () => api.get(`/content/v2/users/${userId}/groups`));
+	const groups = Array.isArray(res) ? res : [];
+	return new Set(groups.filter((g) => g && g.id != null).map((g) => String(g.id)));
 }
 
 async function getUserName(fromUserId) {
@@ -1155,7 +1282,7 @@ async function transferCustomApps(fromUserId, toUserId, filteredIds, { dryRun })
 	return { transferred: ownedByUser, bricks, proCodeApps };
 }
 
-async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fromUserName }) {
+async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fromUserName, inputAccessLevel }) {
 	let ids = filteredIds;
 	if (ids.length === 0) {
 		const pageSize = 100;
@@ -1181,7 +1308,10 @@ async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fr
 	// Resolve the source name(s) for tagging before reassignment overwrites the owner.
 	const tagNameById = dryRun ? {} : await captureDataflowOwnerNames(ids, fromUserName);
 
-	if (dryRun) return { transferred: ids };
+	if (dryRun) {
+		const inputAccess = await ensureDataflowInputAccess(ids, toUserId, { dryRun, inputAccessLevel });
+		return { transferred: ids, inputAccess };
+	}
 
 	const reassignBulk = (dataFlowIds) =>
 		api.put('/dataprocessing/v1/dataflows/bulk/patch', {
@@ -1227,7 +1357,14 @@ async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fr
 			}
 		}
 	}
-	return { transferred };
+
+	// Make sure the new owner can read each transferred dataflow's input datasets;
+	// share any they can't already reach (directly or via group membership).
+	const inputAccess =
+		transferred.length > 0
+			? await ensureDataflowInputAccess(transferred, toUserId, { dryRun, inputAccessLevel })
+			: { shared: [], alreadyHadAccess: [] };
+	return { transferred, inputAccess };
 }
 
 async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fromUserName }) {
