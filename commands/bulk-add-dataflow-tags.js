@@ -180,15 +180,28 @@ async function main() {
 				logger.addResult({ dataflowId: id, status: 'tagged', batch: batchNumber });
 			successCount += chunk.length;
 		} catch (error) {
+			// The bulk tag endpoint is all-or-nothing: a single invalid id (e.g. a
+			// deleted dataflow) rejects the whole batch. Retry each id on its own so
+			// the valid ones still get tagged and the failures pinpoint the bad ids.
 			console.error(`  ✗ Batch ${batchNumber} failed: ${error.message}`);
-			for (const id of chunk)
-				logger.addResult({
-					dataflowId: id,
-					status: 'error',
-					error: error.message,
-					batch: batchNumber
-				});
-			errorCount += chunk.length;
+			console.log(`  Retrying ${chunk.length} dataflow(s) individually...`);
+			for (const id of chunk) {
+				try {
+					await bulkTagDataflows([id], tags);
+					logger.addResult({ dataflowId: id, status: 'tagged', batch: batchNumber });
+					successCount += 1;
+				} catch (singleError) {
+					console.error(`    ✗ ${id}: ${singleError.message}`);
+					logger.addResult({
+						dataflowId: id,
+						status: 'error',
+						error: singleError.message,
+						batch: batchNumber
+					});
+					errorCount += 1;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
 		}
 
 		if (i + batchSize < dataflowIds.length) {

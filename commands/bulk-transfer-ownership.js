@@ -422,9 +422,68 @@ async function attempt(label, fn, context) {
 	}
 }
 
+// Capture the "From <name>" tag source for each dataflow BEFORE reassigning —
+// reassignment overwrites responsibleUserId, so the current owner is only
+// available now. With --from-user (fromUserName set) every dataflow is tagged
+// from that single name; without it, each dataflow is tagged from whoever
+// currently owns it. User IDs are resolved to names once and cached.
+async function captureDataflowOwnerNames(ids, fromUserName) {
+	const map = {};
+	if (fromUserName) {
+		for (const id of ids) map[id] = fromUserName;
+		return map;
+	}
+	const nameCache = {};
+	for (const id of ids) {
+		const df = await safe(`get dataflow owner ${id}`, () => api.get(`/dataprocessing/v1/dataflows/${id}`));
+		const ownerId = df && df.responsibleUserId;
+		if (ownerId == null) continue;
+		if (!(ownerId in nameCache)) nameCache[ownerId] = await getUserName(ownerId);
+		if (nameCache[ownerId]) map[id] = nameCache[ownerId];
+	}
+	return map;
+}
+
+// Same idea as captureDataflowOwnerNames, but datasets expose the owner's name
+// directly on the datasource detail, so no separate user lookup is needed.
+async function captureDatasetOwnerNames(ids, fromUserName) {
+	const map = {};
+	if (fromUserName) {
+		for (const id of ids) map[id] = fromUserName;
+		return map;
+	}
+	for (const id of ids) {
+		const ds = await safe(`get dataset owner ${id}`, () => api.get(`/data/v3/datasources/${id}`));
+		const owner = ds && ds.owner;
+		if (!owner) continue;
+		// A dataset can be owned by a group (dataflows can't). There's no sensible
+		// "From <person>" tag in that case, so skip tagging it.
+		if (owner.type === 'GROUP' || owner.group === true) {
+			console.log(`  Skipping tag for dataset ${id}: owned by group "${owner.name}"`);
+			continue;
+		}
+		if (owner.name) map[id] = owner.name;
+	}
+	return map;
+}
+
 async function getUserName(fromUserId) {
 	const res = await safe(`get user ${fromUserId}`, () => api.get(`/content/v3/users/${fromUserId}`));
 	return (res && res.displayName) || `User ${fromUserId}`;
+}
+
+// Group object IDs by the tag name captured for each, dropping any with no
+// resolved name. Returns Map<name, ids[]> so each owner gets its own
+// "From <name>" tag batch.
+function groupByTagName(ids, tagNameById) {
+	const groups = new Map();
+	for (const id of ids) {
+		const name = tagNameById[id];
+		if (!name) continue;
+		if (!groups.has(name)) groups.set(name, []);
+		groups.get(name).push(id);
+	}
+	return groups;
 }
 
 async function listPublications(fromUserId) {
@@ -1118,6 +1177,10 @@ async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fr
 		}
 	}
 	if (ids.length === 0) return { transferred: [] };
+
+	// Resolve the source name(s) for tagging before reassignment overwrites the owner.
+	const tagNameById = dryRun ? {} : await captureDataflowOwnerNames(ids, fromUserName);
+
 	if (dryRun) return { transferred: ids };
 
 	const reassignBulk = (dataFlowIds) =>
@@ -1146,19 +1209,22 @@ async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fr
 		console.log(`  Individual retry: ${transferred.length}/${ids.length} succeeded`);
 	}
 
-	if (fromUserName && transferred.length > 0) {
+	if (transferred.length > 0) {
 		const batchSize = 50;
-		for (let i = 0; i < transferred.length; i += batchSize) {
-			const chunk = transferred.slice(i, i + batchSize);
-			await safe(
-				`tag dataflows ${i + 1}-${i + chunk.length}`,
-				() =>
-					api.put('/dataprocessing/v1/dataflows/bulk/tag', {
-						dataFlowIds: chunk,
-						tagNames: [`From ${fromUserName}`]
-					}),
-				{ dataFlowIds: chunk }
-			);
+		const tagGroups = groupByTagName(transferred, tagNameById);
+		for (const [name, groupIds] of tagGroups) {
+			for (let i = 0; i < groupIds.length; i += batchSize) {
+				const chunk = groupIds.slice(i, i + batchSize);
+				await safe(
+					`tag dataflows (From ${name}) ${i + 1}-${i + chunk.length}`,
+					() =>
+						api.put('/dataprocessing/v1/dataflows/bulk/tag', {
+							dataFlowIds: chunk,
+							tagNames: [`From ${name}`]
+						}),
+					{ dataFlowIds: chunk }
+				);
+			}
 		}
 	}
 	return { transferred };
@@ -1175,6 +1241,9 @@ async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fro
 		}
 	}
 	if (ids.length === 0) return { transferred: [] };
+
+	// Resolve the source name(s) for tagging before reassignment overwrites the owner.
+	const tagNameById = dryRun ? {} : await captureDatasetOwnerNames(ids, fromUserName);
 
 	if (dryRun) return { transferred: ids };
 
@@ -1216,18 +1285,21 @@ async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fro
 		console.log(`  Datasets reassigned: ${transferred.length}/${ids.length}`);
 	}
 
-	if (fromUserName && transferred.length > 0) {
-		for (let i = 0; i < transferred.length; i += batchSize) {
-			const chunk = transferred.slice(i, i + batchSize);
-			await safe(
-				`tag datasets ${i + 1}-${i + chunk.length}`,
-				() =>
-					api.post('/data/v1/ui/bulk/tag', {
-						bulkItems: { ids: chunk, type: 'DATA_SOURCE' },
-						tags: [`From ${fromUserName}`]
-					}),
-				{ ids: chunk }
-			);
+	if (transferred.length > 0) {
+		const tagGroups = groupByTagName(transferred, tagNameById);
+		for (const [name, groupIds] of tagGroups) {
+			for (let i = 0; i < groupIds.length; i += batchSize) {
+				const chunk = groupIds.slice(i, i + batchSize);
+				await safe(
+					`tag datasets (From ${name}) ${i + 1}-${i + chunk.length}`,
+					() =>
+						api.post('/data/v1/ui/bulk/tag', {
+							bulkItems: { ids: chunk, type: 'DATA_SOURCE' },
+							tags: [`From ${name}`]
+						}),
+					{ ids: chunk }
+				);
+			}
 		}
 	}
 	return { transferred };

@@ -11,3 +11,4 @@ id-mappings/
 !.yarn/sdks
 !.yarn/versions
 .pnp.*
+tmp
