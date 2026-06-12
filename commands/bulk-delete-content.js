@@ -193,7 +193,20 @@ const DELETERS = {
 	dataset: {
 		label: 'dataset',
 		bulk: (ids) => api.post('/data/v1/ui/bulk/delete', { ids, type: 'DATA_SOURCE' }),
-		single: (id) => api.del(`/data/v3/datasources/${id}`)
+		single: (id) => api.del(`/data/v3/datasources/${id}`),
+		// The dataset bulk endpoint returns HTTP 2xx even when individual datasets
+		// are rejected (e.g. "Frozen"), listing them in a `failed` map keyed by id.
+		// Trust only that map: any chunk id NOT in `failed` was deleted.
+		parseBulkResult: (response, chunk) => {
+			const failedMap = response && typeof response.failed === 'object' && response.failed ? response.failed : {};
+			const failed = Object.entries(failedMap).map(([id, reason]) => ({
+				id: String(id),
+				reason: typeof reason === 'string' ? reason : JSON.stringify(reason)
+			}));
+			const failedIds = new Set(failed.map((f) => f.id));
+			const succeeded = chunk.filter((id) => !failedIds.has(String(id)));
+			return { succeeded, failed };
+		}
 	},
 	group: {
 		label: 'group',
@@ -461,37 +474,65 @@ async function deleteType(type, ids, { dryRun, batchSize, concurrency, logger })
 
 	if (deleter.bulk) {
 		const totalBatches = Math.ceil(ids.length / batchSize);
+
+		// Used when the whole batch CALL throws: fall back to deleting the chunk
+		// one id at a time so a single bad id doesn't sink the rest of the batch.
+		const retryIndividually = async (chunk, batchNumber) => {
+			for (const id of chunk) {
+				try {
+					await deleter.single(id);
+					console.log(`      ✓ ${deleter.label} ${id} deleted`);
+					logger.addResult({ objectType: type, objectId: id, status: 'deleted', batch: batchNumber, retried: true });
+					deleted++;
+				} catch (singleError) {
+					if (isAlreadyGone(singleError)) {
+						console.log(`      ↷ ${deleter.label} ${id} already gone (skipped)`);
+						logger.addResult({ objectType: type, objectId: id, status: 'skipped', reason: 'already-deleted', batch: batchNumber });
+						skipped++;
+					} else {
+						console.error(`      ✗ ${deleter.label} ${id} failed: ${singleError.message}`);
+						logger.addResult({ objectType: type, objectId: id, status: 'error', error: singleError.message, batch: batchNumber });
+						errors++;
+					}
+				}
+				await delay(150);
+			}
+		};
+
 		for (let i = 0; i < ids.length; i += batchSize) {
 			const chunk = ids.slice(i, i + batchSize);
 			const batchNumber = Math.floor(i / batchSize) + 1;
 			console.log(`  [${batchNumber}/${totalBatches}] Deleting ${chunk.length} ${deleter.label}(s)...`);
 			try {
-				await deleter.bulk(chunk);
-				console.log(`    ✓ Batch ${batchNumber} succeeded`);
-				for (const id of chunk) logger.addResult({ objectType: type, objectId: id, status: 'deleted', batch: batchNumber });
-				deleted += chunk.length;
+				const response = await deleter.bulk(chunk);
+				// A non-throwing bulk call doesn't always mean every id was deleted —
+				// some endpoints (dataset) return 2xx with a `failed` map. parseBulkResult
+				// separates server-rejected ids; without it we assume the whole chunk went.
+				const { succeeded, failed } = deleter.parseBulkResult
+					? deleter.parseBulkResult(response, chunk)
+					: { succeeded: chunk, failed: [] };
+
+				for (const id of succeeded) {
+					logger.addResult({ objectType: type, objectId: id, status: 'deleted', batch: batchNumber });
+					deleted++;
+				}
+
+				if (failed.length === 0) {
+					console.log(`    ✓ Batch ${batchNumber} succeeded`);
+				} else {
+					// The bulk endpoint reported these ids in its `failed` map but still
+					// returned 2xx. That can be a transient/endpoint-specific failure
+					// (the dataset bulk endpoint sometimes leaks an internal servlet
+					// error), so retry them one at a time via the single-delete path —
+					// a different endpoint — which also distinguishes already-gone.
+					console.error(`    ⚠ Batch ${batchNumber}: ${succeeded.length} deleted, ${failed.length} reported failed by the bulk endpoint`);
+					console.log(`    Retrying ${failed.length} ${deleter.label}(s) individually...`);
+					await retryIndividually(failed.map((f) => f.id), batchNumber);
+				}
 			} catch (error) {
 				console.error(`    ✗ Batch ${batchNumber} failed: ${error.message}`);
 				console.log(`    Retrying ${chunk.length} ${deleter.label}(s) individually...`);
-				for (const id of chunk) {
-					try {
-						await deleter.single(id);
-						console.log(`      ✓ ${deleter.label} ${id} deleted`);
-						logger.addResult({ objectType: type, objectId: id, status: 'deleted', batch: batchNumber, retried: true });
-						deleted++;
-					} catch (singleError) {
-						if (isAlreadyGone(singleError)) {
-							console.log(`      ↷ ${deleter.label} ${id} already gone (skipped)`);
-							logger.addResult({ objectType: type, objectId: id, status: 'skipped', reason: 'already-deleted', batch: batchNumber });
-							skipped++;
-						} else {
-							console.error(`      ✗ ${deleter.label} ${id} failed: ${singleError.message}`);
-							logger.addResult({ objectType: type, objectId: id, status: 'error', error: singleError.message, batch: batchNumber });
-							errors++;
-						}
-					}
-					await delay(150);
-				}
+				await retryIndividually(chunk, batchNumber);
 			}
 			if (i + batchSize < ids.length) await delay(150);
 		}
