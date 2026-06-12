@@ -17,16 +17,22 @@
  *   custom-app   DELETE /apps/v1/designs/{id}                              (per-item)
  *   jupyter      DELETE /datascience/v1/workspaces/{id}                    (per-item)
  *   ai-project   DELETE /datascience/ml/v1/projects/{id}                   (per-item)
- *   workflow     DELETE /workflow/v1/models/{id}                           (per-item)
+ *   workflow     DELETE /workflow/v1/models/{id}                           (per-item)*
  *   project      DELETE /content/v1/projects/{id}                          (per-item)
  *   project-task DELETE /content/v1/projects/{projectId}/tasks/{id}        (per-item)
  *   collection   DELETE /datastores/v1/collections/{id}                    (per-item)
  *   account      DELETE /accounts/v1/accounts/{id}                         (per-item)
+ *   workspace    DELETE /nav/v1/workspaces/{workspaceGUID}                 (per-item)
  *
  * project-task has no standalone delete endpoint — the parent projectId is
  * resolved first via GET /content/v1/tasks/{id}, then the task is deleted under
- * its project. jupyter is the activity-log DATA_SCIENCE_NOTEBOOK type (the API
- * calls these Jupyter workspaces).
+ * its project. workflow (*) deactivates any active versions first — the delete
+ * endpoint rejects a model that still has an active version — by listing
+ * GET /workflow/v2/models/{id}/versions and PUTting each active one back with
+ * active:false before the DELETE. jupyter is the activity-log
+ * DATA_SCIENCE_NOTEBOOK type (the API
+ * calls those "Jupyter workspaces") — that is a DIFFERENT thing from workspace,
+ * which is the navigation Workspaces feature (nav/v1/workspaces, keyed by GUID).
  *
  * Users are intentionally NOT handled here — delete them with bulk-delete-users.
  *
@@ -83,9 +89,10 @@
  *
  * Types are deleted in a fixed dependency-safe order (alert, card, page,
  * app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
- * dataset, dataflow, account, collection, group) so dependents go before what
- * they reference. Deletes within a single type run concurrently; types do not
- * overlap.
+ * dataset, dataflow, account, collection, group, workspace) so dependents go
+ * before what they reference. workspace is last because a workspace can contain
+ * any other content, so everything it holds is deleted first. Deletes within a
+ * single type run concurrently; types do not overlap.
  */
 
 const { api, readCSV, createLogger, showHelp } = require('../lib');
@@ -100,7 +107,7 @@ that bulk-list-user-content emits ("Object Type" + "Object ID" columns).
 
 Supported types: dataflow, card, dataset, group, page, alert, app-studio,
 custom-app, jupyter, ai-project, workflow, project, project-task, collection,
-account.
+account, workspace.
 (Users are not handled here — use bulk-delete-users.)
 
 ID source:
@@ -126,8 +133,9 @@ Optional:
 
 Types are deleted in a fixed dependency-safe order: alert, card, page,
 app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
-dataset, dataflow, account, collection, group. Deletes within a type run
-concurrently; types never overlap.
+dataset, dataflow, account, collection, group, workspace. workspace is last
+because a workspace can contain any other content, so its contents go first.
+Deletes within a type run concurrently; types never overlap.
 
 Objects already gone (HTTP 404/410) are reported as "already gone" and skipped,
 not counted as errors, so re-runs and stale rows don't fail the command.
@@ -142,13 +150,15 @@ activity-log labels emitted by bulk-list-user-content are accepted too:
   alert        (ALERT)
   app-studio   (DATA_APP, data-app)
   custom-app   (RYUU_APP, app, ryuu)
-  jupyter      (DATA_SCIENCE_NOTEBOOK, jupyter-workspace)
+  jupyter      (DATA_SCIENCE_NOTEBOOK, jupyter-workspace) — data science
+               notebooks; NOT the same as workspace
   ai-project   (AI_PROJECT)
   workflow     (WORKFLOW_MODEL)
   project      (PROJECT)
   project-task (PROJECT_TASK)
   collection   (MAGNUM_COLLECTION, appdb-collection)
-  account      (ACCOUNT)`;
+  account      (ACCOUNT)
+  workspace    (WORKSPACE) — navigation Workspaces feature, keyed by GUID`;
 
 // Canonical type → accepted aliases. Includes the activity-log labels that
 // bulk-list-user-content writes into its "Object Type" column, normalized to
@@ -168,7 +178,8 @@ const TYPE_ALIASES = {
 	page: ['page'],
 	project: ['project'],
 	'project-task': ['project-task'],
-	workflow: ['workflow', 'workflow-model']
+	workflow: ['workflow', 'workflow-model'],
+	workspace: ['workspace']
 };
 
 const ALIAS_TO_CANONICAL = {};
@@ -240,8 +251,23 @@ const DELETERS = {
 		single: (id) => api.del(`/datascience/ml/v1/projects/${id}`)
 	},
 	workflow: {
+		// DELETE /workflow/v1/models/{id} rejects models that still have an active
+		// version, so list the model's versions and deactivate any active ones
+		// (PUT each back with active:false, preserving its description) before the
+		// delete. If the model is already gone, the versions GET 404s and is caught
+		// upstream as "already gone", same as project-task's parent-project lookup.
 		label: 'workflow',
-		single: (id) => api.del(`/workflow/v1/models/${id}`)
+		single: async (id) => {
+			const versions = await api.get(`/workflow/v2/models/${id}/versions`);
+			const activeVersions = (versions || []).filter((v) => v && v.active);
+			for (const ver of activeVersions) {
+				await api.put(`/workflow/v2/models/${id}/versions/${ver.version}`, {
+					active: false,
+					description: ver.description
+				});
+			}
+			return api.del(`/workflow/v1/models/${id}`);
+		}
 	},
 	project: {
 		label: 'project',
@@ -266,6 +292,12 @@ const DELETERS = {
 	account: {
 		label: 'account',
 		single: (id) => api.del(`/accounts/v1/accounts/${id}`)
+	},
+	workspace: {
+		// The navigation Workspaces feature (NOT Jupyter "workspaces" — that's the
+		// `jupyter` type). Keyed by workspace GUID; "Safe Delete Workspace".
+		label: 'workspace',
+		single: (id) => api.del(`/nav/v1/workspaces/${id}`)
 	}
 };
 
@@ -275,8 +307,11 @@ const DELETERS = {
 // on, datasets before the dataflows that produce them, project tasks before
 // their parent project — which would otherwise take the tasks with it and 404
 // the per-task deletes), so we never orphan or block a downstream delete. Groups
-// go last, since other content references them for access. Types are processed
-// strictly in this order; only the deletes WITHIN a type may run concurrently.
+// go near the end, since other content references them for access. Workspaces go
+// dead last: a workspace can contain virtually any other content (cards, pages,
+// dataflows, datasets, ...), so everything it holds is deleted first. Types are
+// processed strictly in this order; only the deletes WITHIN a type may run
+// concurrently.
 const TYPE_ORDER = [
 	'alert',
 	'card',
@@ -292,7 +327,8 @@ const TYPE_ORDER = [
 	'dataflow',
 	'account',
 	'collection',
-	'group'
+	'group',
+	'workspace'
 ];
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
