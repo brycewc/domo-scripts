@@ -72,6 +72,9 @@ Optional:
                        dataflow's input datasets when they don't already have access
                        (directly or via group). One of CAN_VIEW, CAN_EDIT, CAN_SHARE, OWNER.
                        Default: CAN_VIEW.
+  --send-email         After transferring, email the new owner a summary of every
+                       asset that was transferred to them (by type, with IDs). Skipped
+                       on a dry run.
   --dry-run            Print what would be transferred without calling any write endpoints
   --help               Show this help
 
@@ -198,6 +201,7 @@ async function _main() {
 	const typeColumn = argv['type-column'];
 	const idColumn = argv['id-column'] || 'Object ID';
 	const dryRun = Boolean(argv['dry-run']);
+	const sendEmailFlag = Boolean(argv['send-email']);
 	const keepPreviousOwner = Boolean(argv['keep-previous-owner']);
 	const inputAccessLevel = String(argv['input-access-level'] || 'CAN_VIEW').toUpperCase();
 
@@ -301,10 +305,13 @@ async function _main() {
 	console.log(`Mode:      ${objectsByType ? `file (${filePath})` : 'user discovery'}`);
 	console.log(`Types:     ${typesToProcess.join(', ')}`);
 	if (keepPreviousOwner) console.log('Keep previous owner: previous owner will NOT be removed for multi-owner types.');
+	if (sendEmailFlag) console.log('Send email: the new owner will be emailed a summary of transferred assets.');
 	if (dryRun) console.log('DRY RUN — no write calls will be made.');
 
 	const ctx = { fromUserId, toUserId, fromUserName, toUserName, dryRun, keepPreviousOwner, inputAccessLevel };
 	const summary = { totals: {}, skipped: [], errors: failures };
+	// type → transferred IDs, accumulated for the optional --send-email summary.
+	const transferredByType = {};
 
 	for (const type of typesToProcess) {
 		const filtered = objectsByType ? objectsByType[type] || [] : [];
@@ -325,6 +332,7 @@ async function _main() {
 			const res = await runType(type, filtered, ctx);
 			const transferred = (res && res.transferred) || [];
 			summary.totals[type] = transferred.length;
+			if (transferred.length) transferredByType[type] = transferred;
 			const typeErrors = failures.filter((f) => f.type === type);
 			logger.addResult({ type, transferred, errors: typeErrors, details: res });
 			if (typeErrors.length) console.log(`  ⚠ ${typeErrors.length} error(s) logged — see run log`);
@@ -351,6 +359,7 @@ async function _main() {
 			const coalescedErrors = failures.filter((f) => f.type === 'beast-mode/variable');
 			if (beastSelected) {
 				summary.totals['beast-mode'] = (res.beastModes || []).length;
+				if ((res.beastModes || []).length) transferredByType['beast-mode'] = res.beastModes;
 				logger.addResult({
 					type: 'beast-mode',
 					transferred: res.beastModes,
@@ -361,6 +370,7 @@ async function _main() {
 			}
 			if (varSelected) {
 				summary.totals['variable'] = (res.variables || []).length;
+				if ((res.variables || []).length) transferredByType['variable'] = res.variables;
 				logger.addResult({
 					type: 'variable',
 					transferred: res.variables,
@@ -388,17 +398,29 @@ async function _main() {
 			const coalescedErrors = failures.filter((f) => f.type === 'project/project-task');
 			if (projectsSelected) {
 				summary.totals['project'] = (res.projects || []).length;
+				if ((res.projects || []).length) transferredByType['project'] = res.projects;
 				logger.addResult({ type: 'project', transferred: res.projects, errors: coalescedErrors, details: res });
 				console.log(`  → ${(res.projects || []).length} projects transferred`);
 			}
 			if (taskSelected) {
 				summary.totals['project-task'] = (res.tasks || []).length;
+				if ((res.tasks || []).length) transferredByType['project-task'] = res.tasks;
 				logger.addResult({ type: 'project-task', transferred: res.tasks, errors: coalescedErrors, details: res });
 				console.log(`  → ${(res.tasks || []).length} tasks transferred`);
 			}
 			if (coalescedErrors.length) console.log(`  ⚠ ${coalescedErrors.length} error(s) logged — see run log`);
 		} catch (err) {
 			console.error(`  ✗ projects/tasks failed: ${err.message}`);
+		}
+	}
+
+	if (sendEmailFlag) {
+		console.log('\n=== email ===');
+		activeType = 'email';
+		if (dryRun) {
+			console.log('  Dry run — skipping email to the new owner.');
+		} else {
+			await sendTransferEmail({ toUserId, toUserName, fromUserName, transferredByType });
 		}
 	}
 
@@ -556,6 +578,18 @@ async function ensureDataflowInputAccess(dataflowIds, toUserId, { dryRun, inputA
 	return { shared, alreadyHadAccess };
 }
 
+// Minimal HTML escaping for values interpolated into the --send-email body
+// (owner display names, type labels, IDs). Keeps an injected name from breaking
+// the surrounding markup.
+function escapeHtml(value) {
+	return String(value)
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;')
+		.replace(/'/g, '&#39;');
+}
+
 // Grant rows for a set of datasets, keyed by dataset ID. Prefers the single
 // bulk call; if that endpoint is unavailable (some instances gate it) or omits
 // a dataset, falls back to the per-dataset permissions endpoint. Each value is
@@ -583,6 +617,14 @@ async function getDatasetPermissions(datasetIds) {
 		byDataset.set(String(dsId), (res && res.list) || []);
 	}
 	return byDataset;
+}
+
+// New owner's email address — used as the `recipients` query param on the
+// messages endpoint (see sendTransferEmail). Returns null if it can't be
+// resolved; the message is still routed by recipientsUserIds in that case.
+async function getUserEmail(userId) {
+	const res = await safe(`get user email ${userId}`, () => api.get(`/content/v3/users/${userId}`));
+	return (res && (res.emailAddress || res.email)) || null;
 }
 
 // New owner's group IDs (as strings) — one call, used to detect inherited
@@ -715,6 +757,51 @@ async function sanitizeLinks(links) {
 		valid.push(link);
 	}
 	return { valid, invalid };
+}
+
+// Email the new owner a summary of everything that was transferred to them.
+// Uses Domo's social messaging endpoint (mirrors domo-toolkit's messages
+// service): POST /social/v3/messages/domoWrapperNew:plainText/send with the
+// recipient routed both by email (query param) and user ID (body), so it lands
+// even if the email lookup fails. The HTML body is wrapped in the same
+// Helvetica flex-column styling the toolkit/Code Engine helpers use.
+async function sendTransferEmail({ toUserId, toUserName, fromUserName, transferredByType }) {
+	const types = Object.entries(transferredByType).filter(([, ids]) => ids && ids.length > 0);
+	if (types.length === 0) {
+		console.log('  Nothing was transferred — skipping email.');
+		return;
+	}
+
+	const total = types.reduce((sum, [, ids]) => sum + ids.length, 0);
+	const email = await getUserEmail(toUserId);
+
+	const fromClause = fromUserName ? ` previously owned by ${escapeHtml(fromUserName)}` : '';
+	let bodyHtml = `<h2 style="text-align: left;">Content transferred to you</h2>`;
+	bodyHtml += `<p style="text-align: left;">Hi ${escapeHtml(toUserName)},</p>`;
+	bodyHtml += `<p style="text-align: left;">You are now the owner of ${total} item(s)${fromClause}, broken down below.</p>`;
+	for (const [type, ids] of types) {
+		bodyHtml += `<h3 style="text-align: left;">${escapeHtml(type)} (${ids.length})</h3>`;
+		bodyHtml += `<ul style="text-align: left;">${ids.map((id) => `<li>${escapeHtml(id)}</li>`).join('')}</ul>`;
+	}
+
+	const payload = {
+		subject: 'Domo content transferred to you',
+		text: `<div style="display: flex; flex-direction: column; font-family: Helvetica; overflow-x: auto; flex-wrap: wrap; width: 100%; text-align: center;"><div style="display: flex; flex-direction: column; justify-content: center; width: 100%">${bodyHtml}</div></div>`,
+		recipientsUserIds: [parseInt(toUserId, 10)],
+		recipientsGroupIds: [],
+		dataFileAttachments: [],
+		populateReplyToHeaderWithRecipients: false
+	};
+
+	const url = `/social/v3/messages/domoWrapperNew:plainText/send?route=recipients&method=EMAIL&recipients=${encodeURIComponent(
+		email || ''
+	)}`;
+	// safe() logs and records any failure (into `failures`) and returns null, so
+	// only announce success when nothing was recorded for this send.
+	await safe('send transfer email', () => api.post(url, { parameters: payload }), { toUserId, recipientEmail: email });
+	if (!failures.some((f) => f.label === 'send transfer email')) {
+		console.log(`  → Emailed ${toUserName}${email ? ` (${email})` : ''} a summary of ${total} transferred item(s).`);
+	}
 }
 
 async function transferAccounts(fromUserId, toUserId, filteredIds, { dryRun }) {
