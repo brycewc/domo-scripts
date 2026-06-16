@@ -2,7 +2,7 @@ node_modules/
 .env
 .env.*
 !.env.example
-logs/
+logs
 id-mappings/
 .yarn/*
 !.yarn/patches
