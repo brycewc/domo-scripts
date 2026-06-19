@@ -26,6 +26,9 @@
  *   # Assign ownership for a CSV without specifying a previous owner
  *   node cli.js bulk-transfer-ownership --to-user 67890 --file datasets.csv --object-types "dataset" --keep-previous-owner
  *
+ *   # Route each row to a different new owner read from a CSV column
+ *   node cli.js bulk-transfer-ownership --from-user 12345 --file content.csv --type-column "Object Type ID" --to-user-column "New Owner ID"
+ *
  * When dataflows are transferred, the new owner is granted access to any input
  * dataset they can't already reach (directly or via a group). Control the grant
  * level with --input-access-level (default CAN_VIEW).
@@ -53,13 +56,18 @@ const HELP_TEXT = `Usage: node cli.js bulk-transfer-ownership [options]
 Transfer ownership of Domo content from one user to another.
 
 Required:
-  --to-user <id>       New owner's user ID (destination)
+  --to-user <id>       New owner's user ID (destination). Not required when
+                       --to-user-column is used (the new owner comes from the CSV).
   --from-user <id>     Current owner's user ID (source). Required unless using
                        --file together with --keep-previous-owner.
 
 Optional:
   --file <path>        CSV file with specific IDs to transfer (instead of discovering everything)
   --id-column <name>   CSV column with object IDs (default: "Object ID")
+  --to-user-column <name> CSV column holding the destination user ID per row. Only valid
+                       with --file. Rows are grouped by this value and each new owner is
+                       processed in turn, so different objects can go to different owners
+                       in one run. Overrides --to-user.
   --type-column <name> CSV column with object type per row — needed when the CSV mixes types
   --object-types <csv> Comma-separated list of types to include. Omit to transfer every type.
                        When --file is used without --type-column, this must be exactly one type
@@ -197,6 +205,7 @@ async function _main() {
 
 	const fromUserId = argv['from-user'];
 	const toUserId = argv['to-user'];
+	const toUserColumn = argv['to-user-column'];
 	const filePath = argv.file;
 	const typeColumn = argv['type-column'];
 	const idColumn = argv['id-column'] || 'Object ID';
@@ -209,7 +218,12 @@ async function _main() {
 		throw new Error(`Invalid --input-access-level. Must be one of: ${DATASET_ACCESS_LEVELS.join(', ')}`);
 	}
 
-	if (!toUserId) throw new Error('--to-user is required');
+	if (toUserColumn && !filePath) {
+		throw new Error('--to-user-column can only be used with --file');
+	}
+	if (!toUserId && !toUserColumn) {
+		throw new Error('--to-user is required (or use --to-user-column together with --file)');
+	}
 	if (!fromUserId) {
 		if (!filePath) {
 			throw new Error('--from-user is required when --file is not used');
@@ -220,7 +234,7 @@ async function _main() {
 					'this acknowledges that previous owners will not be removed for types that support multiple owners.'
 			);
 		}
-	} else if (String(fromUserId) === String(toUserId)) {
+	} else if (toUserId && String(fromUserId) === String(toUserId)) {
 		throw new Error('--from-user and --to-user must be different');
 	}
 
@@ -239,14 +253,22 @@ async function _main() {
 			});
 	}
 
-	// Build filtered-ID map from CSV when --file is provided.
-	let objectsByType = null;
+	// Build the work groups. Each group is one destination user plus the
+	// objectsByType map of what they should receive. Without --file there is a
+	// single group whose objectsByType is null (discover everything --from-user
+	// owns). With --file we read the CSV; with --to-user-column the rows are
+	// partitioned by destination user so different objects can go to different
+	// new owners in one run.
+	let groups;
 	if (filePath) {
 		const records = readCSV(filePath);
 		if (records.length === 0) throw new Error('CSV file has no rows');
 		const columns = Object.keys(records[0]);
 		if (!columns.includes(idColumn)) {
 			throw new Error(`ID column "${idColumn}" not found in CSV. Available: ${columns.join(', ')}`);
+		}
+		if (toUserColumn && !columns.includes(toUserColumn)) {
+			throw new Error(`To-user column "${toUserColumn}" not found in CSV. Available: ${columns.join(', ')}`);
 		}
 		if (!typeColumn) {
 			if (!requestedTypes || requestedTypes.length !== 1) {
@@ -256,7 +278,7 @@ async function _main() {
 			throw new Error(`Type column "${typeColumn}" not found in CSV. Available: ${columns.join(', ')}`);
 		}
 
-		objectsByType = {};
+		const byUser = new Map();
 		for (const row of records) {
 			const id = row[idColumn];
 			if (!id) continue;
@@ -271,28 +293,34 @@ async function _main() {
 			} else {
 				canon = requestedTypes[0];
 			}
+			const rowToUser = toUserColumn ? String(row[toUserColumn] || '').trim() : String(toUserId);
+			if (!rowToUser) {
+				console.warn(`  Skipping row with id=${id}: blank "${toUserColumn}" value.`);
+				continue;
+			}
+			if (!byUser.has(rowToUser)) byUser.set(rowToUser, {});
+			const objectsByType = byUser.get(rowToUser);
 			if (!objectsByType[canon]) objectsByType[canon] = [];
 			objectsByType[canon].push(id);
 		}
+		groups = [...byUser.entries()].map(([groupToUserId, objectsByType]) => ({ toUserId: groupToUserId, objectsByType }));
+		if (groups.length === 0) throw new Error('CSV produced no transferable rows.');
+	} else {
+		groups = [{ toUserId: String(toUserId), objectsByType: null }];
 	}
 
-	const [fromUserName, toUserName] = await Promise.all([
-		fromUserId ? getUserName(fromUserId) : Promise.resolve(null),
-		getUserName(toUserId)
-	]);
-
-	const typesToProcess = objectsByType ? Object.keys(objectsByType) : requestedTypes || ALL_TYPES;
+	const fromUserName = fromUserId ? await getUserName(fromUserId) : null;
 
 	const logger = createLogger('bulk-transfer-ownership', {
 		debugMode: false,
 		dryRun,
 		runMeta: {
 			fromUserId: fromUserId || null,
-			fromUserName: fromUserName,
-			toUserId: toUserId,
-			toUserName: toUserName,
-			mode: objectsByType ? 'file' : 'user',
+			fromUserName,
+			toUserId: toUserColumn ? `multiple (per "${toUserColumn}" column)` : toUserId,
+			mode: filePath ? 'file' : 'user',
 			file: filePath || null,
+			toUserColumn: toUserColumn || null,
 			keepPreviousOwner,
 			requestedTypes: requestedTypes || 'all'
 		}
@@ -301,126 +329,65 @@ async function _main() {
 	console.log('Bulk Transfer Ownership');
 	console.log('========================');
 	console.log(`From:      ${fromUserId ? `${fromUserName} (${fromUserId})` : '(none — assigning new owner)'}`);
-	console.log(`To:        ${toUserName} (${toUserId})`);
-	console.log(`Mode:      ${objectsByType ? `file (${filePath})` : 'user discovery'}`);
-	console.log(`Types:     ${typesToProcess.join(', ')}`);
+	if (toUserColumn) {
+		console.log(`To:        per CSV column "${toUserColumn}" (${groups.length} destination user(s))`);
+	} else {
+		console.log(`To:        ${toUserId}`);
+	}
+	console.log(`Mode:      ${filePath ? `file (${filePath})` : 'user discovery'}`);
 	if (keepPreviousOwner) console.log('Keep previous owner: previous owner will NOT be removed for multi-owner types.');
-	if (sendEmailFlag) console.log('Send email: the new owner will be emailed a summary of transferred assets.');
+	if (sendEmailFlag) console.log('Send email: each new owner will be emailed a summary of transferred assets.');
 	if (dryRun) console.log('DRY RUN — no write calls will be made.');
 
-	const ctx = { fromUserId, toUserId, fromUserName, toUserName, dryRun, keepPreviousOwner, inputAccessLevel };
 	const summary = { totals: {}, skipped: [], errors: failures };
-	// type → transferred IDs, accumulated for the optional --send-email summary.
-	const transferredByType = {};
+	const toUserNameCache = {};
 
-	for (const type of typesToProcess) {
-		const filtered = objectsByType ? objectsByType[type] || [] : [];
-
-		if (objectsByType && filtered.length === 0) continue;
-		if (objectsByType && DISCOVERY_ONLY_TYPES.has(type)) {
-			console.log(`\n=== ${type} ===`);
-			console.warn(
-				`  Type "${type}" only supports discovery from --from-user; skipping ${filtered.length} filtered ID(s).`
-			);
-			summary.skipped.push({ type, ids: filtered, reason: 'discovery-only' });
+	for (const group of groups) {
+		const groupToUserId = group.toUserId;
+		if (fromUserId && String(fromUserId) === String(groupToUserId)) {
+			console.warn(`\nSkipping destination user ${groupToUserId}: same as --from-user.`);
 			continue;
 		}
-
-		if (COALESCED_TYPES.has(type)) continue; // handled below
-
-		try {
-			const res = await runType(type, filtered, ctx);
-			const transferred = (res && res.transferred) || [];
-			summary.totals[type] = transferred.length;
-			if (transferred.length) transferredByType[type] = transferred;
-			const typeErrors = failures.filter((f) => f.type === type);
-			logger.addResult({ type, transferred, errors: typeErrors, details: res });
-			if (typeErrors.length) console.log(`  ⚠ ${typeErrors.length} error(s) logged — see run log`);
-			console.log(`  → ${transferred.length} transferred`);
-		} catch (err) {
-			console.error(`  ✗ ${type} failed: ${err.message}`);
-			summary.totals[type] = 0;
-			logger.addResult({ type, error: err.message, errors: failures.filter((f) => f.type === type) });
+		if (!(groupToUserId in toUserNameCache)) {
+			toUserNameCache[groupToUserId] = await getUserName(groupToUserId);
 		}
-	}
+		const groupToUserName = toUserNameCache[groupToUserId];
 
-	// Beast modes + variables share transferFunctions — call it once.
-	const beastSelected = typesToProcess.includes('beast-mode');
-	const varSelected = typesToProcess.includes('variable');
-	if (beastSelected || varSelected) {
-		console.log(`\n=== beast-mode / variable ===`);
-		activeType = 'beast-mode/variable';
-		const combinedIds = [
-			...((objectsByType && objectsByType['beast-mode']) || []),
-			...((objectsByType && objectsByType['variable']) || [])
-		];
-		try {
-			const res = await transferFunctions(fromUserId, toUserId, combinedIds, ctx);
-			const coalescedErrors = failures.filter((f) => f.type === 'beast-mode/variable');
-			if (beastSelected) {
-				summary.totals['beast-mode'] = (res.beastModes || []).length;
-				if ((res.beastModes || []).length) transferredByType['beast-mode'] = res.beastModes;
-				logger.addResult({
-					type: 'beast-mode',
-					transferred: res.beastModes,
-					errors: coalescedErrors,
-					details: { deleted: res.deletedBeastModes }
+		if (groups.length > 1) {
+			console.log(`\n##### Transferring to ${groupToUserName} (${groupToUserId}) #####`);
+		}
+
+		const ctx = {
+			fromUserId,
+			toUserId: groupToUserId,
+			fromUserName,
+			toUserName: groupToUserName,
+			dryRun,
+			keepPreviousOwner,
+			inputAccessLevel
+		};
+
+		const transferredByType = await transferForUser({
+			ctx,
+			objectsByType: group.objectsByType,
+			requestedTypes,
+			logger,
+			summary
+		});
+
+		if (sendEmailFlag) {
+			console.log('\n=== email ===');
+			activeType = 'email';
+			if (dryRun) {
+				console.log('  Dry run — skipping email to the new owner.');
+			} else {
+				await sendTransferEmail({
+					toUserId: groupToUserId,
+					toUserName: groupToUserName,
+					fromUserName,
+					transferredByType
 				});
-				console.log(`  → ${(res.beastModes || []).length} beast modes transferred`);
 			}
-			if (varSelected) {
-				summary.totals['variable'] = (res.variables || []).length;
-				if ((res.variables || []).length) transferredByType['variable'] = res.variables;
-				logger.addResult({
-					type: 'variable',
-					transferred: res.variables,
-					errors: coalescedErrors,
-					details: { deleted: res.deletedVariables }
-				});
-				console.log(`  → ${(res.variables || []).length} variables transferred`);
-			}
-			if (coalescedErrors.length) console.log(`  ⚠ ${coalescedErrors.length} error(s) logged — see run log`);
-		} catch (err) {
-			console.error(`  ✗ beast-mode/variable failed: ${err.message}`);
-		}
-	}
-
-	// Projects + project-tasks share a single API flow; handle them together.
-	const projectsSelected = typesToProcess.includes('project');
-	const taskSelected = typesToProcess.includes('project-task');
-	if (projectsSelected || taskSelected) {
-		console.log(`\n=== project / project-task ===`);
-		activeType = 'project/project-task';
-		const projectIds = (objectsByType && objectsByType['project']) || [];
-		const taskIds = (objectsByType && objectsByType['project-task']) || [];
-		try {
-			const res = await transferProjectsAndTasks(fromUserId, toUserId, projectIds, taskIds, ctx);
-			const coalescedErrors = failures.filter((f) => f.type === 'project/project-task');
-			if (projectsSelected) {
-				summary.totals['project'] = (res.projects || []).length;
-				if ((res.projects || []).length) transferredByType['project'] = res.projects;
-				logger.addResult({ type: 'project', transferred: res.projects, errors: coalescedErrors, details: res });
-				console.log(`  → ${(res.projects || []).length} projects transferred`);
-			}
-			if (taskSelected) {
-				summary.totals['project-task'] = (res.tasks || []).length;
-				if ((res.tasks || []).length) transferredByType['project-task'] = res.tasks;
-				logger.addResult({ type: 'project-task', transferred: res.tasks, errors: coalescedErrors, details: res });
-				console.log(`  → ${(res.tasks || []).length} tasks transferred`);
-			}
-			if (coalescedErrors.length) console.log(`  ⚠ ${coalescedErrors.length} error(s) logged — see run log`);
-		} catch (err) {
-			console.error(`  ✗ projects/tasks failed: ${err.message}`);
-		}
-	}
-
-	if (sendEmailFlag) {
-		console.log('\n=== email ===');
-		activeType = 'email';
-		if (dryRun) {
-			console.log('  Dry run — skipping email to the new owner.');
-		} else {
-			await sendTransferEmail({ toUserId, toUserName, fromUserName, transferredByType });
 		}
 	}
 
@@ -1559,6 +1526,131 @@ async function transferFilesets(fromUserId, toUserId, filteredIds, { dryRun }) {
 		);
 	}
 	return { transferred: ids };
+}
+
+// Run the full per-type transfer for a single destination user. Called once per
+// group of work — when --to-user-column partitions a CSV across several new
+// owners, this runs once per owner. Per-type counts accumulate into the shared
+// `summary`; returns the type → transferred-IDs map for the optional email.
+// Per-type errors are sliced out of the global `failures` array by position
+// (not filtered by type) so a type processed for multiple owners attributes
+// only that owner's failures to that owner's log entry.
+async function transferForUser({ ctx, objectsByType, requestedTypes, logger, summary }) {
+	const { fromUserId, toUserId } = ctx;
+	const typesToProcess = objectsByType ? Object.keys(objectsByType) : requestedTypes || ALL_TYPES;
+	const transferredByType = {};
+
+	const addTotal = (type, n) => {
+		summary.totals[type] = (summary.totals[type] || 0) + n;
+	};
+
+	for (const type of typesToProcess) {
+		const filtered = objectsByType ? objectsByType[type] || [] : [];
+
+		if (objectsByType && filtered.length === 0) continue;
+		if (objectsByType && DISCOVERY_ONLY_TYPES.has(type)) {
+			console.log(`\n=== ${type} ===`);
+			console.warn(
+				`  Type "${type}" only supports discovery from --from-user; skipping ${filtered.length} filtered ID(s).`
+			);
+			summary.skipped.push({ type, ids: filtered, reason: 'discovery-only' });
+			continue;
+		}
+
+		if (COALESCED_TYPES.has(type)) continue; // handled below
+
+		const errStart = failures.length;
+		try {
+			const res = await runType(type, filtered, ctx);
+			const transferred = (res && res.transferred) || [];
+			addTotal(type, transferred.length);
+			if (transferred.length) transferredByType[type] = transferred;
+			const typeErrors = failures.slice(errStart);
+			logger.addResult({ type, toUserId, transferred, errors: typeErrors, details: res });
+			if (typeErrors.length) console.log(`  ⚠ ${typeErrors.length} error(s) logged — see run log`);
+			console.log(`  → ${transferred.length} transferred`);
+		} catch (err) {
+			console.error(`  ✗ ${type} failed: ${err.message}`);
+			addTotal(type, 0);
+			logger.addResult({ type, toUserId, error: err.message, errors: failures.slice(errStart) });
+		}
+	}
+
+	// Beast modes + variables share transferFunctions — call it once.
+	const beastSelected = typesToProcess.includes('beast-mode');
+	const varSelected = typesToProcess.includes('variable');
+	if (beastSelected || varSelected) {
+		console.log(`\n=== beast-mode / variable ===`);
+		activeType = 'beast-mode/variable';
+		const errStart = failures.length;
+		const combinedIds = [
+			...((objectsByType && objectsByType['beast-mode']) || []),
+			...((objectsByType && objectsByType['variable']) || [])
+		];
+		try {
+			const res = await transferFunctions(fromUserId, toUserId, combinedIds, ctx);
+			const coalescedErrors = failures.slice(errStart);
+			if (beastSelected) {
+				addTotal('beast-mode', (res.beastModes || []).length);
+				if ((res.beastModes || []).length) transferredByType['beast-mode'] = res.beastModes;
+				logger.addResult({
+					type: 'beast-mode',
+					toUserId,
+					transferred: res.beastModes,
+					errors: coalescedErrors,
+					details: { deleted: res.deletedBeastModes }
+				});
+				console.log(`  → ${(res.beastModes || []).length} beast modes transferred`);
+			}
+			if (varSelected) {
+				addTotal('variable', (res.variables || []).length);
+				if ((res.variables || []).length) transferredByType['variable'] = res.variables;
+				logger.addResult({
+					type: 'variable',
+					toUserId,
+					transferred: res.variables,
+					errors: coalescedErrors,
+					details: { deleted: res.deletedVariables }
+				});
+				console.log(`  → ${(res.variables || []).length} variables transferred`);
+			}
+			if (coalescedErrors.length) console.log(`  ⚠ ${coalescedErrors.length} error(s) logged — see run log`);
+		} catch (err) {
+			console.error(`  ✗ beast-mode/variable failed: ${err.message}`);
+		}
+	}
+
+	// Projects + project-tasks share a single API flow; handle them together.
+	const projectsSelected = typesToProcess.includes('project');
+	const taskSelected = typesToProcess.includes('project-task');
+	if (projectsSelected || taskSelected) {
+		console.log(`\n=== project / project-task ===`);
+		activeType = 'project/project-task';
+		const errStart = failures.length;
+		const projectIds = (objectsByType && objectsByType['project']) || [];
+		const taskIds = (objectsByType && objectsByType['project-task']) || [];
+		try {
+			const res = await transferProjectsAndTasks(fromUserId, toUserId, projectIds, taskIds, ctx);
+			const coalescedErrors = failures.slice(errStart);
+			if (projectsSelected) {
+				addTotal('project', (res.projects || []).length);
+				if ((res.projects || []).length) transferredByType['project'] = res.projects;
+				logger.addResult({ type: 'project', toUserId, transferred: res.projects, errors: coalescedErrors, details: res });
+				console.log(`  → ${(res.projects || []).length} projects transferred`);
+			}
+			if (taskSelected) {
+				addTotal('project-task', (res.tasks || []).length);
+				if ((res.tasks || []).length) transferredByType['project-task'] = res.tasks;
+				logger.addResult({ type: 'project-task', toUserId, transferred: res.tasks, errors: coalescedErrors, details: res });
+				console.log(`  → ${(res.tasks || []).length} tasks transferred`);
+			}
+			if (coalescedErrors.length) console.log(`  ⚠ ${coalescedErrors.length} error(s) logged — see run log`);
+		} catch (err) {
+			console.error(`  ✗ projects/tasks failed: ${err.message}`);
+		}
+	}
+
+	return transferredByType;
 }
 
 async function transferFunctions(fromUserId, toUserId, filteredIds, { dryRun }) {
