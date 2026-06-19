@@ -6,28 +6,37 @@
  *   2) From file  — read specific object IDs (optionally mixed types) from a CSV
  *
  * --from-user may be omitted when --file is used together with
- * --keep-previous-owner. In that mode, the listed IDs are assigned to --to-user
- * without removing any existing owner — useful when the objects in the CSV
+ * --keep-previous-owner. In that mode, the listed IDs are assigned to the new
+ * owner without removing any existing owner — useful when the objects in the CSV
  * have no owner currently assigned.
  *
  * Usage:
  *   # Transfer every type the user owns
- *   node cli.js bulk-transfer-ownership --from-user 12345 --to-user 67890
+ *   node cli.js bulk-transfer-ownership --from-user 12345 --to-owner 67890
  *
  *   # Transfer only specific types owned by the user
- *   node cli.js bulk-transfer-ownership --from-user 12345 --to-user 67890 --object-types "dataset,dataflow,card"
+ *   node cli.js bulk-transfer-ownership --from-user 12345 --to-owner 67890 --object-types "dataset,dataflow,card"
  *
  *   # Transfer a CSV of mixed content — CSV has a type column
- *   node cli.js bulk-transfer-ownership --from-user 12345 --to-user 67890 --file content.csv --type-column "Object Type ID"
+ *   node cli.js bulk-transfer-ownership --from-user 12345 --to-owner 67890 --file content.csv --type-column "Object Type ID"
  *
  *   # Transfer a CSV that is all one type — no type column needed
- *   node cli.js bulk-transfer-ownership --from-user 12345 --to-user 67890 --file datasets.csv --object-types "dataset"
+ *   node cli.js bulk-transfer-ownership --from-user 12345 --to-owner 67890 --file datasets.csv --object-types "dataset"
  *
  *   # Assign ownership for a CSV without specifying a previous owner
- *   node cli.js bulk-transfer-ownership --to-user 67890 --file datasets.csv --object-types "dataset" --keep-previous-owner
+ *   node cli.js bulk-transfer-ownership --to-owner 67890 --file datasets.csv --object-types "dataset" --keep-previous-owner
  *
  *   # Route each row to a different new owner read from a CSV column
- *   node cli.js bulk-transfer-ownership --from-user 12345 --file content.csv --type-column "Object Type ID" --to-user-column "New Owner ID"
+ *   node cli.js bulk-transfer-ownership --from-user 12345 --file content.csv --type-column "Object Type ID" --to-owner-column "New Owner ID"
+ *
+ *   # Transfer everything the user owns to a GROUP (user-only types are skipped + logged)
+ *   node cli.js bulk-transfer-ownership --from-user 12345 --to-owner 67890 --to-owner-type group
+ *
+ *   # Route each row to a user OR group: one column holds the owner ID, another the kind
+ *   node cli.js bulk-transfer-ownership --from-user 12345 --file content.csv --type-column "Object Type ID" --to-owner-column "New Owner ID" --to-owner-type-column "New Owner Type"
+ *
+ * Group ownership is only supported for: card, page, app-studio, worksheet, dataset,
+ * workspace. For any other type, a GROUP destination is skipped and logged.
  *
  * When dataflows are transferred, the new owner is granted access to any input
  * dataset they can't already reach (directly or via a group). Control the grant
@@ -53,21 +62,25 @@ const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage: node cli.js bulk-transfer-ownership [options]
 
-Transfer ownership of Domo content from one user to another.
+Transfer ownership of Domo content from one user to a new user or group.
 
-Required:
-  --to-user <id>       New owner's user ID (destination). Not required when
-                       --to-user-column is used (the new owner comes from the CSV).
+Required (one destination):
+  --to-owner <id>      New owner's ID, of the kind given by --to-owner-type.
   --from-user <id>     Current owner's user ID (source). Required unless using
                        --file together with --keep-previous-owner.
+  (--to-owner is not required when --to-owner-column supplies the destination per row.)
 
 Optional:
+  --to-owner-type <kind>  USER or GROUP (case-insensitive). Applies to --to-owner and
+                       to every row when --to-owner-type-column is not given. Default: USER.
   --file <path>        CSV file with specific IDs to transfer (instead of discovering everything)
   --id-column <name>   CSV column with object IDs (default: "Object ID")
-  --to-user-column <name> CSV column holding the destination user ID per row. Only valid
-                       with --file. Rows are grouped by this value and each new owner is
-                       processed in turn, so different objects can go to different owners
-                       in one run. Overrides --to-user.
+  --to-owner-column <name> CSV column holding the destination owner ID per row. Only valid
+                       with --file. Rows are grouped by owner (type + id) and each new owner
+                       is processed in turn, so different objects can go to different owners
+                       in one run.
+  --to-owner-type-column <name> CSV column holding USER/GROUP per row (case-insensitive).
+                       Only valid with --file. When omitted, --to-owner-type applies to all rows.
   --type-column <name> CSV column with object type per row — needed when the CSV mixes types
   --object-types <csv> Comma-separated list of types to include. Omit to transfer every type.
                        When --file is used without --type-column, this must be exactly one type
@@ -94,6 +107,9 @@ Object types (case-insensitive, hyphens or underscores both accepted):
   worksheet, workspace
 
 Notes:
+  - GROUP ownership is only supported by these types: card, page, app-studio, worksheet,
+    dataset, workspace. When a destination is a GROUP, every other type is skipped and
+    recorded in the run log (best-effort).
   - When a dataflow is transferred, the new owner is checked for access to each of the
     dataflow's input datasets (direct USER grant or inherited via group membership). Any
     input they can't reach is shared with them directly (see --input-access-level).
@@ -188,6 +204,12 @@ const HANDLERS = {
 // Types handled outside the per-type loop because they share an underlying API.
 const COALESCED_TYPES = new Set(['beast-mode', 'variable', 'project', 'project-task']);
 
+// Types whose reassignment endpoints accept a GROUP owner (their payloads take a
+// { type, id } owner). Every other type is user-only; a GROUP destination for
+// those is skipped and logged (see transferForUser). Keep this conservative —
+// adding a type here means its handler passes ctx.toOwnerType into the API call.
+const GROUP_CAPABLE_TYPES = new Set(['app-studio', 'card', 'dataset', 'page', 'worksheet', 'workspace']);
+
 // Errors swallowed by safe() are collected here so they make it into the run
 // log instead of only being printed to the console. activeType tags each
 // failure with the type being processed when it occurred.
@@ -204,8 +226,6 @@ async function _main() {
 	showHelp(argv, HELP_TEXT);
 
 	const fromUserId = argv['from-user'];
-	const toUserId = argv['to-user'];
-	const toUserColumn = argv['to-user-column'];
 	const filePath = argv.file;
 	const typeColumn = argv['type-column'];
 	const idColumn = argv['id-column'] || 'Object ID';
@@ -214,15 +234,30 @@ async function _main() {
 	const keepPreviousOwner = Boolean(argv['keep-previous-owner']);
 	const inputAccessLevel = String(argv['input-access-level'] || 'CAN_VIEW').toUpperCase();
 
+	// Destination owner. The owner ID comes from --to-owner (single) or the
+	// --to-owner-column CSV column; the owner type from --to-owner-type (applied to
+	// every row) or the per-row --to-owner-type-column. Type tokens are parsed
+	// case-insensitively (user/group) and default to USER.
+	const singleOwnerId = argv['to-owner'];
+	const ownerColumn = argv['to-owner-column'] || null;
+	const toOwnerTypeColumn = argv['to-owner-type-column'];
+
 	if (!DATASET_ACCESS_LEVELS.includes(inputAccessLevel)) {
 		throw new Error(`Invalid --input-access-level. Must be one of: ${DATASET_ACCESS_LEVELS.join(', ')}`);
 	}
 
-	if (toUserColumn && !filePath) {
-		throw new Error('--to-user-column can only be used with --file');
+	// Owner type applied to the single destination, and to every row when
+	// --to-owner-type-column is not supplied. Defaults to USER.
+	const runOwnerType = normalizeOwnerType(argv['to-owner-type'], 'USER');
+	if (!runOwnerType) {
+		throw new Error(`Invalid --to-owner-type "${argv['to-owner-type']}". Must be USER or GROUP.`);
 	}
-	if (!toUserId && !toUserColumn) {
-		throw new Error('--to-user is required (or use --to-user-column together with --file)');
+
+	if ((ownerColumn || toOwnerTypeColumn) && !filePath) {
+		throw new Error('--to-owner-column / --to-owner-type-column can only be used with --file');
+	}
+	if (!ownerColumn && singleOwnerId == null) {
+		throw new Error('A destination is required: --to-owner, or --to-owner-column together with --file.');
 	}
 	if (!fromUserId) {
 		if (!filePath) {
@@ -234,8 +269,8 @@ async function _main() {
 					'this acknowledges that previous owners will not be removed for types that support multiple owners.'
 			);
 		}
-	} else if (toUserId && String(fromUserId) === String(toUserId)) {
-		throw new Error('--from-user and --to-user must be different');
+	} else if (!ownerColumn && singleOwnerId != null && runOwnerType === 'USER' && String(fromUserId) === String(singleOwnerId)) {
+		throw new Error('--from-user and the destination user must be different');
 	}
 
 	let requestedTypes = null;
@@ -253,12 +288,11 @@ async function _main() {
 			});
 	}
 
-	// Build the work groups. Each group is one destination user plus the
-	// objectsByType map of what they should receive. Without --file there is a
+	// Build the work groups. Each group is one destination owner (id + type) plus
+	// the objectsByType map of what they should receive. Without --file there is a
 	// single group whose objectsByType is null (discover everything --from-user
-	// owns). With --file we read the CSV; with --to-user-column the rows are
-	// partitioned by destination user so different objects can go to different
-	// new owners in one run.
+	// owns). With --file we read the CSV and partition rows by (ownerType, ownerId)
+	// so objects can go to different new owners — users or groups — in one run.
 	let groups;
 	if (filePath) {
 		const records = readCSV(filePath);
@@ -267,8 +301,11 @@ async function _main() {
 		if (!columns.includes(idColumn)) {
 			throw new Error(`ID column "${idColumn}" not found in CSV. Available: ${columns.join(', ')}`);
 		}
-		if (toUserColumn && !columns.includes(toUserColumn)) {
-			throw new Error(`To-user column "${toUserColumn}" not found in CSV. Available: ${columns.join(', ')}`);
+		if (ownerColumn && !columns.includes(ownerColumn)) {
+			throw new Error(`Owner column "${ownerColumn}" not found in CSV. Available: ${columns.join(', ')}`);
+		}
+		if (toOwnerTypeColumn && !columns.includes(toOwnerTypeColumn)) {
+			throw new Error(`Owner-type column "${toOwnerTypeColumn}" not found in CSV. Available: ${columns.join(', ')}`);
 		}
 		if (!typeColumn) {
 			if (!requestedTypes || requestedTypes.length !== 1) {
@@ -278,7 +315,7 @@ async function _main() {
 			throw new Error(`Type column "${typeColumn}" not found in CSV. Available: ${columns.join(', ')}`);
 		}
 
-		const byUser = new Map();
+		const byOwner = new Map();
 		for (const row of records) {
 			const id = row[idColumn];
 			if (!id) continue;
@@ -293,34 +330,51 @@ async function _main() {
 			} else {
 				canon = requestedTypes[0];
 			}
-			const rowToUser = toUserColumn ? String(row[toUserColumn] || '').trim() : String(toUserId);
-			if (!rowToUser) {
-				console.warn(`  Skipping row with id=${id}: blank "${toUserColumn}" value.`);
+			const rowOwnerId = ownerColumn ? String(row[ownerColumn] || '').trim() : String(singleOwnerId);
+			if (!rowOwnerId) {
+				console.warn(`  Skipping row with id=${id}: blank "${ownerColumn}" value.`);
 				continue;
 			}
-			if (!byUser.has(rowToUser)) byUser.set(rowToUser, {});
-			const objectsByType = byUser.get(rowToUser);
+			let rowOwnerType;
+			if (toOwnerTypeColumn) {
+				rowOwnerType = normalizeOwnerType(row[toOwnerTypeColumn]);
+				if (!rowOwnerType) {
+					console.warn(
+						`  Skipping row with id=${id}: invalid "${toOwnerTypeColumn}" value "${row[toOwnerTypeColumn]}" (expected USER or GROUP).`
+					);
+					continue;
+				}
+			} else {
+				rowOwnerType = runOwnerType;
+			}
+			const key = `${rowOwnerType}:${rowOwnerId}`;
+			if (!byOwner.has(key)) byOwner.set(key, { toUserId: rowOwnerId, toOwnerType: rowOwnerType, objectsByType: {} });
+			const { objectsByType } = byOwner.get(key);
 			if (!objectsByType[canon]) objectsByType[canon] = [];
 			objectsByType[canon].push(id);
 		}
-		groups = [...byUser.entries()].map(([groupToUserId, objectsByType]) => ({ toUserId: groupToUserId, objectsByType }));
+		groups = [...byOwner.values()];
 		if (groups.length === 0) throw new Error('CSV produced no transferable rows.');
 	} else {
-		groups = [{ toUserId: String(toUserId), objectsByType: null }];
+		groups = [{ toUserId: String(singleOwnerId), toOwnerType: runOwnerType, objectsByType: null }];
 	}
 
 	const fromUserName = fromUserId ? await getUserName(fromUserId) : null;
 
+	// The destination owner varies per row when either a column names the owner ID
+	// or a column names the owner type.
+	const perRowOwner = Boolean(ownerColumn) || Boolean(toOwnerTypeColumn);
 	const logger = createLogger('bulk-transfer-ownership', {
 		debugMode: false,
 		dryRun,
 		runMeta: {
 			fromUserId: fromUserId || null,
 			fromUserName,
-			toUserId: toUserColumn ? `multiple (per "${toUserColumn}" column)` : toUserId,
+			toOwner: perRowOwner ? `multiple (per CSV${ownerColumn ? ` "${ownerColumn}"` : ''})` : `${runOwnerType} ${singleOwnerId}`,
 			mode: filePath ? 'file' : 'user',
 			file: filePath || null,
-			toUserColumn: toUserColumn || null,
+			ownerColumn: ownerColumn || null,
+			ownerTypeColumn: toOwnerTypeColumn || null,
 			keepPreviousOwner,
 			requestedTypes: requestedTypes || 'all'
 		}
@@ -329,10 +383,10 @@ async function _main() {
 	console.log('Bulk Transfer Ownership');
 	console.log('========================');
 	console.log(`From:      ${fromUserId ? `${fromUserName} (${fromUserId})` : '(none — assigning new owner)'}`);
-	if (toUserColumn) {
-		console.log(`To:        per CSV column "${toUserColumn}" (${groups.length} destination user(s))`);
+	if (perRowOwner) {
+		console.log(`To:        per CSV (${groups.length} destination owner(s))`);
 	} else {
-		console.log(`To:        ${toUserId}`);
+		console.log(`To:        ${runOwnerType} ${singleOwnerId}`);
 	}
 	console.log(`Mode:      ${filePath ? `file (${filePath})` : 'user discovery'}`);
 	if (keepPreviousOwner) console.log('Keep previous owner: previous owner will NOT be removed for multi-owner types.');
@@ -340,28 +394,31 @@ async function _main() {
 	if (dryRun) console.log('DRY RUN — no write calls will be made.');
 
 	const summary = { totals: {}, skipped: [], errors: failures };
-	const toUserNameCache = {};
+	const ownerNameCache = {};
 
 	for (const group of groups) {
-		const groupToUserId = group.toUserId;
-		if (fromUserId && String(fromUserId) === String(groupToUserId)) {
-			console.warn(`\nSkipping destination user ${groupToUserId}: same as --from-user.`);
+		const groupOwnerId = group.toUserId;
+		const groupOwnerType = group.toOwnerType;
+		if (fromUserId && groupOwnerType === 'USER' && String(fromUserId) === String(groupOwnerId)) {
+			console.warn(`\nSkipping destination user ${groupOwnerId}: same as --from-user.`);
 			continue;
 		}
-		if (!(groupToUserId in toUserNameCache)) {
-			toUserNameCache[groupToUserId] = await getUserName(groupToUserId);
+		const cacheKey = `${groupOwnerType}:${groupOwnerId}`;
+		if (!(cacheKey in ownerNameCache)) {
+			ownerNameCache[cacheKey] = await getOwnerName(groupOwnerId, groupOwnerType);
 		}
-		const groupToUserName = toUserNameCache[groupToUserId];
+		const groupOwnerName = ownerNameCache[cacheKey];
 
 		if (groups.length > 1) {
-			console.log(`\n##### Transferring to ${groupToUserName} (${groupToUserId}) #####`);
+			console.log(`\n##### Transferring to ${groupOwnerType} ${groupOwnerName} (${groupOwnerId}) #####`);
 		}
 
 		const ctx = {
 			fromUserId,
-			toUserId: groupToUserId,
+			toUserId: groupOwnerId,
+			toOwnerType: groupOwnerType,
 			fromUserName,
-			toUserName: groupToUserName,
+			toUserName: groupOwnerName,
 			dryRun,
 			keepPreviousOwner,
 			inputAccessLevel
@@ -382,8 +439,9 @@ async function _main() {
 				console.log('  Dry run — skipping email to the new owner.');
 			} else {
 				await sendTransferEmail({
-					toUserId: groupToUserId,
-					toUserName: groupToUserName,
+					toUserId: groupOwnerId,
+					toOwnerType: groupOwnerType,
+					toUserName: groupOwnerName,
 					fromUserName,
 					transferredByType
 				});
@@ -586,6 +644,16 @@ async function getDatasetPermissions(datasetIds) {
 	return byDataset;
 }
 
+async function getGroupName(groupId) {
+	const res = await safe(`get group ${groupId}`, () => api.get(`/content/v2/groups/${groupId}`));
+	return (res && res.name) || `Group ${groupId}`;
+}
+
+// Display name for a destination owner of either kind.
+async function getOwnerName(id, type) {
+	return type === 'GROUP' ? getGroupName(id) : getUserName(id);
+}
+
 // New owner's email address — used as the `recipients` query param on the
 // messages endpoint (see sendTransferEmail). Returns null if it can't be
 // resolved; the message is still routed by recipientsUserIds in that case.
@@ -633,6 +701,17 @@ async function listPublications(fromUserId) {
 		}
 	}
 	return owned;
+}
+
+// Map a free-form owner-type token (user/group, any case) to USER/GROUP. Returns
+// `fallback` when the token is blank/absent, or null when it's present but not a
+// recognized type (so callers can reject it).
+function normalizeOwnerType(raw, fallback = null) {
+	if (raw == null || String(raw).trim() === '') return fallback;
+	const key = String(raw).trim().toLowerCase();
+	if (key === 'user') return 'USER';
+	if (key === 'group') return 'GROUP';
+	return null;
 }
 
 function normalizeType(raw) {
@@ -768,15 +847,18 @@ async function sanitizeLinks(links) {
 // recipient routed both by email (query param) and user ID (body), so it lands
 // even if the email lookup fails. The HTML body is wrapped in the same
 // Helvetica flex-column styling the toolkit/Code Engine helpers use.
-async function sendTransferEmail({ toUserId, toUserName, fromUserName, transferredByType }) {
+async function sendTransferEmail({ toUserId, toOwnerType, toUserName, fromUserName, transferredByType }) {
 	const types = Object.entries(transferredByType).filter(([, ids]) => ids && ids.length > 0);
 	if (types.length === 0) {
 		console.log('  Nothing was transferred — skipping email.');
 		return;
 	}
 
+	const isGroup = toOwnerType === 'GROUP';
 	const total = types.reduce((sum, [, ids]) => sum + ids.length, 0);
-	const email = await getUserEmail(toUserId);
+	// Groups have no single email address; route them by recipientsGroupIds and
+	// let Domo fan the message out to the group's members.
+	const email = isGroup ? null : await getUserEmail(toUserId);
 
 	const fromClause = fromUserName ? ` previously owned by ${escapeHtml(fromUserName)}` : '';
 	let bodyHtml = `<h2 style="text-align: left;">Content transferred to you</h2>`;
@@ -790,8 +872,8 @@ async function sendTransferEmail({ toUserId, toUserName, fromUserName, transferr
 	const payload = {
 		subject: 'Domo content transferred to you',
 		text: `<div style="display: flex; flex-direction: column; font-family: Helvetica; overflow-x: auto; flex-wrap: wrap; width: 100%; text-align: center;"><div style="display: flex; flex-direction: column; justify-content: center; width: 100%">${bodyHtml}</div></div>`,
-		recipientsUserIds: [parseInt(toUserId, 10)],
-		recipientsGroupIds: [],
+		recipientsUserIds: isGroup ? [] : [parseInt(toUserId, 10)],
+		recipientsGroupIds: isGroup ? [parseInt(toUserId, 10)] : [],
 		dataFileAttachments: [],
 		populateReplyToHeaderWithRecipients: false
 	};
@@ -805,6 +887,14 @@ async function sendTransferEmail({ toUserId, toUserName, fromUserName, transferr
 	if (!failures.some((f) => f.label === 'send transfer email')) {
 		console.log(`  → Emailed ${toUserName}${email ? ` (${email})` : ''} a summary of ${total} transferred item(s).`);
 	}
+}
+
+// Record + announce that a user-only type can't accept the current GROUP
+// destination. `ids` is the filtered list for the type ([] in discover-all mode).
+function skipGroupOwner(type, ids, summary) {
+	console.log(`\n=== ${type} ===`);
+	console.warn(`  Type "${type}" does not support group ownership; skipping${ids.length ? ` ${ids.length}` : ''} item(s).`);
+	summary.skipped.push({ type, ids, reason: 'group-owner-unsupported' });
 }
 
 async function transferAccounts(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -1199,7 +1289,7 @@ async function transferApprovalTemplates(fromUserId, toUserId, filteredIds, { dr
 	return { transferred: templateIds };
 }
 
-async function transferAppStudioApps(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner }) {
+async function transferAppStudioApps(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner, toOwnerType }) {
 	let ids = filteredIds.map(String);
 	if (ids.length === 0) {
 		const limit = 30;
@@ -1232,7 +1322,7 @@ async function transferAppStudioApps(fromUserId, toUserId, filteredIds, { dryRun
 			api.put('/content/v1/dataapps/bulk/owners', {
 				note: '',
 				entityIds,
-				owners: [{ type: 'USER', id: parseInt(toUserId, 10) }],
+				owners: [{ type: toOwnerType, id: parseInt(toUserId, 10) }],
 				sendEmail: false
 			}),
 		removeOldOwner:
@@ -1247,7 +1337,7 @@ async function transferAppStudioApps(fromUserId, toUserId, filteredIds, { dryRun
 	return { transferred };
 }
 
-async function transferCards(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner }) {
+async function transferCards(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner, toOwnerType }) {
 	let ids = filteredIds;
 	if (ids.length === 0) {
 		const count = 50;
@@ -1281,12 +1371,12 @@ async function transferCards(fromUserId, toUserId, filteredIds, { dryRun, keepPr
 	if (dryRun) return { transferred: ids };
 
 	// POST /content/v1/cards/owners/{action} — action is "add" or "remove";
-	// same body shape for both. Cards support multiple owners, so adding the new
-	// owner only makes them a co-owner; the old owner is removed separately below.
-	const updateOwners = (action, cardIds, ownerId) =>
+	// same body shape for both. The new owner may be a USER or GROUP; the previous
+	// owner being removed is always the --from-user (a USER).
+	const updateOwners = (action, cardIds, ownerId, ownerType) =>
 		api.post(`/content/v1/cards/owners/${action}`, {
 			cardIds,
-			cardOwners: [{ id: ownerId, type: 'USER' }],
+			cardOwners: [{ id: ownerId, type: ownerType }],
 			note: '',
 			sendEmail: false
 		});
@@ -1297,8 +1387,9 @@ async function transferCards(fromUserId, toUserId, filteredIds, { dryRun, keepPr
 	// --from-user), in which case the old owner stays attached.
 	const transferred = await reassignOwnersInBatches(ids, {
 		label: 'card',
-		addOwner: (cardIds) => updateOwners('add', cardIds, toUserId),
-		removeOldOwner: fromUserId && !keepPreviousOwner ? (cardIds) => updateOwners('remove', cardIds, fromUserId) : null
+		addOwner: (cardIds) => updateOwners('add', cardIds, toUserId, toOwnerType),
+		removeOldOwner:
+			fromUserId && !keepPreviousOwner ? (cardIds) => updateOwners('remove', cardIds, fromUserId, 'USER') : null
 	});
 	return { transferred };
 }
@@ -1480,7 +1571,7 @@ async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fr
 	return { transferred, inputAccess };
 }
 
-async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fromUserName }) {
+async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fromUserName, toOwnerType }) {
 	let ids = filteredIds;
 	if (ids.length === 0) {
 		const res = await safe('list datasets owned by user', () =>
@@ -1500,20 +1591,23 @@ async function transferDatasets(fromUserId, toUserId, filteredIds, { dryRun, fro
 	const reassignBatch = (dsIds) =>
 		api.put('/data/ui/v3/datasources/ownedBy', [
 			{
-				entityIdentifier: { id: parseInt(toUserId, 10), type: 'USER' },
+				entityIdentifier: { id: parseInt(toUserId, 10), type: toOwnerType },
 				dataSourceIds: dsIds
 			}
 		]);
-	const reassignOne = (id) =>
-		api.put(`/data/v2/datasources/${id}/responsibleUsers`, {
-			responsibleUserId: String(toUserId)
-		});
+	// The per-dataset responsibleUsers endpoint is USER-only, so it's only a valid
+	// retry path for a user owner; for a GROUP owner, retry via the same bulk
+	// ownedBy endpoint one ID at a time.
+	const reassignOne =
+		toOwnerType === 'GROUP'
+			? (id) => reassignBatch([id])
+			: (id) => api.put(`/data/v2/datasources/${id}/responsibleUsers`, { responsibleUserId: String(toUserId) });
 
-	// Reassign in batches. When a batch fails, retry each dataset on its own via
-	// the per-dataset endpoint — a different code path that can succeed where the
-	// batch choked, and the per-ID failures pinpoint which datasets are the
-	// problem. transferred tracks only what actually went through, so the count
-	// and tagging stay honest.
+	// Reassign in batches. When a batch fails, retry each dataset on its own — for
+	// a user owner via the per-dataset endpoint (a different code path that can
+	// succeed where the batch choked); the per-ID failures pinpoint which datasets
+	// are the problem. transferred tracks only what actually went through, so the
+	// count and tagging stay honest.
 	const batchSize = 50;
 	const transferred = [];
 	for (let i = 0; i < ids.length; i += batchSize) {
@@ -1589,8 +1683,8 @@ async function transferFilesets(fromUserId, toUserId, filteredIds, { dryRun }) {
 	return { transferred };
 }
 
-// Run the full per-type transfer for a single destination user. Called once per
-// group of work — when --to-user-column partitions a CSV across several new
+// Run the full per-type transfer for a single destination owner. Called once per
+// group of work — when --to-owner-column partitions a CSV across several new
 // owners, this runs once per owner. Per-type counts accumulate into the shared
 // `summary`; returns the type → transferred-IDs map for the optional email.
 // Per-type errors are sliced out of the global `failures` array by position
@@ -1620,6 +1714,11 @@ async function transferForUser({ ctx, objectsByType, requestedTypes, logger, sum
 
 		if (COALESCED_TYPES.has(type)) continue; // handled below
 
+		if (ctx.toOwnerType === 'GROUP' && !GROUP_CAPABLE_TYPES.has(type)) {
+			skipGroupOwner(type, filtered, summary);
+			continue;
+		}
+
 		const errStart = failures.length;
 		try {
 			const res = await runType(type, filtered, ctx);
@@ -1637,10 +1736,14 @@ async function transferForUser({ ctx, objectsByType, requestedTypes, logger, sum
 		}
 	}
 
-	// Beast modes + variables share transferFunctions — call it once.
+	// Beast modes + variables share transferFunctions — call it once. Both are
+	// user-only, so a GROUP destination skips them.
 	const beastSelected = typesToProcess.includes('beast-mode');
 	const varSelected = typesToProcess.includes('variable');
-	if (beastSelected || varSelected) {
+	if ((beastSelected || varSelected) && ctx.toOwnerType === 'GROUP') {
+		if (beastSelected) skipGroupOwner('beast-mode', (objectsByType && objectsByType['beast-mode']) || [], summary);
+		if (varSelected) skipGroupOwner('variable', (objectsByType && objectsByType['variable']) || [], summary);
+	} else if (beastSelected || varSelected) {
 		console.log(`\n=== beast-mode / variable ===`);
 		activeType = 'beast-mode/variable';
 		const errStart = failures.length;
@@ -1681,10 +1784,14 @@ async function transferForUser({ ctx, objectsByType, requestedTypes, logger, sum
 		}
 	}
 
-	// Projects + project-tasks share a single API flow; handle them together.
+	// Projects + project-tasks share a single API flow; handle them together. Both
+	// are user-only, so a GROUP destination skips them.
 	const projectsSelected = typesToProcess.includes('project');
 	const taskSelected = typesToProcess.includes('project-task');
-	if (projectsSelected || taskSelected) {
+	if ((projectsSelected || taskSelected) && ctx.toOwnerType === 'GROUP') {
+		if (projectsSelected) skipGroupOwner('project', (objectsByType && objectsByType['project']) || [], summary);
+		if (taskSelected) skipGroupOwner('project-task', (objectsByType && objectsByType['project-task']) || [], summary);
+	} else if (projectsSelected || taskSelected) {
 		console.log(`\n=== project / project-task ===`);
 		activeType = 'project/project-task';
 		const errStart = failures.length;
@@ -1949,7 +2056,7 @@ async function transferMetrics(fromUserId, toUserId, filteredIds, { dryRun }) {
 	return { transferred };
 }
 
-async function transferPages(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner }) {
+async function transferPages(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner, toOwnerType }) {
 	let ids = filteredIds;
 	if (ids.length === 0) {
 		const limit = 50;
@@ -1979,7 +2086,7 @@ async function transferPages(fromUserId, toUserId, filteredIds, { dryRun, keepPr
 		label: 'page',
 		addOwner: (pageIds) =>
 			api.put('/content/v1/pages/bulk/owners', {
-				owners: [{ id: toUserId, type: 'USER' }],
+				owners: [{ id: toUserId, type: toOwnerType }],
 				pageIds
 			}),
 		removeOldOwner:
@@ -2306,7 +2413,7 @@ async function transferWorkflows(fromUserId, toUserId, filteredIds, { dryRun }) 
 // Worksheets live on the same DATA_APP backend as App Studio apps and share
 // the /dataapps/bulk/owners endpoints; the adminsummary `type` filter is what
 // separates them.
-async function transferWorksheets(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner }) {
+async function transferWorksheets(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner, toOwnerType }) {
 	let ids = filteredIds.map(String);
 	if (ids.length === 0) {
 		const limit = 30;
@@ -2339,7 +2446,7 @@ async function transferWorksheets(fromUserId, toUserId, filteredIds, { dryRun, k
 			api.put('/content/v1/dataapps/bulk/owners', {
 				note: '',
 				entityIds,
-				owners: [{ type: 'USER', id: parseInt(toUserId, 10) }],
+				owners: [{ type: toOwnerType, id: parseInt(toUserId, 10) }],
 				sendEmail: false
 			}),
 		removeOldOwner:
@@ -2366,7 +2473,7 @@ async function transferWorksheets(fromUserId, toUserId, filteredIds, { dryRun, k
  *      delete fails after step 2 succeeded, the workspace has two owners — we
  *      warn and continue so the caller can clean up manually.
  */
-async function transferWorkspaces(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner }) {
+async function transferWorkspaces(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner, toOwnerType }) {
 	let ids = filteredIds;
 	if (ids.length === 0) {
 		const count = 100;
@@ -2409,7 +2516,7 @@ async function transferWorkspaces(fromUserId, toUserId, filteredIds, { dryRun, k
 			const raw = await api.get(`/nav/v1/workspaces/${id}/members`);
 			const members = Array.isArray(raw) ? raw : (raw && raw.members) || [];
 
-			const destMember = members.find((m) => m.memberType === 'USER' && m.memberId === toUserId);
+			const destMember = members.find((m) => m.memberType === toOwnerType && m.memberId === toUserId);
 			const sourceMember = fromUserId
 				? members.find((m) => m.memberType === 'USER' && m.memberId === fromUserId)
 				: null;
@@ -2421,7 +2528,7 @@ async function transferWorkspaces(fromUserId, toUserId, filteredIds, { dryRun, k
 				});
 			} else {
 				await api.post(`/nav/v1/workspaces/${id}/members/${toUserId}`, {
-					members: [{ memberId: toUserId, memberRole: 'OWNER', memberType: 'USER' }],
+					members: [{ memberId: toUserId, memberRole: 'OWNER', memberType: toOwnerType }],
 					sendEmail: false
 				});
 			}
