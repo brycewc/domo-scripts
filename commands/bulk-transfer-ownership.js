@@ -1234,18 +1234,39 @@ async function transferCards(fromUserId, toUserId, filteredIds, { dryRun }) {
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
-	await safe(
-		'add card owner',
-		() =>
-			api.post('/content/v1/cards/owners/add', {
-				cardIds: ids,
-				cardOwners: [{ id: toUserId, type: 'USER' }],
-				note: '',
-				sendEmail: false
-			}),
-		{ cardIds: ids }
-	);
-	return { transferred: ids };
+	const addOwner = (cardIds) =>
+		api.post('/content/v1/cards/owners/add', {
+			cardIds,
+			cardOwners: [{ id: toUserId, type: 'USER' }],
+			note: '',
+			sendEmail: false
+		});
+
+	// Reassign in batches of 100. When a batch fails, retry each card on its own
+	// so the valid cards still transfer and the per-ID failures pinpoint the bad
+	// ones. transferred tracks only what actually went through, so a failed batch
+	// is never counted as transferred.
+	const batchSize = 100;
+	const transferred = [];
+	for (let i = 0; i < ids.length; i += batchSize) {
+		const chunk = ids.slice(i, i + batchSize);
+		const bulk = await attempt(`add card owner ${i + 1}-${i + chunk.length}`, () => addOwner(chunk), {
+			cardIds: chunk
+		});
+		if (bulk.ok) {
+			transferred.push(...chunk);
+		} else {
+			console.log(`  Batch ${i + 1}-${i + chunk.length} failed — retrying ${chunk.length} card(s) individually...`);
+			for (const id of chunk) {
+				const one = await attempt(`add card owner ${id}`, () => addOwner([id]), { cardIds: [id] });
+				if (one.ok) transferred.push(id);
+			}
+		}
+	}
+	if (transferred.length < ids.length) {
+		console.log(`  Cards reassigned: ${transferred.length}/${ids.length}`);
+	}
+	return { transferred };
 }
 
 async function transferCodeEnginePackages(fromUserId, toUserId, filteredIds, { dryRun }) {
