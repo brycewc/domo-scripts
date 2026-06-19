@@ -73,7 +73,7 @@ Optional:
                        When --file is used without --type-column, this must be exactly one type
                        and is applied to every row.
   --keep-previous-owner Do NOT remove the previous owner for types that support multiple
-                       owners (app-studio, page, worksheet, group, repository, workspace).
+                       owners (card, app-studio, page, worksheet, group, repository, workspace).
                        Required when --from-user is omitted (only valid with --file). Useful
                        when the listed objects have no current owner assigned.
   --input-access-level <level> Access level granted to the new owner on a transferred
@@ -667,6 +667,42 @@ async function processFunctionTemplate(template, toUserId) {
 	};
 }
 
+// Add the new owner to a list of entity IDs in batches of 100, retrying a failed
+// batch one ID at a time so valid IDs still transfer and per-ID failures pinpoint
+// the bad ones. Only IDs that actually got the new owner are returned. When
+// removeOldOwner is supplied, it strips the previous owner from each successfully
+// reassigned batch. Shared by the bulk-owner content types (app-studio, page,
+// worksheet, group) whose owner endpoints otherwise take the whole list at once.
+async function reassignOwnersInBatches(ids, { label, addOwner, removeOldOwner }) {
+	const batchSize = 100;
+	const transferred = [];
+	for (let i = 0; i < ids.length; i += batchSize) {
+		const chunk = ids.slice(i, i + batchSize);
+		const bulk = await attempt(`reassign ${label}s ${i + 1}-${i + chunk.length}`, () => addOwner(chunk), { ids: chunk });
+		if (bulk.ok) {
+			transferred.push(...chunk);
+		} else {
+			console.log(`  Batch ${i + 1}-${i + chunk.length} failed — retrying ${chunk.length} ${label}(s) individually...`);
+			for (const id of chunk) {
+				const one = await attempt(`reassign ${label} ${id}`, () => addOwner([id]), { ids: [id] });
+				if (one.ok) transferred.push(id);
+			}
+		}
+	}
+	if (transferred.length < ids.length) {
+		console.log(`  ${label}s reassigned: ${transferred.length}/${ids.length}`);
+	}
+	if (removeOldOwner && transferred.length > 0) {
+		for (let i = 0; i < transferred.length; i += batchSize) {
+			const chunk = transferred.slice(i, i + batchSize);
+			await safe(`remove previous ${label} owner ${i + 1}-${i + chunk.length}`, () => removeOldOwner(chunk), {
+				ids: chunk
+			});
+		}
+	}
+	return transferred;
+}
+
 async function reportPublications(fromUserId, _toUserId, filteredIds) {
 	const ids = filteredIds.length > 0 ? filteredIds : await listPublications(fromUserId);
 	if (ids.length > 0) {
@@ -808,16 +844,18 @@ async function transferAccounts(fromUserId, toUserId, filteredIds, { dryRun }) {
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
-		await safe(`reassign account ${id}`, () =>
+		const res = await attempt(`reassign account ${id}`, () =>
 			api.put(`/data/v2/accounts/share/${id}`, {
 				type: 'USER',
 				id: toUserId,
 				accessLevel: 'OWNER'
 			})
 		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferAiModels(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -847,12 +885,14 @@ async function transferAiModels(fromUserId, toUserId, filteredIds, { dryRun }) {
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
-		await safe(`reassign ai model ${id}`, () =>
+		const res = await attempt(`reassign ai model ${id}`, () =>
 			api.post(`/datascience/ml/v1/models/${id}/ownership`, { userId: toUserId })
 		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferAiProjects(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -882,12 +922,14 @@ async function transferAiProjects(fromUserId, toUserId, filteredIds, { dryRun })
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
-		await safe(`reassign ai project ${id}`, () =>
+		const res = await attempt(`reassign ai project ${id}`, () =>
 			api.post(`/datascience/ml/v1/projects/${id}/ownership`, { userId: toUserId })
 		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferAlerts(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -908,10 +950,14 @@ async function transferAlerts(fromUserId, toUserId, filteredIds, { dryRun }) {
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
-		await safe(`update alert ${id}`, () => api.request('PATCH', `/social/v4/alerts/${id}`, { id, owner: toUserId }));
+		const res = await attempt(`update alert ${id}`, () =>
+			api.request('PATCH', `/social/v4/alerts/${id}`, { id, owner: toUserId })
+		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferAppDbCollections(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -942,10 +988,14 @@ async function transferAppDbCollections(fromUserId, toUserId, filteredIds, { dry
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
-		await safe(`update collection ${id}`, () => api.put(`/datastores/v1/collections/${id}`, { id, owner: toUserId }));
+		const res = await attempt(`update collection ${id}`, () =>
+			api.put(`/datastores/v1/collections/${id}`, { id, owner: toUserId })
+		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferApprovals(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -1176,32 +1226,28 @@ async function transferAppStudioApps(fromUserId, toUserId, filteredIds, { dryRun
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
-	await safe(
-		'add app studio owners',
-		() =>
+	const transferred = await reassignOwnersInBatches(ids, {
+		label: 'app studio app',
+		addOwner: (entityIds) =>
 			api.put('/content/v1/dataapps/bulk/owners', {
 				note: '',
-				entityIds: ids,
+				entityIds,
 				owners: [{ type: 'USER', id: parseInt(toUserId, 10) }],
 				sendEmail: false
 			}),
-		{ entityIds: ids }
-	);
-	if (fromUserId && !keepPreviousOwner) {
-		await safe(
-			'remove old app studio owners',
-			() =>
-				api.post('/content/v1/dataapps/bulk/owners/remove', {
-					entityIds: ids,
-					owners: [{ type: 'USER', id: fromUserId }]
-				}),
-			{ entityIds: ids }
-		);
-	}
-	return { transferred: ids };
+		removeOldOwner:
+			fromUserId && !keepPreviousOwner
+				? (entityIds) =>
+						api.post('/content/v1/dataapps/bulk/owners/remove', {
+							entityIds,
+							owners: [{ type: 'USER', id: fromUserId }]
+						})
+				: null
+	});
+	return { transferred };
 }
 
-async function transferCards(fromUserId, toUserId, filteredIds, { dryRun }) {
+async function transferCards(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner }) {
 	let ids = filteredIds;
 	if (ids.length === 0) {
 		const count = 50;
@@ -1234,38 +1280,26 @@ async function transferCards(fromUserId, toUserId, filteredIds, { dryRun }) {
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
-	const addOwner = (cardIds) =>
-		api.post('/content/v1/cards/owners/add', {
+	// POST /content/v1/cards/owners/{action} — action is "add" or "remove";
+	// same body shape for both. Cards support multiple owners, so adding the new
+	// owner only makes them a co-owner; the old owner is removed separately below.
+	const updateOwners = (action, cardIds, ownerId) =>
+		api.post(`/content/v1/cards/owners/${action}`, {
 			cardIds,
-			cardOwners: [{ id: toUserId, type: 'USER' }],
+			cardOwners: [{ id: ownerId, type: 'USER' }],
 			note: '',
 			sendEmail: false
 		});
 
-	// Reassign in batches of 100. When a batch fails, retry each card on its own
-	// so the valid cards still transfer and the per-ID failures pinpoint the bad
-	// ones. transferred tracks only what actually went through, so a failed batch
-	// is never counted as transferred.
-	const batchSize = 100;
-	const transferred = [];
-	for (let i = 0; i < ids.length; i += batchSize) {
-		const chunk = ids.slice(i, i + batchSize);
-		const bulk = await attempt(`add card owner ${i + 1}-${i + chunk.length}`, () => addOwner(chunk), {
-			cardIds: chunk
-		});
-		if (bulk.ok) {
-			transferred.push(...chunk);
-		} else {
-			console.log(`  Batch ${i + 1}-${i + chunk.length} failed — retrying ${chunk.length} card(s) individually...`);
-			for (const id of chunk) {
-				const one = await attempt(`add card owner ${id}`, () => addOwner([id]), { cardIds: [id] });
-				if (one.ok) transferred.push(id);
-			}
-		}
-	}
-	if (transferred.length < ids.length) {
-		console.log(`  Cards reassigned: ${transferred.length}/${ids.length}`);
-	}
+	// Cards allow multiple owners, so adding the new owner only makes them a
+	// co-owner; the previous owner is removed afterward from the cards that
+	// successfully got the new owner — unless --keep-previous-owner (or no
+	// --from-user), in which case the old owner stays attached.
+	const transferred = await reassignOwnersInBatches(ids, {
+		label: 'card',
+		addOwner: (cardIds) => updateOwners('add', cardIds, toUserId),
+		removeOldOwner: fromUserId && !keepPreviousOwner ? (cardIds) => updateOwners('remove', cardIds, fromUserId) : null
+	});
 	return { transferred };
 }
 
@@ -1302,14 +1336,16 @@ async function transferCodeEnginePackages(fromUserId, toUserId, filteredIds, { d
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
-		await safe(`reassign package ${id}`, () =>
+		const res = await attempt(`reassign package ${id}`, () =>
 			api.put(`/codeengine/v2/packages/${id}`, {
 				owner: parseInt(toUserId, 10)
 			})
 		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferCustomApps(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -1349,12 +1385,14 @@ async function transferCustomApps(fromUserId, toUserId, filteredIds, { dryRun })
 	if (ownedByUser.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ownedByUser, bricks, proCodeApps };
 
+	const transferred = [];
 	for (const id of ownedByUser) {
-		await safe(`grant admin to new owner on app ${id}`, () =>
+		const res = await attempt(`grant admin to new owner on app ${id}`, () =>
 			api.post(`/apps/v1/designs/${id}/permissions/ADMIN`, [toUserId])
 		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ownedByUser, bricks, proCodeApps };
+	return { transferred, bricks, proCodeApps };
 }
 
 async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fromUserName, inputAccessLevel }) {
@@ -1539,14 +1577,16 @@ async function transferFilesets(fromUserId, toUserId, filteredIds, { dryRun }) {
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
-		await safe(`reassign fileset ${id}`, () =>
+		const res = await attempt(`reassign fileset ${id}`, () =>
 			api.post(`/files/v1/filesets/${id}/ownership`, {
 				userId: parseInt(toUserId, 10)
 			})
 		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 // Run the full per-type transfer for a single destination user. Called once per
@@ -1794,12 +1834,14 @@ async function transferGoals(fromUserId, toUserId, filteredIds, { dryRun }) {
 	if (allGoals.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: allGoals.map((g) => g.id) };
 
+	const transferred = [];
 	for (const goal of allGoals) {
 		goal.ownerId = toUserId;
 		goal.owners = [{ ownerId: toUserId, ownerType: 'USER', primary: false }];
-		await safe(`update goal ${goal.id}`, () => api.put(`/social/v1/objectives/${goal.id}`, goal));
+		const res = await attempt(`update goal ${goal.id}`, () => api.put(`/social/v1/objectives/${goal.id}`, goal));
+		if (res.ok) transferred.push(goal.id);
 	}
-	return { transferred: allGoals.map((g) => g.id) };
+	return { transferred };
 }
 
 async function transferGroups(fromUserId, toUserId, filteredIds, { dryRun, keepPreviousOwner }) {
@@ -1821,21 +1863,22 @@ async function transferGroups(fromUserId, toUserId, filteredIds, { dryRun, keepP
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	// The groups endpoint adds the new owner and removes the previous one in the
+	// same call, so there's no separate removeOldOwner pass here.
 	const removeOldOwner = fromUserId && !keepPreviousOwner;
-	await safe(
-		'update group owners',
-		() =>
+	const transferred = await reassignOwnersInBatches(ids, {
+		label: 'group',
+		addOwner: (groupIds) =>
 			api.put(
 				'/content/v2/groups/access',
-				ids.map((gid) => ({
+				groupIds.map((gid) => ({
 					groupId: gid,
 					addOwners: [{ type: 'USER', id: toUserId }],
 					...(removeOldOwner && { removeOwners: [{ type: 'USER', id: fromUserId }] })
 				}))
-			),
-		{ groupIds: ids }
-	);
-	return { transferred: ids };
+			)
+	});
+	return { transferred };
 }
 
 async function transferJupyterWorkspaces(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -1862,12 +1905,14 @@ async function transferJupyterWorkspaces(fromUserId, toUserId, filteredIds, { dr
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
-		await safe(`reassign workspace ${id}`, () =>
+		const res = await attempt(`reassign workspace ${id}`, () =>
 			api.put(`/datascience/v1/workspaces/${id}/ownership`, { newOwnerId: toUserId })
 		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferMetrics(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -1930,27 +1975,23 @@ async function transferPages(fromUserId, toUserId, filteredIds, { dryRun, keepPr
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
-	await safe(
-		'add page owners',
-		() =>
+	const transferred = await reassignOwnersInBatches(ids, {
+		label: 'page',
+		addOwner: (pageIds) =>
 			api.put('/content/v1/pages/bulk/owners', {
 				owners: [{ id: toUserId, type: 'USER' }],
-				pageIds: ids
+				pageIds
 			}),
-		{ pageIds: ids }
-	);
-	if (fromUserId && !keepPreviousOwner) {
-		await safe(
-			'remove old page owners',
-			() =>
-				api.post('/content/v1/pages/bulk/owners/remove', {
-					owners: [{ id: parseInt(fromUserId, 10), type: 'USER' }],
-					pageIds: ids
-				}),
-			{ pageIds: ids }
-		);
-	}
-	return { transferred: ids };
+		removeOldOwner:
+			fromUserId && !keepPreviousOwner
+				? (pageIds) =>
+						api.post('/content/v1/pages/bulk/owners/remove', {
+							owners: [{ id: parseInt(fromUserId, 10), type: 'USER' }],
+							pageIds
+						})
+				: null
+	});
+	return { transferred };
 }
 
 async function transferProjectsAndTasks(fromUserId, toUserId, filteredProjectIds, filteredTaskIds, { dryRun }) {
@@ -2059,14 +2100,16 @@ async function transferRepositories(fromUserId, toUserId, filteredIds, { dryRun,
 	if (fromUserId && !keepPreviousOwner) {
 		updates.push({ userId: fromUserId, permission: 'NONE' });
 	}
+	const transferred = [];
 	for (const id of ids) {
-		await safe(`reassign repository ${id}`, () =>
+		const res = await attempt(`reassign repository ${id}`, () =>
 			api.post(`/version/v1/repositories/${id}/permissions`, {
 				repositoryPermissionUpdates: updates
 			})
 		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferScheduledReports(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -2079,10 +2122,11 @@ async function transferScheduledReports(fromUserId, toUserId, filteredIds, { dry
 	}
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
 		const report = await safe(`get report ${id}`, () => api.get(`/content/v1/reportschedules/${id}`));
 		if (!report) continue;
-		await safe(`update report ${id}`, () =>
+		const res = await attempt(`update report ${id}`, () =>
 			api.put(`/content/v1/reportschedules/${id}`, {
 				id: report.id,
 				ownerId: toUserId,
@@ -2091,8 +2135,9 @@ async function transferScheduledReports(fromUserId, toUserId, filteredIds, { dry
 				viewId: report.viewId
 			})
 		);
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferSubscriptions(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -2165,10 +2210,12 @@ async function transferTaskCenterQueues(fromUserId, toUserId, filteredIds, { dry
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
-		await safe(`set queue ${id} owner`, () => api.put(`/queues/v1/${id}/owner/${toUserId}`));
+		const res = await attempt(`set queue ${id} owner`, () => api.put(`/queues/v1/${id}/owner/${toUserId}`));
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 async function transferTaskCenterTasks(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -2245,13 +2292,15 @@ async function transferWorkflows(fromUserId, toUserId, filteredIds, { dryRun }) 
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
+	const transferred = [];
 	for (const id of ids) {
 		const workflow = await safe(`get workflow ${id}`, () => api.get(`/workflow/v1/models/${id}`));
 		if (!workflow) continue;
 		workflow.owner = String(toUserId);
-		await safe(`update workflow ${id}`, () => api.put(`/workflow/v1/models/${id}`, workflow));
+		const res = await attempt(`update workflow ${id}`, () => api.put(`/workflow/v1/models/${id}`, workflow));
+		if (res.ok) transferred.push(id);
 	}
-	return { transferred: ids };
+	return { transferred };
 }
 
 // Worksheets live on the same DATA_APP backend as App Studio apps and share
@@ -2284,29 +2333,25 @@ async function transferWorksheets(fromUserId, toUserId, filteredIds, { dryRun, k
 	if (ids.length === 0) return { transferred: [] };
 	if (dryRun) return { transferred: ids };
 
-	await safe(
-		'add worksheet owners',
-		() =>
+	const transferred = await reassignOwnersInBatches(ids, {
+		label: 'worksheet',
+		addOwner: (entityIds) =>
 			api.put('/content/v1/dataapps/bulk/owners', {
 				note: '',
-				entityIds: ids,
+				entityIds,
 				owners: [{ type: 'USER', id: parseInt(toUserId, 10) }],
 				sendEmail: false
 			}),
-		{ entityIds: ids }
-	);
-	if (fromUserId && !keepPreviousOwner) {
-		await safe(
-			'remove old worksheet owners',
-			() =>
-				api.post('/content/v1/dataapps/bulk/owners/remove', {
-					entityIds: ids,
-					owners: [{ type: 'USER', id: fromUserId }]
-				}),
-			{ entityIds: ids }
-		);
-	}
-	return { transferred: ids };
+		removeOldOwner:
+			fromUserId && !keepPreviousOwner
+				? (entityIds) =>
+						api.post('/content/v1/dataapps/bulk/owners/remove', {
+							entityIds,
+							owners: [{ type: 'USER', id: fromUserId }]
+						})
+				: null
+	});
+	return { transferred };
 }
 
 /**
