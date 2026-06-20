@@ -109,3 +109,4 @@ Written to `logs/<commandName>/` (git-ignored). Two log types:
 - `csv-parse` — CSV parsing (sync mode)
 - `minimist` — CLI argument parsing
 - `sanitize-filename` — Safe file naming for exports
+- `xlsx` (SheetJS) — Builds the `.xlsx` transfer-log attachment emailed by `bulk-transfer-ownership --send-email`

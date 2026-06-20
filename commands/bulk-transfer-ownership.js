@@ -54,7 +54,9 @@
  * is alphabetical.
  */
 
+const XLSX = require('xlsx');
 const api = require('../lib/api');
+const config = require('../lib/config');
 const { readCSV } = require('../lib/csv');
 const { showHelp } = require('../lib/help');
 const { createLogger } = require('../lib/log');
@@ -82,6 +84,8 @@ Optional:
   --to-owner-type-column <name> CSV column holding USER/GROUP per row (case-insensitive).
                        Only valid with --file. When omitted, --to-owner-type applies to all rows.
   --type-column <name> CSV column with object type per row — needed when the CSV mixes types
+  --name-column <name> CSV column with each object's display name. Only valid with --file.
+                       When given, the --send-email attachment includes an "Object Name" column.
   --object-types <csv> Comma-separated list of types to include. Omit to transfer every type.
                        When --file is used without --type-column, this must be exactly one type
                        and is applied to every row.
@@ -93,9 +97,9 @@ Optional:
                        dataflow's input datasets when they don't already have access
                        (directly or via group). One of CAN_VIEW, CAN_EDIT, CAN_SHARE, OWNER.
                        Default: CAN_VIEW.
-  --send-email         After transferring, email the new owner a summary of every
-                       asset that was transferred to them (by type, with IDs). Skipped
-                       on a dry run.
+  --send-email         After transferring, email the new owner a per-type summary with
+                       the full per-object list attached as an .xlsx (includes an
+                       "Object Name" column when --name-column is given). Skipped on a dry run.
   --dry-run            Print what would be transferred without calling any write endpoints
   --help               Show this help
 
@@ -241,6 +245,9 @@ async function _main() {
 	const singleOwnerId = argv['to-owner'];
 	const ownerColumn = argv['to-owner-column'] || null;
 	const toOwnerTypeColumn = argv['to-owner-type-column'];
+	// Optional CSV column holding each object's display name — used only to fill the
+	// "Object Name" column in the --send-email attachment.
+	const nameColumn = argv['name-column'] || null;
 
 	if (!DATASET_ACCESS_LEVELS.includes(inputAccessLevel)) {
 		throw new Error(`Invalid --input-access-level. Must be one of: ${DATASET_ACCESS_LEVELS.join(', ')}`);
@@ -253,8 +260,8 @@ async function _main() {
 		throw new Error(`Invalid --to-owner-type "${argv['to-owner-type']}". Must be USER or GROUP.`);
 	}
 
-	if ((ownerColumn || toOwnerTypeColumn) && !filePath) {
-		throw new Error('--to-owner-column / --to-owner-type-column can only be used with --file');
+	if ((ownerColumn || toOwnerTypeColumn || nameColumn) && !filePath) {
+		throw new Error('--to-owner-column / --to-owner-type-column / --name-column can only be used with --file');
 	}
 	if (!ownerColumn && singleOwnerId == null) {
 		throw new Error('A destination is required: --to-owner, or --to-owner-column together with --file.');
@@ -293,6 +300,9 @@ async function _main() {
 	// single group whose objectsByType is null (discover everything --from-user
 	// owns). With --file we read the CSV and partition rows by (ownerType, ownerId)
 	// so objects can go to different new owners — users or groups — in one run.
+	// id → display name, keyed by `${type}:${id}`, populated from --name-column when
+	// given. Used only to fill the "Object Name" column in the email attachment.
+	const objectNames = nameColumn ? new Map() : null;
 	let groups;
 	if (filePath) {
 		const records = readCSV(filePath);
@@ -306,6 +316,9 @@ async function _main() {
 		}
 		if (toOwnerTypeColumn && !columns.includes(toOwnerTypeColumn)) {
 			throw new Error(`Owner-type column "${toOwnerTypeColumn}" not found in CSV. Available: ${columns.join(', ')}`);
+		}
+		if (nameColumn && !columns.includes(nameColumn)) {
+			throw new Error(`Name column "${nameColumn}" not found in CSV. Available: ${columns.join(', ')}`);
 		}
 		if (!typeColumn) {
 			if (!requestedTypes || requestedTypes.length !== 1) {
@@ -352,6 +365,7 @@ async function _main() {
 			const { objectsByType } = byOwner.get(key);
 			if (!objectsByType[canon]) objectsByType[canon] = [];
 			objectsByType[canon].push(id);
+			if (objectNames) objectNames.set(`${canon}:${id}`, cleanObjectName(row[nameColumn]));
 		}
 		groups = [...byOwner.values()];
 		if (groups.length === 0) throw new Error('CSV produced no transferable rows.');
@@ -442,8 +456,10 @@ async function _main() {
 					toUserId: groupOwnerId,
 					toOwnerType: groupOwnerType,
 					toUserName: groupOwnerName,
+					fromUserId,
 					fromUserName,
-					transferredByType
+					transferredByType,
+					objectNames
 				});
 			}
 		}
@@ -532,6 +548,37 @@ async function captureDatasetOwnerNames(ids, fromUserName) {
 		if (owner.name) map[id] = owner.name;
 	}
 	return map;
+}
+
+// Reduce a --name-column value to plain text for the email attachment. CSV
+// exports often store the name as an HTML anchor (e.g.
+// <a name="April 2026 Opportunities" href="...">April 2026 Opportunities</a>);
+// take the link's visible text (falling back to its name/title attribute), strip
+// any remaining tags, then decode the handful of HTML entities Domo emits.
+function cleanObjectName(raw) {
+	if (raw == null) return '';
+	let value = String(raw).trim();
+	if (!value) return '';
+	const anchor = value.match(/<a\b[^>]*>([\s\S]*?)<\/a>/i);
+	if (anchor) {
+		const inner = anchor[1].replace(/<[^>]*>/g, '').trim();
+		if (inner) {
+			value = inner;
+		} else {
+			const attr = value.match(/\b(?:name|title)\s*=\s*"([^"]*)"/i);
+			value = attr ? attr[1].trim() : '';
+		}
+	} else if (value.includes('<')) {
+		value = value.replace(/<[^>]*>/g, '').trim();
+	}
+	return value
+		.replace(/&amp;/g, '&')
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&nbsp;/g, ' ')
+		.trim();
 }
 
 // For each transferred dataflow, make sure the new owner can actually read the
@@ -841,13 +888,14 @@ async function sanitizeLinks(links) {
 	return { valid, invalid };
 }
 
-// Email the new owner a summary of everything that was transferred to them.
-// Uses Domo's social messaging endpoint (mirrors domo-toolkit's messages
-// service): POST /social/v3/messages/domoWrapperNew:plainText/send with the
-// recipient routed both by email (query param) and user ID (body), so it lands
-// even if the email lookup fails. The HTML body is wrapped in the same
-// Helvetica flex-column styling the toolkit/Code Engine helpers use.
-async function sendTransferEmail({ toUserId, toOwnerType, toUserName, fromUserName, transferredByType }) {
+// Email the new owner a summary of everything that was transferred to them, with
+// the full per-object list attached as an .xlsx (mirrors domo-toolkit's ownership
+// flow). Uses Domo's social messaging endpoint: POST
+// /social/v3/messages/domoWrapperNew:plainText/send with the recipient routed
+// both by email (query param) and user/group ID (body), so it lands even if the
+// email lookup fails. The HTML body is wrapped in the same Helvetica flex-column
+// styling the toolkit/Code Engine helpers use.
+async function sendTransferEmail({ toUserId, toOwnerType, toUserName, fromUserId, fromUserName, transferredByType, objectNames }) {
 	const types = Object.entries(transferredByType).filter(([, ids]) => ids && ids.length > 0);
 	if (types.length === 0) {
 		console.log('  Nothing was transferred — skipping email.');
@@ -860,13 +908,57 @@ async function sendTransferEmail({ toUserId, toOwnerType, toUserName, fromUserNa
 	// let Domo fan the message out to the group's members.
 	const email = isGroup ? null : await getUserEmail(toUserId);
 
+	// Build the transfer-log attachment: one row per transferred object, mirroring
+	// the column shape domo-toolkit emails. "Object Name" is included only when a
+	// --name-column supplied names (objectNames); "Notes" is always omitted (per-
+	// object failure reasons aren't tracked here). Upload it as a data file; its ID
+	// goes in dataFileAttachments.
+	const date = new Date().toISOString().slice(0, -5);
+	const includeNames = Boolean(objectNames);
+	const columns = [
+		'Object Type',
+		'Object ID',
+		...(includeNames ? ['Object Name'] : []),
+		'Date',
+		'Status',
+		'Previous Owner ID',
+		'Previous Owner Name',
+		'New Owner ID',
+		'New Owner Name'
+	];
+	const aoa = [columns];
+	for (const [type, ids] of types) {
+		for (const id of ids) {
+			aoa.push([
+				String(type).toUpperCase(),
+				id,
+				...(includeNames ? [objectNames.get(`${type}:${id}`) ?? ''] : []),
+				date,
+				'TRANSFERRED',
+				fromUserId || '',
+				fromUserName || '',
+				toUserId,
+				toUserName
+			]);
+		}
+	}
+	const wb = XLSX.utils.book_new();
+	XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), 'Transfer Log');
+	const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+	const filename = `transferred-objects_${date.replace(/[:-]/g, '').replace('T', '_')}.xlsx`;
+	const dataFileId = await uploadDataFile(
+		buffer,
+		filename,
+		'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+	);
+
 	const fromClause = fromUserName ? ` previously owned by ${escapeHtml(fromUserName)}` : '';
 	let bodyHtml = `<h2 style="text-align: left;">Content transferred to you</h2>`;
 	bodyHtml += `<p style="text-align: left;">Hi ${escapeHtml(toUserName)},</p>`;
 	bodyHtml += `<p style="text-align: left;">You are now the owner of ${total} item(s)${fromClause}, broken down below.</p>`;
-	for (const [type, ids] of types) {
-		bodyHtml += `<h3 style="text-align: left;">${escapeHtml(type)} (${ids.length})</h3>`;
-		bodyHtml += `<ul style="text-align: left;">${ids.map((id) => `<li>${escapeHtml(id)}</li>`).join('')}</ul>`;
+	bodyHtml += `<ul style="text-align: left;">${types.map(([type, ids]) => `<li>${escapeHtml(type)}: ${ids.length}</li>`).join('')}</ul>`;
+	if (dataFileId != null) {
+		bodyHtml += `<p style="text-align: left;">A complete list of the transferred items is attached (${escapeHtml(filename)}).</p>`;
 	}
 
 	const payload = {
@@ -874,7 +966,7 @@ async function sendTransferEmail({ toUserId, toOwnerType, toUserName, fromUserNa
 		text: `<div style="display: flex; flex-direction: column; font-family: Helvetica; overflow-x: auto; flex-wrap: wrap; width: 100%; text-align: center;"><div style="display: flex; flex-direction: column; justify-content: center; width: 100%">${bodyHtml}</div></div>`,
 		recipientsUserIds: isGroup ? [] : [parseInt(toUserId, 10)],
 		recipientsGroupIds: isGroup ? [parseInt(toUserId, 10)] : [],
-		dataFileAttachments: [],
+		dataFileAttachments: dataFileId != null ? [dataFileId] : [],
 		populateReplyToHeaderWithRecipients: false
 	};
 
@@ -885,7 +977,8 @@ async function sendTransferEmail({ toUserId, toOwnerType, toUserName, fromUserNa
 	// only announce success when nothing was recorded for this send.
 	await safe('send transfer email', () => api.post(url, { parameters: payload }), { toUserId, recipientEmail: email });
 	if (!failures.some((f) => f.label === 'send transfer email')) {
-		console.log(`  → Emailed ${toUserName}${email ? ` (${email})` : ''} a summary of ${total} transferred item(s).`);
+		const attachNote = dataFileId != null ? ' with an attached list' : ' (attachment upload failed — see log)';
+		console.log(`  → Emailed ${toUserName}${email ? ` (${email})` : ''} a summary of ${total} transferred item(s)${attachNote}.`);
 	}
 }
 
@@ -2555,6 +2648,31 @@ async function transferWorkspaces(fromUserId, toUserId, filteredIds, { dryRun, k
 		}
 	}
 	return { transferred };
+}
+
+// Upload a Buffer as a Domo data file and return its numeric ID, for use as an
+// email attachment (dataFileAttachments). Mirrors domo-toolkit's files service:
+// POST /data/v1/data-files with the raw binary body (not multipart). Uses a raw
+// fetch because the shared api client assumes JSON. Returns null on failure
+// (recorded via safe()) so the email still sends without the attachment.
+async function uploadDataFile(buffer, filename, mimeType) {
+	const url = `${config.baseUrl}/data/v1/data-files?name=${encodeURIComponent(filename)}&public=false`;
+	return safe(
+		`upload attachment ${filename}`,
+		async () => {
+			const res = await fetch(url, {
+				method: 'POST',
+				headers: { 'X-DOMO-Developer-Token': config.accessToken, 'Content-Type': mimeType },
+				body: buffer
+			});
+			if (!res.ok) {
+				throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+			}
+			const data = await res.json();
+			return data.dataFileId;
+		},
+		{ filename }
+	);
 }
 
 _main().catch((err) => {
