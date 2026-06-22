@@ -16,12 +16,18 @@
  *   page         DELETE /content/v1/pages/{id}                             (per-item)
  *   alert        DELETE /social/v4/alerts/{id}                             (per-item)
  *   app-studio   DELETE /content/v1/dataapps/{appId}                       (per-item)
+ *   worksheet    DELETE /content/v1/dataapps/{id}                          (per-item)
  *   custom-app   DELETE /apps/v1/designs/{id}                              (per-item)
+ *   code-engine  DELETE /codeengine/v2/packages/{id}                       (per-item)
  *   jupyter      DELETE /datascience/v1/workspaces/{id}                    (per-item)
  *   ai-project   DELETE /datascience/ml/v1/projects/{id}                   (per-item)
+ *   ai-model     DELETE /datascience/ml/v1/models/{id}                     (per-item)
  *   workflow     DELETE /workflow/v1/models/{id}                           (per-item)*
  *   project      DELETE /content/v1/projects/{id}                          (per-item)
  *   project-task DELETE /content/v1/projects/{projectId}/tasks/{id}        (per-item)
+ *   goal         DELETE /social/v1/objectives/{id}                         (per-item)
+ *   metric       DELETE /content/v1/metrics/{id}?hardDelete=true           (per-item)
+ *   fileset      DELETE /files/v1/filesets/{id}                            (per-item)
  *   collection   DELETE /datastores/v1/collections/{id}                    (per-item)
  *   account      DELETE /accounts/v1/accounts/{id}                         (per-item)
  *   workspace    DELETE /nav/v1/workspaces/{workspaceGUID}                 (per-item)
@@ -35,6 +41,13 @@
  * DATA_SCIENCE_NOTEBOOK type (the API
  * calls those "Jupyter workspaces") — that is a DIFFERENT thing from workspace,
  * which is the navigation Workspaces feature (nav/v1/workspaces, keyed by GUID).
+ * worksheet reuses the same /content/v1/dataapps/{id} endpoint as app-studio
+ * (both are "dataapps"); only the activity-log label differs. metric is the
+ * activity-log METRIC type — the content/v1/metrics resource discovered by
+ * bulk-list-user-content via /content/v1/metrics/filter, deleted at
+ * /content/v1/metrics/{id} with hardDelete=true for a permanent delete (the
+ * endpoint only archives/soft-deletes without it). This is NOT the unrelated
+ * Beast Mode calc metrics at /social/v1/calc/metrics.
  *
  * Users are intentionally NOT handled here — delete them with bulk-delete-users.
  *
@@ -90,12 +103,13 @@
  *   --dry-run        Preview which objects would be deleted without deleting
  *
  * Types are deleted in a fixed dependency-safe order (alert, card, page,
- * app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
- * beast-mode, variable, dataset, dataflow, account, collection, group, workspace)
- * so dependents go before what they reference (beast modes and variables before
- * the datasets they sit on). workspace is last because a workspace can contain any other content,
- * so everything it holds is deleted first. Deletes within a single type run
- * concurrently; types do not overlap.
+ * app-studio, worksheet, custom-app, code-engine, jupyter, ai-project, ai-model,
+ * workflow, project-task, project, beast-mode, variable, goal, metric, fileset,
+ * dataset, dataflow, account, collection, group, workspace) so dependents go
+ * before what they reference (beast modes, variables, goals, metrics and filesets
+ * before the datasets they sit on). workspace is last because a workspace can
+ * contain any other content, so everything it holds is deleted first. Deletes
+ * within a single type run concurrently; types do not overlap.
  */
 
 const { api, readCSV, createLogger, showHelp } = require('../lib');
@@ -109,8 +123,9 @@ Routes each row to the correct DELETE endpoint by object type. Consumes the CSV
 that bulk-list-user-content emits ("Object Type" + "Object ID" columns).
 
 Supported types: dataflow, card, dataset, group, beast-mode, variable, page,
-alert, app-studio, custom-app, jupyter, ai-project, workflow, project,
-project-task, collection, account, workspace.
+alert, app-studio, worksheet, custom-app, code-engine, jupyter, ai-project,
+ai-model, workflow, project, project-task, goal, metric, fileset, collection,
+account, workspace.
 (Users are not handled here — use bulk-delete-users.)
 
 ID source:
@@ -135,10 +150,11 @@ Optional:
   --dry-run        Preview without deleting
 
 Types are deleted in a fixed dependency-safe order: alert, card, page,
-app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
-beast-mode, variable, dataset, dataflow, account, collection, group, workspace.
-workspace is last because a workspace can contain any other content, so its
-contents go first. Deletes within a type run concurrently; types never overlap.
+app-studio, worksheet, custom-app, code-engine, jupyter, ai-project, ai-model,
+workflow, project-task, project, beast-mode, variable, goal, metric, fileset,
+dataset, dataflow, account, collection, group, workspace. workspace is last
+because a workspace can contain any other content, so its contents go first.
+Deletes within a type run concurrently; types never overlap.
 
 Objects already gone (HTTP 404/410) are reported as "already gone" and skipped,
 not counted as errors, so re-runs and stale rows don't fail the command.
@@ -156,13 +172,20 @@ activity-log labels emitted by bulk-list-user-content are accepted too:
   page         (PAGE)
   alert        (ALERT)
   app-studio   (DATA_APP, data-app)
+  worksheet    (WORKSHEET) — dataapps; same endpoint as app-studio
   custom-app   (RYUU_APP, app, ryuu)
+  code-engine  (CODEENGINE_PACKAGE, codeengine) — Code Engine packages (UUID id)
   jupyter      (DATA_SCIENCE_NOTEBOOK, jupyter-workspace) — data science
                notebooks; NOT the same as workspace
   ai-project   (AI_PROJECT)
+  ai-model     (AI_MODEL) — data science models
   workflow     (WORKFLOW_MODEL)
   project      (PROJECT)
   project-task (PROJECT_TASK)
+  goal         (OBJECTIVE) — goals/objectives
+  metric       (METRIC) — permanently deleted (hardDelete); content/v1 metrics,
+               not Beast Mode calc metrics
+  fileset      (FILESET)
   collection   (MAGNUM_COLLECTION, appdb-collection)
   account      (ACCOUNT)
   workspace    (WORKSPACE) — navigation Workspaces feature, keyed by GUID`;
@@ -172,22 +195,28 @@ activity-log labels emitted by bulk-list-user-content are accepted too:
 // lower-case with underscores → hyphens (see normalizeType).
 const TYPE_ALIASES = {
 	account: ['account'],
+	'ai-model': ['ai-model'],
 	'ai-project': ['ai-project'],
 	alert: ['alert'],
 	'app-studio': ['app-studio', 'appstudio', 'data-app', 'dataapp'],
 	'beast-mode': ['beast-mode', 'beastmode', 'beast-mode-formula'],
 	card: ['card'],
+	'code-engine': ['code-engine', 'codeengine', 'codeengine-package'],
 	collection: ['collection', 'appdb-collection', 'magnum-collection'],
 	'custom-app': ['custom-app', 'app', 'ryuu', 'ryuu-app'],
 	dataflow: ['dataflow', 'dataflow-type'],
 	dataset: ['dataset', 'datasource', 'data-source'],
+	fileset: ['fileset'],
+	goal: ['goal', 'objective'],
 	group: ['group'],
 	jupyter: ['jupyter', 'jupyter-workspace', 'data-science-notebook'],
+	metric: ['metric'],
 	page: ['page'],
 	project: ['project'],
 	'project-task': ['project-task'],
 	variable: ['variable'],
 	workflow: ['workflow', 'workflow-model'],
+	worksheet: ['worksheet'],
 	workspace: ['workspace']
 };
 
@@ -262,11 +291,22 @@ const DELETERS = {
 		label: 'app studio app',
 		single: (id) => api.del(`/content/v1/dataapps/${id}`)
 	},
+	worksheet: {
+		// Worksheets are "dataapps" too, so they share app-studio's endpoint —
+		// only the activity-log label (WORKSHEET vs DATA_APP) differs.
+		label: 'worksheet',
+		single: (id) => api.del(`/content/v1/dataapps/${id}`)
+	},
 	'custom-app': {
 		// "Custom apps" (activity-log RYUU_APP) are app designs. deleteDesign is a
 		// soft-delete — recoverable via PUT /apps/v1/designs/{id}/undelete.
 		label: 'custom app',
 		single: (id) => api.del(`/apps/v1/designs/${id}`)
+	},
+	'code-engine': {
+		// Code Engine packages (activity-log CODEENGINE_PACKAGE). The id is a UUID.
+		label: 'Code Engine package',
+		single: (id) => api.del(`/codeengine/v2/packages/${id}`)
 	},
 	jupyter: {
 		label: 'Jupyter workspace',
@@ -275,6 +315,10 @@ const DELETERS = {
 	'ai-project': {
 		label: 'AI project',
 		single: (id) => api.del(`/datascience/ml/v1/projects/${id}`)
+	},
+	'ai-model': {
+		label: 'AI model',
+		single: (id) => api.del(`/datascience/ml/v1/models/${id}`)
 	},
 	workflow: {
 		// DELETE /workflow/v1/models/{id} rejects models that still have an active
@@ -311,6 +355,25 @@ const DELETERS = {
 			return api.del(`/content/v1/projects/${projectId}/tasks/${id}`);
 		}
 	},
+	goal: {
+		// Goals (activity-log OBJECTIVE). Numeric id.
+		label: 'goal',
+		single: (id) => api.del(`/social/v1/objectives/${id}`)
+	},
+	metric: {
+		// Metrics (activity-log METRIC) — the content/v1/metrics resource that
+		// bulk-list-user-content discovers via /content/v1/metrics/filter, NOT the
+		// unrelated Beast Mode calc metrics at /social/v1/calc/metrics. hardDelete=true
+		// permanently removes it; without it the endpoint only archives/soft-deletes.
+		// Numeric id.
+		label: 'metric',
+		single: (id) => api.del(`/content/v1/metrics/${id}?hardDelete=true`)
+	},
+	fileset: {
+		// FileSets (activity-log FILESET). The id is a UUID.
+		label: 'fileset',
+		single: (id) => api.del(`/files/v1/filesets/${id}`)
+	},
 	collection: {
 		label: 'AppDB collection',
 		single: (id) => api.del(`/datastores/v1/collections/${id}`)
@@ -329,8 +392,9 @@ const DELETERS = {
 
 // Order types are deleted in. This is dependency-safe, not cosmetic: dependents
 // are removed before the things they reference (e.g. alerts before the cards and
-// datasets they watch, cards/pages/apps/notebooks and beast modes/variables
-// before the datasets they sit on, datasets before the dataflows that produce them, project tasks before
+// datasets they watch, cards/pages/apps/notebooks and beast modes/variables/
+// goals/metrics/filesets before the datasets they sit on, datasets before the
+// dataflows that produce them, project tasks before
 // their parent project — which would otherwise take the tasks with it and 404
 // the per-task deletes), so we never orphan or block a downstream delete. Groups
 // go near the end, since other content references them for access. Workspaces go
@@ -343,14 +407,20 @@ const TYPE_ORDER = [
 	'card',
 	'page',
 	'app-studio',
+	'worksheet',
 	'custom-app',
+	'code-engine',
 	'jupyter',
 	'ai-project',
+	'ai-model',
 	'workflow',
 	'project-task',
 	'project',
 	'beast-mode',
 	'variable',
+	'goal',
+	'metric',
+	'fileset',
 	'dataset',
 	'dataflow',
 	'account',
