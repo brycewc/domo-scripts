@@ -11,6 +11,8 @@
  *   card         DELETE /content/v1/cards/bulk                             (bulk)
  *   dataset      POST   /data/v1/ui/bulk/delete                            (bulk)
  *   group        DELETE /content/v2/groups                                 (bulk)
+ *   beast-mode   POST   /query/v1/functions/bulk/template { delete: [...] } (bulk)
+ *   variable     POST   /query/v1/functions/bulk/template { delete: [...] } (bulk)
  *   page         DELETE /content/v1/pages/{id}                             (per-item)
  *   alert        DELETE /social/v4/alerts/{id}                             (per-item)
  *   app-studio   DELETE /content/v1/dataapps/{appId}                       (per-item)
@@ -89,10 +91,11 @@
  *
  * Types are deleted in a fixed dependency-safe order (alert, card, page,
  * app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
- * dataset, dataflow, account, collection, group, workspace) so dependents go
- * before what they reference. workspace is last because a workspace can contain
- * any other content, so everything it holds is deleted first. Deletes within a
- * single type run concurrently; types do not overlap.
+ * beast-mode, variable, dataset, dataflow, account, collection, group, workspace)
+ * so dependents go before what they reference (beast modes and variables before
+ * the datasets they sit on). workspace is last because a workspace can contain any other content,
+ * so everything it holds is deleted first. Deletes within a single type run
+ * concurrently; types do not overlap.
  */
 
 const { api, readCSV, createLogger, showHelp } = require('../lib');
@@ -105,9 +108,9 @@ WARNING: This is a destructive operation. Deleted content cannot be recovered.
 Routes each row to the correct DELETE endpoint by object type. Consumes the CSV
 that bulk-list-user-content emits ("Object Type" + "Object ID" columns).
 
-Supported types: dataflow, card, dataset, group, page, alert, app-studio,
-custom-app, jupyter, ai-project, workflow, project, project-task, collection,
-account, workspace.
+Supported types: dataflow, card, dataset, group, beast-mode, variable, page,
+alert, app-studio, custom-app, jupyter, ai-project, workflow, project,
+project-task, collection, account, workspace.
 (Users are not handled here — use bulk-delete-users.)
 
 ID source:
@@ -133,9 +136,9 @@ Optional:
 
 Types are deleted in a fixed dependency-safe order: alert, card, page,
 app-studio, custom-app, jupyter, ai-project, workflow, project-task, project,
-dataset, dataflow, account, collection, group, workspace. workspace is last
-because a workspace can contain any other content, so its contents go first.
-Deletes within a type run concurrently; types never overlap.
+beast-mode, variable, dataset, dataflow, account, collection, group, workspace.
+workspace is last because a workspace can contain any other content, so its
+contents go first. Deletes within a type run concurrently; types never overlap.
 
 Objects already gone (HTTP 404/410) are reported as "already gone" and skipped,
 not counted as errors, so re-runs and stale rows don't fail the command.
@@ -146,6 +149,10 @@ activity-log labels emitted by bulk-list-user-content are accepted too:
   card         (CARD)
   dataset      (DATA_SOURCE)
   group        (GROUP)
+  beast-mode   (BEAST_MODE_FORMULA, beastmode, beast-mode-formula) — beast modes
+               (functions); deletes by template id regardless of usage
+  variable     (VARIABLE) — variables are functions too; same endpoint and
+               caveat as beast-mode
   page         (PAGE)
   alert        (ALERT)
   app-studio   (DATA_APP, data-app)
@@ -168,6 +175,7 @@ const TYPE_ALIASES = {
 	'ai-project': ['ai-project'],
 	alert: ['alert'],
 	'app-studio': ['app-studio', 'appstudio', 'data-app', 'dataapp'],
+	'beast-mode': ['beast-mode', 'beastmode', 'beast-mode-formula'],
 	card: ['card'],
 	collection: ['collection', 'appdb-collection', 'magnum-collection'],
 	'custom-app': ['custom-app', 'app', 'ryuu', 'ryuu-app'],
@@ -178,6 +186,7 @@ const TYPE_ALIASES = {
 	page: ['page'],
 	project: ['project'],
 	'project-task': ['project-task'],
+	variable: ['variable'],
 	workflow: ['workflow', 'workflow-model'],
 	workspace: ['workspace']
 };
@@ -223,6 +232,23 @@ const DELETERS = {
 		label: 'group',
 		bulk: (ids) => api.del('/content/v2/groups', ids.map((id) => Number(id))),
 		single: (id) => api.del(`/content/v2/groups/${id}`)
+	},
+	// Beast modes and variables are both "functions" and share these endpoints —
+	// the list command just emits them under separate Object Type labels
+	// (BEAST_MODE_FORMULA vs VARIABLE), so they're routed as separate types here.
+	// The bulk endpoint takes the ids under a `delete` key; the single endpoint
+	// deletes one template by id. Both delete by id regardless of whether the
+	// function is in use — unlike delete-unused-beast-modes, which only removes
+	// ones with no active links.
+	'beast-mode': {
+		label: 'beast mode',
+		bulk: (ids) => api.post('/query/v1/functions/bulk/template', { delete: ids.map((id) => Number(id)) }),
+		single: (id) => api.del(`/query/v1/functions/template/${id}`)
+	},
+	variable: {
+		label: 'variable',
+		bulk: (ids) => api.post('/query/v1/functions/bulk/template', { delete: ids.map((id) => Number(id)) }),
+		single: (id) => api.del(`/query/v1/functions/template/${id}`)
 	},
 	page: {
 		label: 'page',
@@ -303,8 +329,8 @@ const DELETERS = {
 
 // Order types are deleted in. This is dependency-safe, not cosmetic: dependents
 // are removed before the things they reference (e.g. alerts before the cards and
-// datasets they watch, cards/pages/apps/notebooks before the datasets they sit
-// on, datasets before the dataflows that produce them, project tasks before
+// datasets they watch, cards/pages/apps/notebooks and beast modes/variables
+// before the datasets they sit on, datasets before the dataflows that produce them, project tasks before
 // their parent project — which would otherwise take the tasks with it and 404
 // the per-task deletes), so we never orphan or block a downstream delete. Groups
 // go near the end, since other content references them for access. Workspaces go
@@ -323,6 +349,8 @@ const TYPE_ORDER = [
 	'workflow',
 	'project-task',
 	'project',
+	'beast-mode',
+	'variable',
 	'dataset',
 	'dataflow',
 	'account',
