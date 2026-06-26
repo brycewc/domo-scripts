@@ -5,10 +5,10 @@
  *   1) From user  — discover every object owned by --from-user and transfer it
  *   2) From file  — read specific object IDs (optionally mixed types) from a CSV
  *
- * --from-user may be omitted when --file is used together with
- * --keep-previous-owner. In that mode, the listed IDs are assigned to the new
- * owner without removing any existing owner — useful when the objects in the CSV
- * have no owner currently assigned.
+ * --from-user may be omitted when explicit IDs are supplied (via --file or
+ * --id/--ids). In that mode, the listed IDs are assigned to the new owner without
+ * removing any existing owner — useful when the objects have no owner currently
+ * assigned.
  *
  * Usage:
  *   # Transfer every type the user owns
@@ -23,8 +23,13 @@
  *   # Transfer a CSV that is all one type — no type column needed
  *   node cli.js bulk-transfer-ownership --from-user 12345 --to-owner 67890 --file datasets.csv --object-types "dataset"
  *
- *   # Assign ownership for a CSV without specifying a previous owner
- *   node cli.js bulk-transfer-ownership --to-owner 67890 --file datasets.csv --object-types "dataset" --keep-previous-owner
+ *   # Transfer an ad-hoc list of IDs of one type (no CSV)
+ *   node cli.js bulk-transfer-ownership --from-user 12345 --to-owner 67890 --object-types "dataset" --ids "111,222,333"
+ *   node cli.js bulk-transfer-ownership --from-user 12345 --to-owner 67890 --object-types "card" --id 789
+ *
+ *   # Assign ownership without specifying a previous owner (no --from-user)
+ *   node cli.js bulk-transfer-ownership --to-owner 67890 --file datasets.csv --object-types "dataset"
+ *   node cli.js bulk-transfer-ownership --to-owner 67890 --object-types "dataset" --ids "111,222,333"
  *
  *   # Route each row to a different new owner read from a CSV column
  *   node cli.js bulk-transfer-ownership --from-user 12345 --file content.csv --type-column "Object Type ID" --to-owner-column "New Owner ID"
@@ -68,14 +73,17 @@ Transfer ownership of Domo content from one user to a new user or group.
 
 Required (one destination):
   --to-owner <id>      New owner's ID, of the kind given by --to-owner-type.
-  --from-user <id>     Current owner's user ID (source). Required unless using
-                       --file together with --keep-previous-owner.
+  --from-user <id>     Current owner's user ID (source). Required unless explicit IDs
+                       are supplied via --file or --id/--ids.
   (--to-owner is not required when --to-owner-column supplies the destination per row.)
 
 Optional:
   --to-owner-type <kind>  USER or GROUP (case-insensitive). Applies to --to-owner and
                        to every row when --to-owner-type-column is not given. Default: USER.
   --file <path>        CSV file with specific IDs to transfer (instead of discovering everything)
+  --id, --ids <ids>    Single ID / comma-separated IDs to transfer (instead of --file or
+                       discovery). Requires exactly one --object-types. Cannot be combined
+                       with --file or the per-row --to-owner-column / --to-owner-type-column.
   --id-column <name>   CSV column with object IDs (default: "Object ID")
   --to-owner-column <name> CSV column holding the destination owner ID per row. Only valid
                        with --file. Rows are grouped by owner (type + id) and each new owner
@@ -91,8 +99,8 @@ Optional:
                        and is applied to every row.
   --keep-previous-owner Do NOT remove the previous owner for types that support multiple
                        owners (card, app-studio, page, worksheet, group, repository, workspace).
-                       Required when --from-user is omitted (only valid with --file). Useful
-                       when the listed objects have no current owner assigned.
+                       Implied when --from-user is omitted (there's no previous owner to
+                       remove), so it's only meaningful alongside --from-user.
   --input-access-level <level> Access level granted to the new owner on a transferred
                        dataflow's input datasets when they don't already have access
                        (directly or via group). One of CAN_VIEW, CAN_EDIT, CAN_SHARE, OWNER.
@@ -245,6 +253,10 @@ async function _main() {
 	const singleOwnerId = argv['to-owner'];
 	const ownerColumn = argv['to-owner-column'] || null;
 	const toOwnerTypeColumn = argv['to-owner-type-column'];
+	// Ad-hoc IDs supplied on the command line instead of a CSV. --id and --ids are
+	// equivalent (both comma-separated). Like bulk-delete-content, this requires
+	// exactly one --object-types since there's no per-row type column.
+	const idsRaw = argv.id != null ? String(argv.id) : argv.ids != null ? String(argv.ids) : null;
 	// Optional CSV column holding each object's display name — used only to fill the
 	// "Object Name" column in the --send-email attachment.
 	const nameColumn = argv['name-column'] || null;
@@ -260,6 +272,9 @@ async function _main() {
 		throw new Error(`Invalid --to-owner-type "${argv['to-owner-type']}". Must be USER or GROUP.`);
 	}
 
+	if (filePath && idsRaw != null) {
+		throw new Error('Use either --file or --id/--ids, not both.');
+	}
 	if ((ownerColumn || toOwnerTypeColumn || nameColumn) && !filePath) {
 		throw new Error('--to-owner-column / --to-owner-type-column / --name-column can only be used with --file');
 	}
@@ -267,15 +282,12 @@ async function _main() {
 		throw new Error('A destination is required: --to-owner, or --to-owner-column together with --file.');
 	}
 	if (!fromUserId) {
-		if (!filePath) {
-			throw new Error('--from-user is required when --file is not used');
+		if (!filePath && idsRaw == null) {
+			throw new Error('--from-user is required unless using --file or --id/--ids');
 		}
-		if (!keepPreviousOwner) {
-			throw new Error(
-				'--from-user is required. Omit it only with --file and --keep-previous-owner — ' +
-					'this acknowledges that previous owners will not be removed for types that support multiple owners.'
-			);
-		}
+		// No --from-user means there's no previous owner to remove — the listed IDs
+		// are simply assigned to the new owner. Every removal path is already guarded
+		// by `fromUserId && !keepPreviousOwner`, so this is implicitly keep-previous.
 	} else if (!ownerColumn && singleOwnerId != null && runOwnerType === 'USER' && String(fromUserId) === String(singleOwnerId)) {
 		throw new Error('--from-user and the destination user must be different');
 	}
@@ -369,6 +381,17 @@ async function _main() {
 		}
 		groups = [...byOwner.values()];
 		if (groups.length === 0) throw new Error('CSV produced no transferable rows.');
+	} else if (idsRaw != null) {
+		// Ad-hoc IDs of a single type, all going to the single destination owner.
+		if (!requestedTypes || requestedTypes.length !== 1) {
+			throw new Error('--id/--ids require exactly one --object-types.');
+		}
+		const ids = idsRaw
+			.split(',')
+			.map((s) => s.trim())
+			.filter(Boolean);
+		if (ids.length === 0) throw new Error('--id/--ids produced no IDs.');
+		groups = [{ toUserId: String(singleOwnerId), toOwnerType: runOwnerType, objectsByType: { [requestedTypes[0]]: ids } }];
 	} else {
 		groups = [{ toUserId: String(singleOwnerId), toOwnerType: runOwnerType, objectsByType: null }];
 	}
@@ -385,7 +408,7 @@ async function _main() {
 			fromUserId: fromUserId || null,
 			fromUserName,
 			toOwner: perRowOwner ? `multiple (per CSV${ownerColumn ? ` "${ownerColumn}"` : ''})` : `${runOwnerType} ${singleOwnerId}`,
-			mode: filePath ? 'file' : 'user',
+			mode: filePath ? 'file' : idsRaw != null ? 'ids' : 'user',
 			file: filePath || null,
 			ownerColumn: ownerColumn || null,
 			ownerTypeColumn: toOwnerTypeColumn || null,
@@ -402,7 +425,7 @@ async function _main() {
 	} else {
 		console.log(`To:        ${runOwnerType} ${singleOwnerId}`);
 	}
-	console.log(`Mode:      ${filePath ? `file (${filePath})` : 'user discovery'}`);
+	console.log(`Mode:      ${filePath ? `file (${filePath})` : idsRaw != null ? 'ids (command line)' : 'user discovery'}`);
 	if (keepPreviousOwner) console.log('Keep previous owner: previous owner will NOT be removed for multi-owner types.');
 	if (sendEmailFlag) console.log('Send email: each new owner will be emailed a summary of transferred assets.');
 	if (dryRun) console.log('DRY RUN — no write calls will be made.');

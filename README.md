@@ -144,7 +144,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-revoke-access-tokens` | Revoke developer access tokens by ID, CSV, owner, expiration, or deleted owner |
 | `bulk-unshare-content` | Unshare content in bulk |
 | `bulk-share-content` | Share content (cards, datasets, pages, dataflows) with users/groups |
-| `bulk-transfer-ownership` | Transfer ownership of a user's content (datasets, cards, pages, etc.) to a new owner — a user or a group — either all discovered from the user or from a CSV (per-row owner id + USER/GROUP type supported) |
+| `bulk-transfer-ownership` | Transfer ownership of a user's content (datasets, cards, pages, etc.) to a new owner — a user or a group — either all discovered from the user, from a CSV (per-row owner id + USER/GROUP type supported), or an ad-hoc list of IDs via `--id`/`--ids` |
 | `bulk-update-column-pdp-policy` | Update users/groups on a column-based PDP policy |
 | `bulk-update-stream-schedules` | Change stream schedules to daily (randomized times), manual, or restore arbitrary schedules from a CSV (`--mode from-file`) |
 | `bulk-update-stream-update-method` | Change stream update mode from Replace to Append |
