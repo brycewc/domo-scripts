@@ -153,6 +153,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `clear-logs` | Delete every log file under `logs/` (supports `--dry-run` and `--command` filter) |
 | `delete-unused-beast-modes` | Find and bulk-delete beast modes with no active links (not used in any card or view), optionally filtered by owner, dataset, or creation date; variables excluded unless `--include-variables` |
 | `extract-card-ids` | Extract card IDs from a page export JSON |
+| `replace-function-references` | Replace every reference to one beast mode / variable with another across the instance — rewrites the formula and links of each function that nests it, then saves in batches |
 | `run-workflow-from-csv` | Convert a CSV to workflow input format and run a Domo workflow |
 | `swap-input-in-dataflows` | Replace a dataset input across all consuming dataflows |
 | `transfer-stream` | Copy a stream (and its input dataset) from one instance to another |

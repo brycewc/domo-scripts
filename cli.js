@@ -26,6 +26,7 @@ const commands = {
 	'check-credentials': './commands/check-credentials',
 	'clear-logs': './commands/clear-logs',
 	'delete-unused-beast-modes': './commands/delete-unused-beast-modes',
+	'replace-function-references': './commands/replace-function-references',
 	'extract-card-ids': './commands/extract-card-ids',
 	'swap-input-in-dataflows': './commands/swap-input-in-dataflows',
 	'transfer-stream': './commands/transfer-stream',
