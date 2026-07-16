@@ -140,7 +140,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-export-dataset-versions` | Export historical versions of a dataset |
 | `bulk-list-user-content` | List everything a set of users own (datasets, cards, pages, etc.) into a single Excel or CSV file — one row per (user, object), including a clickable link to each object (`--format`, default `xlsx`) |
 | `bulk-rename-dataflows` | Find/replace in dataflow names across the instance |
-| `bulk-rename-datasets` | Find/replace in dataset names across the instance |
+| `bulk-rename-datasets` | Find/replace in dataset names across the instance, or rename explicit IDs to new names from a CSV (`--file`) |
 | `bulk-revoke-access-tokens` | Revoke developer access tokens by ID, CSV, owner, expiration, or deleted owner |
 | `bulk-unshare-content` | Unshare content in bulk |
 | `bulk-share-content` | Share content (cards, datasets, pages, dataflows) with users/groups |

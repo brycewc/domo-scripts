@@ -1,19 +1,24 @@
 /**
- * Bulk rename Domo datasets by searching for a substring and replacing it
+ * Bulk rename Domo datasets by searching for a substring and replacing it,
+ * or by supplying explicit IDs and new names via a CSV file.
  *
  * Usage:
  *   node cli.js bulk-rename-datasets --search "Old Prefix" --replace "New Prefix"
  *   node cli.js bulk-rename-datasets --search "Old Prefix" --replace "New Prefix" --case-sensitive
  *   node cli.js bulk-rename-datasets --search "Old Prefix" --replace "New Prefix" --dry-run
+ *   node cli.js bulk-rename-datasets --file renames.csv
  *
  * Options:
- *   --search, -s       Substring to find in dataset names (required)
- *   --replace, -r      Replacement string (required)
+ *   --file, -f          CSV file with dataset IDs and new names (bypasses search/replace)
+ *   --id-column         Column holding the dataset ID (default: "id")
+ *   --name-column       Column holding the new name (default: "newName")
+ *   --search, -s        Substring to find in dataset names (required unless --file)
+ *   --replace, -r       Replacement string (required unless --file)
  *   --case-sensitive    Perform case-sensitive matching (default: false)
  *   --dry-run           Preview changes without applying them
  */
 
-const { api, config, showHelp, createLogger } = require('../lib');
+const { api, config, showHelp, createLogger, readCSV } = require('../lib');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
 
@@ -21,13 +26,20 @@ const PAGE_SIZE = 100;
 
 const HELP_TEXT = `Usage: node cli.js bulk-rename-datasets [options]
 
-Bulk rename Domo datasets by searching for a substring and replacing it.
+Bulk rename Domo datasets by searching for a substring and replacing it,
+or by supplying explicit dataset IDs and new names via a CSV file.
 
 Options:
-  --search, -s       Substring to find in dataset names (required)
-  --replace, -r      Replacement string (required)
+  --file, -f         CSV file with dataset IDs and new names (bypasses search/replace)
+  --id-column        Column holding the dataset ID (default: "id")
+  --name-column      Column holding the new name (default: "newName")
+  --search, -s       Substring to find in dataset names (required unless --file)
+  --replace, -r      Replacement string (required unless --file)
   --case-sensitive   Perform case-sensitive matching (default: false)
-  --dry-run          Preview changes without applying them`;
+  --dry-run          Preview changes without applying them
+
+CSV mode reads one row per dataset. Only the ID and new-name columns are used;
+all other search/replace options are ignored.`;
 
 function ask(question) {
 	const rl = readline.createInterface({
@@ -68,6 +80,54 @@ async function renameDatasource(datasetId, newName, description) {
 		dataSourceName: newName,
 		dataSourceDescription: description
 	});
+}
+
+async function getDatasource(datasetId) {
+	return api.get(`/data/v3/datasources/${datasetId}`);
+}
+
+async function buildRenamesFromCSV(filePath, idColumn, nameColumn) {
+	const rows = readCSV(filePath);
+	const available = Object.keys(rows[0]);
+
+	for (const col of [idColumn, nameColumn]) {
+		if (!available.includes(col)) {
+			throw new Error(
+				`Column "${col}" not found in CSV. Available columns: ${available.join(', ')}`
+			);
+		}
+	}
+
+	const renames = [];
+	console.log(`Fetching current details for ${rows.length} dataset(s)...\n`);
+
+	for (let i = 0; i < rows.length; i++) {
+		const id = String(rows[i][idColumn] || '').trim();
+		const newName = String(rows[i][nameColumn] || '').trim();
+
+		if (!id || !newName) {
+			console.warn(
+				`  Skipping row ${i + 1}: missing ${!id ? idColumn : nameColumn}`
+			);
+			continue;
+		}
+
+		try {
+			const ds = await getDatasource(id);
+			renames.push({
+				id,
+				name: ds.name || '',
+				description: ds.description ?? '',
+				newName
+			});
+		} catch (error) {
+			console.warn(`  Skipping ${id}: ${error.message}`);
+		}
+
+		await new Promise((r) => setTimeout(r, 150));
+	}
+
+	return renames;
 }
 
 async function findAllMatchingDatasources(searchStr, caseSensitive) {
@@ -121,14 +181,20 @@ function buildNewName(originalName, searchStr, replaceStr, caseSensitive) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
+	const file = argv.file || argv.f;
+	const idColumn = argv['id-column'] || 'id';
+	const nameColumn = argv['name-column'] || 'newName';
 	const searchStr = argv.search || argv.s;
 	const replaceStr = argv.replace || argv.r;
 	const caseSensitive = argv['case-sensitive'] || argv.c || false;
 	const dryRun = argv['dry-run'] || argv.dry || false;
 
-	if (!searchStr || replaceStr === undefined) {
-		console.error('Error: --search and --replace parameters are required\n');
+	if (!file && (!searchStr || replaceStr === undefined)) {
+		console.error(
+			'Error: provide either --file, or both --search and --replace\n'
+		);
 		console.error('Usage:');
+		console.error('  node cli.js bulk-rename-datasets --file renames.csv');
 		console.error(
 			'  node cli.js bulk-rename-datasets --search "Old Text" --replace "New Text"'
 		);
@@ -149,22 +215,38 @@ async function main() {
 	console.log('Bulk Rename Datasets');
 	console.log('====================\n');
 	console.log(`Instance:       ${config.instanceUrl}`);
-	console.log(`Search for:     "${searchStr}"`);
-	console.log(`Replace with:   "${replaceStr}"`);
-	console.log(`Case sensitive: ${caseSensitive}`);
+	if (file) {
+		console.log(`File:           ${file}`);
+		console.log(`ID column:      "${idColumn}"`);
+		console.log(`Name column:    "${nameColumn}"`);
+	} else {
+		console.log(`Search for:     "${searchStr}"`);
+		console.log(`Replace with:   "${replaceStr}"`);
+		console.log(`Case sensitive: ${caseSensitive}`);
+	}
 	console.log(`Dry run:        ${dryRun}\n`);
 
-	const matches = await findAllMatchingDatasources(searchStr, caseSensitive);
+	let renames;
+	if (file) {
+		renames = await buildRenamesFromCSV(file, idColumn, nameColumn);
+	} else {
+		const matches = await findAllMatchingDatasources(searchStr, caseSensitive);
 
-	if (matches.length === 0) {
-		console.log('No datasources found containing the search string.');
-		process.exit(0);
+		if (matches.length === 0) {
+			console.log('No datasources found containing the search string.');
+			process.exit(0);
+		}
+
+		renames = matches.map((ds) => ({
+			...ds,
+			newName: buildNewName(ds.name, searchStr, replaceStr, caseSensitive)
+		}));
 	}
 
-	const renames = matches.map((ds) => ({
-		...ds,
-		newName: buildNewName(ds.name, searchStr, replaceStr, caseSensitive)
-	}));
+	if (renames.length === 0) {
+		console.log('No datasets to rename.');
+		process.exit(0);
+	}
 
 	const maxCurrentLen = Math.min(
 		60,
