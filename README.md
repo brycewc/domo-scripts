@@ -138,7 +138,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-delete-dataflow-triggers` | Remove all triggers from dataflows listed in a CSV |
 | `bulk-delete-users` | Delete users listed in a CSV. Does not check or transfer ownership — prompts for confirmation. |
 | `bulk-export-dataset-versions` | Export historical versions of a dataset |
-| `bulk-list-user-content` | List everything a set of users own (datasets, cards, pages, etc.) into a single CSV — one row per (user, object) |
+| `bulk-list-user-content` | List everything a set of users own (datasets, cards, pages, etc.) into a single Excel or CSV file — one row per (user, object), including a clickable link to each object (`--format`, default `xlsx`) |
 | `bulk-rename-dataflows` | Find/replace in dataflow names across the instance |
 | `bulk-rename-datasets` | Find/replace in dataset names across the instance |
 | `bulk-revoke-access-tokens` | Revoke developer access tokens by ID, CSV, owner, expiration, or deleted owner |

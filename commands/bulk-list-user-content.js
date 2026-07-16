@@ -15,7 +15,9 @@
 
 const fs = require('fs');
 const path = require('path');
+const XLSX = require('xlsx');
 const api = require('../lib/api');
+const config = require('../lib/config');
 const { showHelp } = require('../lib/help');
 const { resolveIds } = require('../lib/input');
 const argv = require('minimist')(process.argv.slice(2));
@@ -36,13 +38,19 @@ Optional:
   --filter-value <val>   Required value for --filter-column
   --object-types <csv>   Comma-separated subset of types (default: all). Same
                          aliases accepted as bulk-transfer-ownership.
-  --output <path>        Output CSV path. Defaults to
-                         logs/bulk-list-user-content/user_content_<ts>.csv
+  --format <xlsx|csv>    Output format (default: xlsx). Inferred from --output's
+                         extension when --format is omitted.
+  --output <path>        Output file path. Defaults to
+                         logs/bulk-list-user-content/user_content_<ts>.<ext>
   --help                 Show this help
 
-Output CSV columns: User ID, User Name, Object Type, Object ID, Object Name
+Output columns: User ID, User Name, Object Type, Object ID, Object Name,
+Object Link
 The "Object Type" column uses the activity-log naming (e.g. DATA_SOURCE,
 DATAFLOW_TYPE, RYUU_APP) so rows can be joined directly with audit-log exports.
+"Object Link" is a direct URL to the object in the Domo UI (blank for types
+with no standalone page, e.g. metric and subscription). In xlsx output the
+link cells are clickable hyperlinks.
 
 Object types accepted by --object-types (case-insensitive, hyphens or
 underscores both accepted):
@@ -133,6 +141,57 @@ const TYPE_TO_ACTIVITY_LOG = {
 	workspace: 'WORKSPACE'
 };
 
+// Maps canonical kebab-case types to the Domo UI path for a single object,
+// sourced from domo-toolkit's DomoObjectType registry (urlPath). `{id}` is
+// replaced with the object ID and the result is appended to the instance URL.
+// Types with no standalone UI page (metric, subscription) are omitted, producing
+// a blank link. Paths containing `{parent}` require the item's parentId (e.g.
+// task uses its queueId); the link is left blank if that parent is missing.
+const TYPE_TO_URL_PATH = {
+	account: '/datacenter/accounts?id={id}',
+	'ai-model': '/ai-services/models/{id}',
+	'ai-project': '/ai-services/projects/{id}',
+	alert: '/alerts/{id}',
+	'app-studio': '/app-studio/{id}',
+	approval: '/approval/request-details/{id}',
+	'beast-mode': '/datacenter/beastmode?id={id}',
+	card: '/kpis/details/{id}',
+	'code-engine': '/codeengine/{id}',
+	collection: '/appDb/{id}/permissions',
+	'custom-app': '/assetlibrary/{id}/overview',
+	dataflow: '/datacenter/dataflows/{id}/details',
+	dataset: '/datasources/{id}/details/overview',
+	fileset: '/datacenter/filesets/{id}/overview',
+	goal: '/goals/{id}',
+	group: '/admin/groups/{id}?tab=people',
+	jupyter: '/jupyter-workspaces/{id}',
+	page: '/page/{id}',
+	project: '/project/{id}',
+	'project-task': '/project?taskId={id}',
+	publication: '/admin/domo-everywhere/publications?id={id}',
+	queue: '/queues/tasks?queueId={id}&status=OPEN',
+	repository: '/admin/sandbox/repositories/{id}',
+	task: '/queues/tasks?queueId={parent}&id={id}&openTaskDrawer=true',
+	template: '/approval/edit-request-form/{id}',
+	variable: '/datacenter/beastmode?id={id}',
+	workflow: '/workflows/models/{id}',
+	worksheet: '/app-studio/{id}',
+	workspace: '/workspaces/{id}'
+};
+
+function buildObjectLink(type, item) {
+	const pathTemplate = TYPE_TO_URL_PATH[type];
+	const id = item && item.id;
+	if (!pathTemplate || id == null || id === '') return '';
+	let urlPath = pathTemplate.replace('{id}', encodeURIComponent(id));
+	if (urlPath.includes('{parent}')) {
+		const parentId = item && item.parentId;
+		if (parentId == null || parentId === '') return '';
+		urlPath = urlPath.replace('{parent}', encodeURIComponent(parentId));
+	}
+	return `${config.instanceUrl}${urlPath}`;
+}
+
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function csvField(v) {
@@ -143,6 +202,48 @@ function csvField(v) {
 
 function csvRow(fields) {
 	return fields.map(csvField).join(',') + '\n';
+}
+
+// Column order shared by both output formats. LINK_COL is the 0-based index of
+// the "Object Link" column, turned into a clickable hyperlink in xlsx output.
+const HEADER = ['User ID', 'User Name', 'Object Type', 'Object ID', 'Object Name', 'Object Link'];
+const LINK_COL = 5;
+
+// Resolve the output format from --format, else infer from --output's extension,
+// else default to xlsx.
+function resolveFormat(argv) {
+	if (argv.format) {
+		const f = String(argv.format).trim().toLowerCase();
+		if (f !== 'xlsx' && f !== 'csv') throw new Error(`Unknown --format "${argv.format}" (expected xlsx or csv)`);
+		return f;
+	}
+	if (argv.output) {
+		const ext = path.extname(String(argv.output)).toLowerCase();
+		if (ext === '.csv') return 'csv';
+		if (ext === '.xlsx') return 'xlsx';
+	}
+	return 'xlsx';
+}
+
+// Build an .xlsx from the collected rows, turning each non-empty Object Link
+// cell into a real clickable hyperlink.
+function writeXlsx(outputFile, rows) {
+	const ws = XLSX.utils.aoa_to_sheet([HEADER, ...rows]);
+	for (let i = 0; i < rows.length; i++) {
+		const url = rows[i][LINK_COL];
+		if (!url) continue;
+		const ref = XLSX.utils.encode_cell({ r: i + 1, c: LINK_COL });
+		if (ws[ref]) ws[ref].l = { Target: url, Tooltip: url };
+	}
+	const wb = XLSX.utils.book_new();
+	XLSX.utils.book_append_sheet(wb, ws, 'User Content');
+	XLSX.writeFile(wb, outputFile);
+}
+
+function writeCsv(outputFile, rows) {
+	let out = csvRow(HEADER);
+	for (const r of rows) out += csvRow(r);
+	fs.writeFileSync(outputFile, out);
 }
 
 function normalizeType(raw) {
@@ -770,7 +871,13 @@ async function listTaskCenterTasks(userId) {
 			})
 		);
 		if (!res || res.length === 0) break;
-		out.push(...res.map((t) => ({ id: t.id, name: t.name || t.title || '' })));
+		out.push(
+			...res.map((t) => ({
+				id: t.id,
+				name: t.name || t.title || (Array.isArray(t.attributes) ? t.attributes[0] : '') || '',
+				parentId: t.queueId
+			}))
+		);
 		if (res.length < limit) break;
 		offset += limit;
 	}
@@ -1009,18 +1116,19 @@ async function _main() {
 			});
 	}
 
+	const format = resolveFormat(argv);
 	const ts = new Date().toISOString().replace(/[:.]/g, '-');
 	// Default output lands under the consuming project's working directory, not
 	// this package's install location, matching how logs are written.
 	const defaultOutDir = path.join(process.cwd(), 'logs', 'bulk-list-user-content');
-	const outputFile = argv.output || path.join(defaultOutDir, `user_content_${ts}.csv`);
+	const outputFile = argv.output || path.join(defaultOutDir, `user_content_${ts}.${format}`);
 	fs.mkdirSync(path.dirname(outputFile), { recursive: true });
-	fs.writeFileSync(outputFile, csvRow(['User ID', 'User Name', 'Object Type', 'Object ID', 'Object Name']));
 
 	console.log('Bulk List User Content');
 	console.log('======================');
 	console.log(`Users:  ${userIds.length}`);
 	console.log(`Types:  ${types.join(', ')}`);
+	console.log(`Format: ${format}`);
 	console.log(`Output: ${outputFile}`);
 
 	// Pre-fetch caches for endpoints that don't filter by owner server-side.
@@ -1042,7 +1150,7 @@ async function _main() {
 	}
 
 	const summary = {};
-	let totalRows = 0;
+	const allRows = [];
 	for (const userId of userIds) {
 		const userName = await getUserName(userId);
 		console.log(`\n=== ${userName} (${userId}) ===`);
@@ -1052,15 +1160,18 @@ async function _main() {
 			try {
 				const items = await listForUserAndType(type, userId, caches, userCache);
 				console.log(`  ${type}: ${items.length}`);
-				if (items.length > 0) {
-					const activityType = TYPE_TO_ACTIVITY_LOG[type] || type;
-					const rows = items.map((item) =>
-						csvRow([userId, userName, activityType, item.id ?? '', item.name ?? ''])
-					);
-					fs.appendFileSync(outputFile, rows.join(''));
+				const activityType = TYPE_TO_ACTIVITY_LOG[type] || type;
+				for (const item of items) {
+					allRows.push([
+						userId,
+						userName,
+						activityType,
+						item.id ?? '',
+						item.name ?? '',
+						buildObjectLink(type, item)
+					]);
 				}
 				summary[type] = (summary[type] || 0) + items.length;
-				totalRows += items.length;
 			} catch (err) {
 				console.error(`  ✗ ${type} failed: ${err.message}`);
 			}
@@ -1068,12 +1179,18 @@ async function _main() {
 		await delay(100);
 	}
 
+	if (format === 'csv') {
+		writeCsv(outputFile, allRows);
+	} else {
+		writeXlsx(outputFile, allRows);
+	}
+
 	console.log('\n=== Summary ===');
 	for (const type of types) {
 		console.log(`  ${type}: ${summary[type] || 0}`);
 	}
-	console.log(`\nTotal rows: ${totalRows}`);
-	console.log(`CSV written to ${outputFile}`);
+	console.log(`\nTotal rows: ${allRows.length}`);
+	console.log(`${format.toUpperCase()} written to ${outputFile}`);
 }
 
 _main().catch((err) => {
