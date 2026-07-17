@@ -12,3 +12,8 @@ id-mappings/
 !.yarn/versions
 .pnp.*
 tmp
+# Personal Claude Code overrides
+.claude/settings.local.json
+
+# Personal VS Code workspace config
+.vscode/
