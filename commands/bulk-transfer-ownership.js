@@ -101,6 +101,19 @@ Optional:
                        owners (card, app-studio, page, worksheet, group, repository, workspace).
                        Implied when --from-user is omitted (there's no previous owner to
                        remove), so it's only meaningful alongside --from-user.
+  --verify             After transferring, re-read every transferred object and confirm
+                       the new owner is present (and the previous owner gone, unless
+                       --keep-previous-owner). Reports anything that did not move, was
+                       left ownerless, or vanished. Verifiable types: card, page,
+                       app-studio, beast-mode, variable, dataset, dataflow; others are
+                       reported as unverified rather than assumed fine. Skipped on a dry run.
+  --prune-invalid-functions
+                       Beast modes/variables only. Inspect each formula's links and
+                       DELETE the formula when every link is dead, or when a visible link
+                       is dead; unlink dead links otherwise. This is cleanup, not transfer,
+                       so it is OFF by default: without it a transfer only changes the
+                       owner and echoes the links back untouched. Deletions are printed,
+                       and a dry run with this flag lists what it would destroy.
   --input-access-level <level> Access level granted to the new owner on a transferred
                        dataflow's input datasets when they don't already have access
                        (directly or via group). One of CAN_VIEW, CAN_EDIT, CAN_SHARE, OWNER.
@@ -244,6 +257,8 @@ async function _main() {
 	const dryRun = Boolean(argv['dry-run']);
 	const sendEmailFlag = Boolean(argv['send-email']);
 	const keepPreviousOwner = Boolean(argv['keep-previous-owner']);
+	const pruneInvalidFunctions = Boolean(argv['prune-invalid-functions']);
+	const verify = Boolean(argv.verify);
 	const inputAccessLevel = String(argv['input-access-level'] || 'CAN_VIEW').toUpperCase();
 
 	// Destination owner. The owner ID comes from --to-owner (single) or the
@@ -413,6 +428,8 @@ async function _main() {
 			ownerColumn: ownerColumn || null,
 			ownerTypeColumn: toOwnerTypeColumn || null,
 			keepPreviousOwner,
+			pruneInvalidFunctions,
+			verify,
 			requestedTypes: requestedTypes || 'all'
 		}
 	});
@@ -427,6 +444,12 @@ async function _main() {
 	}
 	console.log(`Mode:      ${filePath ? `file (${filePath})` : idsRaw != null ? 'ids (command line)' : 'user discovery'}`);
 	if (keepPreviousOwner) console.log('Keep previous owner: previous owner will NOT be removed for multi-owner types.');
+	if (pruneInvalidFunctions) {
+		console.log(
+			'Prune invalid functions: beast modes/variables whose links are all dead WILL BE DELETED, not transferred.'
+		);
+	}
+	if (verify) console.log('Verify: each transferred object will be re-read afterwards to confirm the owner actually moved.');
 	if (sendEmailFlag) console.log('Send email: each new owner will be emailed a summary of transferred assets.');
 	if (dryRun) console.log('DRY RUN — no write calls will be made.');
 
@@ -458,6 +481,7 @@ async function _main() {
 			toUserName: groupOwnerName,
 			dryRun,
 			keepPreviousOwner,
+			pruneInvalidFunctions,
 			inputAccessLevel
 		};
 
@@ -468,6 +492,19 @@ async function _main() {
 			logger,
 			summary
 		});
+
+		if (verify && !dryRun) {
+			const result = await verifyTransfers({
+				transferredByType,
+				toUserId: groupOwnerId,
+				toOwnerType: groupOwnerType,
+				fromUserId,
+				keepPreviousOwner
+			});
+			logger.addResult({ type: 'verify', toUserId: groupOwnerId, transferred: [], details: result });
+			summary.verified = (summary.verified || 0) + result.confirmed;
+			summary.verifyProblems = (summary.verifyProblems || []).concat(result.problems);
+		}
 
 		if (sendEmailFlag) {
 			console.log('\n=== email ===');
@@ -496,6 +533,12 @@ async function _main() {
 		console.log('Skipped:');
 		for (const s of summary.skipped) {
 			console.log(`  ${s.type} (${s.reason}): ${s.ids.length}`);
+		}
+	}
+	if (verify && !dryRun) {
+		console.log(`Verified:  ${summary.verified || 0} object(s) confirmed with the new owner`);
+		if ((summary.verifyProblems || []).length > 0) {
+			console.log(`Unverified: ${summary.verifyProblems.length} object(s) did NOT verify — see run log`);
 		}
 	}
 	if (failures.length > 0) {
@@ -790,17 +833,43 @@ function normalizeType(raw) {
 	return ALIAS_TO_CANONICAL[key] || null;
 }
 
-async function processFunctionTemplate(template, toUserId) {
+// Decide what to do with one beast mode / variable during a transfer.
+//
+// By default this is a pure ownership change: the links array is echoed back to
+// the server exactly as it was read, so only `owner` moves and expression,
+// checkSum, legacyId and status are left untouched. Links are NOT inspected,
+// because a transfer that silently deletes the thing it was asked to move is a
+// footgun — a dead link is a cleanup job, not a reason to destroy a formula
+// somebody may still be able to repair.
+//
+// `pruneInvalid` (--prune-invalid-functions) opts back into the old behaviour:
+// unlink dead resources, and delete the formula outright when every link is dead
+// or a *visible* link is dead. Only use it when cleanup, not transfer, is the goal.
+//
+// On a dry run nothing is written; the returned plan still says what would happen
+// so the preview can warn about deletions before they happen.
+async function processFunctionTemplate(template, toUserId, { pruneInvalid = false, dryRun = false } = {}) {
+	if (!pruneInvalid) {
+		return {
+			deleted: false,
+			global: template.global,
+			invalidLinks: 0,
+			update: { id: template.id, owner: toUserId, links: template.links || [] }
+		};
+	}
+
 	const { valid, invalid } = await sanitizeLinks(template.links);
 	const hasInvalidVisible = invalid.some((l) => l.visible === true);
 	const allLinksInvalid = template.links && template.links.length === 1 && invalid.length === 1 && valid.length === 0;
 
 	if (allLinksInvalid || hasInvalidVisible) {
-		await safe(`delete function ${template.id}`, () => api.del(`/query/v1/functions/template/${template.id}`));
-		return { deleted: true, global: template.global };
+		if (!dryRun) {
+			await safe(`delete function ${template.id}`, () => api.del(`/query/v1/functions/template/${template.id}`));
+		}
+		return { deleted: true, global: template.global, invalidLinks: invalid.length };
 	}
 
-	if (invalid.length > 0) {
+	if (invalid.length > 0 && !dryRun) {
 		await safe(`repair function ${template.id} links`, () =>
 			api.post(`/query/v1/functions/template/${template.id}/links`, {
 				linkTo: valid,
@@ -812,6 +881,7 @@ async function processFunctionTemplate(template, toUserId) {
 	return {
 		deleted: false,
 		global: template.global,
+		invalidLinks: invalid.length,
 		update: { id: template.id, owner: toUserId, links: valid }
 	};
 }
@@ -850,6 +920,24 @@ async function reassignOwnersInBatches(ids, { label, addOwner, removeOldOwner })
 		}
 	}
 	return transferred;
+}
+
+// Print what --prune-invalid-functions did (or would do) to the console instead of
+// leaving it in the run log. A "transfer" that destroys formulas has to say so out
+// loud, and on a dry run this is the warning that prevents a surprise in the real run.
+function reportFunctionSideEffects(label, deletedIds, invalidLinkIds, dryRun) {
+	const deleted = deletedIds || [];
+	const invalid = invalidLinkIds || [];
+	if (deleted.length > 0) {
+		console.log(
+			`  ${dryRun ? '[DRY RUN] ' : ''}⚠ ${deleted.length} ${label}(s) ${dryRun ? 'would be' : 'were'} DELETED, ` +
+				`not transferred, because --prune-invalid-functions is set and every link (or a visible link) is dead: ` +
+				`${deleted.join(', ')}`
+		);
+	}
+	if (invalid.length > 0) {
+		console.log(`  ${invalid.length} ${label}(s) had dead links that were unlinked: ${invalid.join(', ')}`);
+	}
 }
 
 async function reportPublications(fromUserId, _toUserId, filteredIds) {
@@ -1878,9 +1966,10 @@ async function transferForUser({ ctx, objectsByType, requestedTypes, logger, sum
 					toUserId,
 					transferred: res.beastModes,
 					errors: coalescedErrors,
-					details: { deleted: res.deletedBeastModes }
+					details: { deleted: res.deletedBeastModes, invalidLinks: res.invalidLinkBeastModes }
 				});
 				console.log(`  → ${(res.beastModes || []).length} beast modes transferred`);
+				reportFunctionSideEffects('beast mode', res.deletedBeastModes, res.invalidLinkBeastModes, ctx.dryRun);
 			}
 			if (varSelected) {
 				addTotal('variable', (res.variables || []).length);
@@ -1890,9 +1979,10 @@ async function transferForUser({ ctx, objectsByType, requestedTypes, logger, sum
 					toUserId,
 					transferred: res.variables,
 					errors: coalescedErrors,
-					details: { deleted: res.deletedVariables }
+					details: { deleted: res.deletedVariables, invalidLinks: res.invalidLinkVariables }
 				});
 				console.log(`  → ${(res.variables || []).length} variables transferred`);
+				reportFunctionSideEffects('variable', res.deletedVariables, res.invalidLinkVariables, ctx.dryRun);
 			}
 			if (coalescedErrors.length) console.log(`  ⚠ ${coalescedErrors.length} error(s) logged — see run log`);
 		} catch (err) {
@@ -1937,21 +2027,39 @@ async function transferForUser({ ctx, objectsByType, requestedTypes, logger, sum
 	return transferredByType;
 }
 
-async function transferFunctions(fromUserId, toUserId, filteredIds, { dryRun }) {
+async function transferFunctions(fromUserId, toUserId, filteredIds, { dryRun, pruneInvalidFunctions }) {
 	const bulkUrl = '/query/v1/functions/bulk/template';
 	const transferred = { beastMode: [], variable: [] };
 	const deleted = { beastMode: [], variable: [] };
+	const withInvalidLinks = { beastMode: [], variable: [] };
 
 	const handleTemplate = async (template) => {
-		const result = await processFunctionTemplate(template, toUserId);
+		const result = await processFunctionTemplate(template, toUserId, {
+			dryRun,
+			pruneInvalid: pruneInvalidFunctions
+		});
 		const bucket = result.global === false ? 'beastMode' : 'variable';
+		if (result.invalidLinks > 0) withInvalidLinks[bucket].push(template.id);
 		if (result.deleted) deleted[bucket].push(template.id);
 		else return { bucket, update: result.update };
 		return null;
 	};
 
+	const buildResult = () => ({
+		transferred: [...transferred.beastMode, ...transferred.variable],
+		deletedBeastModes: deleted.beastMode,
+		deletedVariables: deleted.variable,
+		beastModes: transferred.beastMode,
+		invalidLinkBeastModes: withInvalidLinks.beastMode,
+		invalidLinkVariables: withInvalidLinks.variable,
+		variables: transferred.variable
+	});
+
 	if (filteredIds.length > 0) {
-		if (dryRun) return { transferred: filteredIds };
+		// A dry run still reads each template — the reads are harmless and they let the
+		// preview report the real beast-mode/variable split, and name the formulas that
+		// --prune-invalid-functions would DELETE rather than move. Returning early here
+		// without those keys is what used to make a dry run report 0 transferred.
 		const updates = { beastMode: [], variable: [] };
 		for (const fid of filteredIds) {
 			const template = await safe(`get function ${fid}`, () =>
@@ -1962,62 +2070,79 @@ async function transferFunctions(fromUserId, toUserId, filteredIds, { dryRun }) 
 			if (out) updates[out.bucket].push(out.update);
 		}
 		for (const bucket of ['beastMode', 'variable']) {
-			for (let i = 0; i < updates[bucket].length; i += 100) {
-				const chunk = updates[bucket].slice(i, i + 100);
-				await safe(`bulk update ${bucket} ${i + 1}-${i + chunk.length}`, () => api.post(bulkUrl, { update: chunk }), {
-					ids: chunk.map((u) => u.id)
-				});
+			if (!dryRun) {
+				for (let i = 0; i < updates[bucket].length; i += 100) {
+					const chunk = updates[bucket].slice(i, i + 100);
+					await safe(`bulk update ${bucket} ${i + 1}-${i + chunk.length}`, () => api.post(bulkUrl, { update: chunk }), {
+						ids: chunk.map((u) => u.id)
+					});
+				}
 			}
 			transferred[bucket].push(...updates[bucket].map((u) => u.id));
 		}
 	} else {
+		// The owner search sorted by name is NOT stable: beast-mode names repeat
+		// heavily, so rows with equal keys reorder between pages and plain offset
+		// paging both duplicates and *misses* ids. Count-matching hides it. So dedupe
+		// by id while paging, and on a real run repeat the whole find-then-transfer
+		// pass until the owner search comes back empty, because each transferred row
+		// drops out of the result set and exposes anything the last pass skipped.
 		const limit = 100;
-		let offset = 0;
-		while (true) {
-			const res = await safe(`search functions offset=${offset}`, () =>
-				api.post('/query/v1/functions/search', {
-					filters: [{ field: 'owner', idList: [fromUserId] }],
-					sort: { field: 'name', ascending: true },
-					limit,
-					offset
-				})
-			);
-			if (!res || !res.results || res.results.length === 0) break;
-			if (!dryRun) {
-				const updates = { beastMode: [], variable: [] };
-				for (const template of res.results) {
-					const out = await handleTemplate(template);
-					if (out) updates[out.bucket].push(out.update);
-				}
-				for (const bucket of ['beastMode', 'variable']) {
-					for (let i = 0; i < updates[bucket].length; i += 100) {
-						const chunk = updates[bucket].slice(i, i + 100);
-						await safe(
-							`bulk update ${bucket} ${i + 1}-${i + chunk.length}`,
-							() => api.post(bulkUrl, { update: chunk }),
-							{ ids: chunk.map((u) => u.id) }
-						);
-					}
-					transferred[bucket].push(...updates[bucket].map((u) => u.id));
-				}
-			} else {
-				for (const template of res.results) {
+		const attempted = new Set();
+		const MAX_PASSES = 10;
+		for (let pass = 1; pass <= MAX_PASSES; pass++) {
+			const found = new Map();
+			for (let offset = 0; ; offset += limit) {
+				const res = await safe(`search functions pass ${pass} offset=${offset}`, () =>
+					api.post('/query/v1/functions/search', {
+						filters: [{ field: 'owner', idList: [fromUserId] }],
+						sort: { field: 'name', ascending: true },
+						limit,
+						offset
+					})
+				);
+				const rows = (res && res.results) || [];
+				for (const t of rows) if (!found.has(String(t.id))) found.set(String(t.id), t);
+				if (rows.length === 0 || !res || !res.hasMore) break;
+			}
+			if (found.size === 0) break;
+
+			if (dryRun) {
+				// Nothing is written, so another pass would just re-find the same rows.
+				for (const template of found.values()) {
 					const bucket = template.global === false ? 'beastMode' : 'variable';
 					transferred[bucket].push(template.id);
 				}
+				break;
 			}
-			offset += limit;
-			if (!res.hasMore) break;
+
+			const fresh = [...found.values()].filter((t) => !attempted.has(String(t.id)));
+			if (fresh.length === 0) {
+				// Everything still showing up has already been tried and did not move, so
+				// looping again would spin. The failures are already in the run log.
+				console.log(`  ${found.size} function(s) still owned by the source after ${pass - 1} pass(es)`);
+				break;
+			}
+			for (const t of fresh) attempted.add(String(t.id));
+
+			const updates = { beastMode: [], variable: [] };
+			for (const template of fresh) {
+				const out = await handleTemplate(template);
+				if (out) updates[out.bucket].push(out.update);
+			}
+			for (const bucket of ['beastMode', 'variable']) {
+				for (let i = 0; i < updates[bucket].length; i += 100) {
+					const chunk = updates[bucket].slice(i, i + 100);
+					await safe(`bulk update ${bucket} ${i + 1}-${i + chunk.length}`, () => api.post(bulkUrl, { update: chunk }), {
+						ids: chunk.map((u) => u.id)
+					});
+				}
+				transferred[bucket].push(...updates[bucket].map((u) => u.id));
+			}
 		}
 	}
 
-	return {
-		transferred: [...transferred.beastMode, ...transferred.variable],
-		deletedBeastModes: deleted.beastMode,
-		deletedVariables: deleted.variable,
-		beastModes: transferred.beastMode,
-		variables: transferred.variable
-	};
+	return buildResult();
 }
 
 async function transferGoals(fromUserId, toUserId, filteredIds, { dryRun }) {
@@ -2696,6 +2821,113 @@ async function uploadDataFile(buffer, filename, mimeType) {
 		},
 		{ filename }
 	);
+}
+
+// Re-read every transferred object and confirm the owner actually moved. Domo
+// reports success on the write call, and the search index that discovery uses lags
+// behind ownership writes by minutes, so "the command said 75" and "75 objects
+// changed hands" are different claims. This checks the second one, per object,
+// against the live API.
+//
+// Only types with a known, cheap per-object owner read are checked; anything else
+// is reported as unverified rather than quietly counted as fine.
+async function verifyTransfers({ transferredByType, toUserId, toOwnerType, fromUserId, keepPreviousOwner }) {
+	const expectOldOwnerGone = Boolean(fromUserId) && !keepPreviousOwner;
+	const want = String(toUserId);
+
+	// Each reader returns the current owner ids for one object, or null when the
+	// object could not be found at all.
+	const readFunctionOwner = async (id) => {
+		const t = await api.get(`/query/v1/functions/template/${id}?hidden=true`);
+		const owner = t.owner && t.owner.id != null ? t.owner.id : t.owner;
+		return owner == null ? [] : [String(owner)];
+	};
+	const readers = {
+		'app-studio': async (id) => {
+			const a = await api.get(`/content/v1/dataapps/${id}`);
+			return (a.owners || []).map((o) => String(o.id));
+		},
+		'beast-mode': readFunctionOwner,
+		card: async (id) => {
+			const res = await api.get(`/content/v1/cards?urns=${id}&parts=owners`);
+			const arr = Array.isArray(res) ? res : res.cards || [];
+			if (arr.length === 0) return null;
+			return (arr[0].owners || []).map((o) => String(o.id));
+		},
+		dataflow: async (id) => {
+			const df = await api.get(`/dataprocessing/v1/dataflows/${id}`);
+			return df.responsibleUserId == null ? [] : [String(df.responsibleUserId)];
+		},
+		dataset: async (id) => {
+			const d = await api.get(`/data/v3/datasources/${id}?includeAllDetails=false`);
+			const owner = d.owner && d.owner.id != null ? d.owner.id : d.ownerId;
+			return owner == null ? [] : [String(owner)];
+		},
+		page: async (id) => {
+			const p = await api.get(`/content/v1/pages/${id}`);
+			return (p.owners || []).map((o) => String(o.id));
+		},
+		variable: readFunctionOwner
+	};
+
+	console.log('\n=== verify ===');
+	activeType = 'verify';
+	let confirmed = 0;
+	const problems = [];
+	const unverified = [];
+
+	for (const [type, ids] of Object.entries(transferredByType)) {
+		if (!ids || ids.length === 0) continue;
+		const read = readers[type];
+		if (!read) {
+			unverified.push({ type, count: ids.length });
+			continue;
+		}
+		// A GROUP destination lands as a group id in the owner list for the types that
+		// accept one, so the same identity check covers both kinds of owner.
+		let ok = 0;
+		for (const id of ids) {
+			let owners;
+			try {
+				owners = await read(String(id));
+			} catch (err) {
+				problems.push({ type, id: String(id), issue: `could not re-read: ${err.message.slice(0, 120)}` });
+				continue;
+			}
+			if (owners === null) {
+				problems.push({ type, id: String(id), issue: 'object not found after transfer' });
+			} else if (owners.length === 0) {
+				problems.push({ type, id: String(id), issue: 'OWNERLESS after transfer' });
+			} else if (!owners.includes(want)) {
+				problems.push({
+					type,
+					id: String(id),
+					issue: `new owner ${toOwnerType} ${want} absent; owners are ${owners.join('|')}`
+				});
+			} else if (expectOldOwnerGone && owners.includes(String(fromUserId))) {
+				problems.push({
+					type,
+					id: String(id),
+					issue: `previous owner ${fromUserId} still present; owners are ${owners.join('|')}`
+				});
+			} else {
+				ok++;
+				confirmed++;
+			}
+			await new Promise((r) => setTimeout(r, 60));
+		}
+		console.log(`  ${type}: ${ok}/${ids.length} confirmed`);
+	}
+
+	for (const u of unverified) console.log(`  ${u.type}: ${u.count} transferred, not verifiable by --verify`);
+	if (problems.length > 0) {
+		console.log(`  ⚠ ${problems.length} problem(s):`);
+		for (const p of problems.slice(0, 20)) console.log(`      ${p.type} ${p.id}: ${p.issue}`);
+		if (problems.length > 20) console.log(`      ...and ${problems.length - 20} more (see run log)`);
+	} else {
+		console.log('  no discrepancies');
+	}
+	return { confirmed, problems, unverified };
 }
 
 _main().catch((err) => {

@@ -144,7 +144,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-revoke-access-tokens` | Revoke developer access tokens by ID, CSV, owner, expiration, or deleted owner |
 | `bulk-unshare-content` | Unshare content in bulk |
 | `bulk-share-content` | Share content (cards, datasets, pages, dataflows) with users/groups |
-| `bulk-transfer-ownership` | Transfer ownership of a user's content (datasets, cards, pages, etc.) to a new owner — a user or a group — either all discovered from the user, from a CSV (per-row owner id + USER/GROUP type supported), or an ad-hoc list of IDs via `--id`/`--ids` |
+| `bulk-transfer-ownership` | Transfer ownership of a user's content (datasets, cards, pages, etc.) to a new owner — a user or a group — either all discovered from the user, from a CSV (per-row owner id + USER/GROUP type supported), or an ad-hoc list of IDs via `--id`/`--ids`. `--verify` re-reads every transferred object afterwards to confirm the owner actually moved; beast-mode link pruning (which can delete a formula) is opt-in via `--prune-invalid-functions` |
 | `bulk-update-column-pdp-policy` | Update users/groups on a column-based PDP policy |
 | `bulk-update-stream-schedules` | Change stream schedules to daily (randomized times), manual, or restore arbitrary schedules from a CSV (`--mode from-file`) |
 | `bulk-update-stream-update-method` | Change stream update mode from Replace to Append |
@@ -156,6 +156,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `replace-function-references` | Replace every reference to one beast mode / variable with another across the instance — rewrites the formula and links of each function that nests it, then saves in batches |
 | `run-workflow-from-csv` | Convert a CSV to workflow input format and run a Domo workflow |
 | `swap-input-in-dataflows` | Replace a dataset input across all consuming dataflows |
+| `transfer-beast-modes-to-content-owners` | Transfer a user's beast modes to whoever owns the card or dataset each one lives on. Because a beast mode cannot be group-owned, a group-owned resource falls through a cascade: the producing dataflow's owner when the dataset is a dataflow output, else the departing user's manager if they are in the group, else the group member owning the most beast modes (ties go to the older account). `--dry-run` plus `--output` writes the full routing plan to a CSV for review; `--verify` re-reads every beast mode afterwards |
 | `transfer-stream` | Copy a stream (and its input dataset) from one instance to another |
 | `upload-dataset` | Upload CSV data to a dataset in configurable batches |
 

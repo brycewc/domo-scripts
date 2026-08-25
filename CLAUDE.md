@@ -15,7 +15,11 @@ node cli.js --help                    # List all available commands
 node cli.js <command> --help          # Command-specific options
 ```
 
-There is no build step, test suite, or linter configured.
+There is no build step or test suite. Linting is configured: `yarn lint` (eslint with
+`eslint-plugin-perfectionist`, which enforces alphabetical module ordering in `commands/`) and
+`yarn lint:fix`. Run `yarn lint` after editing a command. Prettier is **not** part of this project:
+there is no config and it is not a dependency, so running it reformats whole files away from the
+house style (tabs, single quotes).
 
 ### Example Invocations
 

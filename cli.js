@@ -29,6 +29,7 @@ const commands = {
 	'replace-function-references': './commands/replace-function-references',
 	'extract-card-ids': './commands/extract-card-ids',
 	'swap-input-in-dataflows': './commands/swap-input-in-dataflows',
+	'transfer-beast-modes-to-content-owners': './commands/transfer-beast-modes-to-content-owners',
 	'transfer-stream': './commands/transfer-stream',
 	'upload-dataset': './commands/upload-dataset'
 };
