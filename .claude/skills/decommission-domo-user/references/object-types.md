@@ -175,7 +175,7 @@ dataflows.
 ## App designs
 
 - **Enumerate:** `GET /apps/v1/designs?checkAdminAuthority=true&deleted=false&limit=&offset=`, filtered by `owner`. Per-id lookups 404 for apps you do not own, so never use them to test existence.
-- **Transfer:** `PUT /api/apps/v1/designs/{designId}/transfer-owner` with `{"newOwner": "<userId>"}`. May not be deployed on your instance; see the traps file. Fallback is an ADMIN permission grant, which does not move `owner`.
+- **Transfer:** `PUT /apps/v1/designs/{designId}/transfer-owner` with `{"newOwner": "<userId>"}` (no `/api` prefix through `lib/api.js`). Confirmed working 2026-09-01. `bulk-transfer-ownership --object-types custom-app --verify` now uses it; the old ADMIN-grant fallback does **not** move `owner` and is reported separately. See the traps file.
 - **Routing:** resolve every instance id on cards, join on `designId`, and take the deploying card's owner. A design that no card deploys has no evidence-based destination and needs a named owner chosen by hand, or deleting.
 
 ## Datastore records

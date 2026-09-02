@@ -105,8 +105,9 @@ Optional:
                        the new owner is present (and the previous owner gone, unless
                        --keep-previous-owner). Reports anything that did not move, was
                        left ownerless, or vanished. Verifiable types: card, page,
-                       app-studio, beast-mode, variable, dataset, dataflow; others are
-                       reported as unverified rather than assumed fine. Skipped on a dry run.
+                       app-studio, beast-mode, variable, dataset, dataflow, custom-app;
+                       others are reported as unverified rather than assumed fine.
+                       Skipped on a dry run.
   --prune-invalid-functions
                        Beast modes/variables only. Inspect each formula's links and
                        DELETE the formula when every link is dead, or when a visible link
@@ -139,6 +140,10 @@ Notes:
     dataflow's input datasets (direct USER grant or inherited via group membership). Any
     input they can't reach is shared with them directly (see --input-access-level).
   - "publication" is never actually transferred (platform limitation); it is only reported.
+  - "custom-app" moves ownership with PUT /apps/v1/designs/{id}/transfer-owner. Where that
+    endpoint is not deployed it falls back to an ADMIN permission grant, which does NOT
+    move "owner". Those designs are counted separately and called out as
+    "got only an ADMIN grant"; they are not reported as transferred.
   - "approval" and "template" only discover from the --from-user; they ignore filtered IDs.
   - "goal" only discovers from the --from-user; it ignores filtered IDs.
   - When --from-user is omitted, "approval", "template", and "goal" cannot be processed.`;
@@ -1681,13 +1686,23 @@ async function transferCustomApps(fromUserId, toUserId, filteredIds, { dryRun })
 	if (dryRun) return { transferred: ownedByUser, bricks, proCodeApps };
 
 	const transferred = [];
+	const adminGrantOnly = [];
 	for (const id of ownedByUser) {
-		const res = await attempt(`grant admin to new owner on app ${id}`, () =>
+		const res = await attempt(`transfer app design ${id}`, () =>
+			api.put(`/apps/v1/designs/${id}/transfer-owner`, { newOwner: String(toUserId) })
+		);
+		if (res.ok) {
+			transferred.push(id);
+			continue;
+		}
+		// An ADMIN grant does NOT move `owner`, so these are reported separately
+		// rather than counted as transfers.
+		const granted = await attempt(`grant admin to new owner on app ${id}`, () =>
 			api.post(`/apps/v1/designs/${id}/permissions/ADMIN`, [toUserId])
 		);
-		if (res.ok) transferred.push(id);
+		if (granted.ok) adminGrantOnly.push(id);
 	}
-	return { transferred, bricks, proCodeApps };
+	return { transferred, adminGrantOnly, bricks, proCodeApps };
 }
 
 async function transferDataflows(fromUserId, toUserId, filteredIds, { dryRun, fromUserName, inputAccessLevel }) {
@@ -1931,8 +1946,12 @@ async function transferForUser({ ctx, objectsByType, requestedTypes, logger, sum
 			if (transferred.length) transferredByType[type] = transferred;
 			const typeErrors = failures.slice(errStart);
 			logger.addResult({ type, toUserId, transferred, errors: typeErrors, details: res });
-			if (typeErrors.length) console.log(`  ⚠ ${typeErrors.length} error(s) logged — see run log`);
+			if (typeErrors.length) console.log(`  ⚠ ${typeErrors.length} error(s) logged, see run log`);
 			console.log(`  → ${transferred.length} transferred`);
+			const grantOnly = (res && res.adminGrantOnly) || [];
+			if (grantOnly.length) {
+				console.log(`  ⚠ ${grantOnly.length} got only an ADMIN grant, ownership did NOT move`);
+			}
 		} catch (err) {
 			console.error(`  ✗ ${type} failed: ${err.message}`);
 			addTotal(type, 0);
@@ -2853,6 +2872,11 @@ async function verifyTransfers({ transferredByType, toUserId, toOwnerType, fromU
 			const arr = Array.isArray(res) ? res : res.cards || [];
 			if (arr.length === 0) return null;
 			return (arr[0].owners || []).map((o) => String(o.id));
+		},
+		'custom-app': async (id) => {
+			const d = await api.get(`/apps/v1/designs/${id}`);
+			if (!d || d.id == null) return null;
+			return d.owner == null ? [] : [String(d.owner)];
 		},
 		dataflow: async (id) => {
 			const df = await api.get(`/dataprocessing/v1/dataflows/${id}`);

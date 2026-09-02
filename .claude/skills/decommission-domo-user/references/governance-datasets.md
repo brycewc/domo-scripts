@@ -66,6 +66,13 @@ Two more things worth pulling from the same place, since they answer questions n
 Notes: string literals need single quotes (double quotes are read as identifiers), and unbounded
 `COUNT(*)` over 184M rows times out — always bound with a date predicate.
 
+**Not every column that looks like a count is one.** `GOLD | MajorDomo | DataSets`.`PDP` is the
+string `'Yes'`/`'No'`, and the engine happily evaluates `'No' > 0` as true, so a numeric filter
+silently matches the entire table. `GROUP BY` a column once before filtering on it, and treat a
+control test that matches *every* row as failed, not passed. Result keys also do not preserve
+alias casing (`AS pdp` comes back as `PDP`), so read them case-insensitively. Full write-up in
+[api-traps.md](api-traps.md).
+
 ## Cautions
 
 - **Check coverage before reading a zero as absence.** Query `MIN`/`MAX` of the timestamp column and the row count first. Two card datasets exist with different windows and different type coverage, and picking the wrong one silently returns no events for app cards.

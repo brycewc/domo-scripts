@@ -14,6 +14,49 @@ wrong answer causes. Anything marked **SILENT** gives no error, just a wrong res
 | `Last Non-Owner Viewed Timestamp` | Excludes the *owner*, not the operator running the cleanup. Your own API poking can land in it. |
 | `GOLD \| MajorDomo \| Pages`.`Owner ID` | **SILENT.** Blank for multi-owner pages, exactly like the Accounts dataset. Filtering it by owner returned **0 of one account's 4 pages**, all of which were co-owned. Use `pages/adminsummary` for page ownership. |
 | Card search index `owned_by_id` | Correct, but **lags ownership writes**. Straight after a transfer it reported **13 cards still owned by the source when only 2 remained**. Fine for discovery, useless as post-execution verification. |
+| `GOLD \| MajorDomo \| DataSets`.`PDP` | **SILENT.** It is the **string `'Yes'`/`'No'`, not a count.** See below: this one also defeats the usual control test. |
+
+## The query engine compares strings to numbers without complaining
+
+**`WHERE <string column> > 0` is true for every row**, so a numeric test against a text
+column returns the whole table instead of erroring. This is the one trap so far that
+**defeats the standard control test**, because the control comes back looking healthy.
+
+The case that caused it: `GOLD | MajorDomo | DataSets`.`PDP` holds `'Yes'` / `'No'`, not a
+count. Reading it as a number produced both halves of a wrong answer at once:
+
+```sql
+-- the control, meant to prove the column is populated. Returns 41,594 of 41,594.
+-- It looks like a pass. It is 'No' > 0 evaluating true for every row.
+SELECT SUM(CASE WHEN `PDP` > 0 THEN 1 ELSE 0 END), COUNT(*) FROM table
+
+-- correct
+SELECT `PDP`, COUNT(*) FROM table GROUP BY 1     -- {'No': 39463, 'Yes': 2131}
+SELECT ... FROM table WHERE `PDP` = 'Yes'
+```
+
+Meanwhile the per-row read said **0 of 364** datasets had PDP, and the two answers were
+never reconciled because each looked plausible on its own. The truth was **23**, every one
+of them a live, heavily-consumed dataset carrying row-level security that deleting would
+silently discard.
+
+Two rules that would have caught it:
+
+- **`GROUP BY` a column before you filter on it.** One query shows the domain and the type.
+  Do this for any column you are about to treat as a count, especially the dependency
+  columns on the governance DataSets table.
+- **A control test has to be able to fail.** "Every row in the instance matches" is not a
+  pass, it is the same shape as a filter being ignored (see `cards/adminsummary`). When a
+  control returns *everything*, treat it exactly as suspiciously as one returning *nothing*.
+
+### Result keys do not keep the casing of your alias
+
+`SELECT \`PDP\` AS pdp` comes back keyed **`PDP`**, so `row.pdp` is `undefined`, which then
+reads as a clean zero. Match result keys case-insensitively rather than trusting the alias:
+
+```js
+const get = (o, k) => { const kk = Object.keys(o).find((x) => x.toLowerCase() === k.toLowerCase()); return kk ? o[kk] : undefined; };
+```
 
 ## Endpoints that 404 or return empty without meaning "gone"
 
@@ -151,11 +194,26 @@ Dataflows fail the opposite way: `if (res.id)` reports every deleted dataflow as
 - **The AppDB collection transfer endpoint is named `disableSyncToDataset`.** `PUT /datastores/v1/collections/{id}` with `{id, owner}` transfers ownership, but the operation name and its `schema` body field suggest it wipes the schema or breaks the dataset sync. It does neither; test it on an unsynced collection and then a low-risk synced one before touching anything that matters.
 - **App instance transfer replaces the whole object.** `PUT /apps/v1/instances/{id}` needs the full body with `owner` swapped, or the mappings are lost. Diff every mapping afterwards (`datasetsMapping`, `collectionsMapping`, `databasesMapping`, `accountsMapping`, `actionsMapping`, `workflowsMapping`, `packagesMapping`) plus `disabled` and `designId`.
 - **Datastore ownership cannot be changed. SILENT.** `PUT /datastores/v1/{id}` accepts an owner field, returns 200, and ignores it. The documented `updateDatastore` body only takes `name`. Whether deleting the user cascades into its datastores is unresolved and worth confirming with Domo, since it would take the collections with it.
-- **App design ownership needs a purpose-built endpoint that may not be deployed.**
+- **App design ownership: the purpose-built endpoint works, as of 2026-09.**
   ```
-  PUT /api/apps/v1/designs/{designId}/transfer-owner   {"newOwner": "<userId>"}
+  PUT /apps/v1/designs/{designId}/transfer-owner   {"newOwner": "<userId>"}
   ```
-  Optional `?parts=owners,creator`. It grants `READ_WRITE_DELETE_SHARE_ADMIN` to the new owner first and only then revokes it from the old one, so the last-owner guard never trips, and it writes an audit record. Auth is APP_ADMIN authority or ADMIN permission on the design. As of 2026-08 it **404s on `domo.domo.com`** for every path variant, with Spring's `No static resource ... for request` body, while sibling sub-paths (`.../has-thumbnail`, `.../versions`) return 200. Re-test after a release rather than reaching for a workaround. `updateDesign` only accepts `name` and `description`; the CLI's fallback is `POST /apps/v1/designs/{id}/permissions/ADMIN` with `[toUserId]`, which grants management rights but leaves `owner` alone.
+  Confirmed working on `domo.domo.com` on 2026-09-01 across 108 designs, each verified by
+  re-reading `owner`. **Note the path takes no `/api` prefix** when called through
+  `lib/api.js`, which adds one itself; `/api/apps/v1/...` is a 404, and that is most likely
+  what the earlier "404s for every path variant, as of 2026-08" note was actually seeing.
+  It grants `READ_WRITE_DELETE_SHARE_ADMIN` to the new owner first and only then revokes it
+  from the old one, so the last-owner guard never trips, and it writes an audit record.
+  Auth is APP_ADMIN authority or ADMIN permission on the design. Optional
+  `?parts=owners,creator`.
+
+  **The fallback is not a transfer.** `updateDesign` only accepts `name` and `description`,
+  and `POST /apps/v1/designs/{id}/permissions/ADMIN` with `[toUserId]` grants management
+  rights but leaves `owner` untouched. `bulk-transfer-ownership` used to call only that and
+  **print "108 transferred" while all 108 designs still belonged to the departing account**;
+  nothing but a follow-up inventory caught it. Fixed 2026-09-01: it now calls
+  `transfer-owner`, falls back to the ADMIN grant only on failure, reports those separately
+  as "got only an ADMIN grant", and `--verify` covers `custom-app`.
 
 ## Object model surprises
 
