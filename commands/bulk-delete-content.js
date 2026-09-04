@@ -15,6 +15,8 @@
  *   variable     POST   /query/v1/functions/bulk/template { delete: [...] } (bulk)
  *   page         DELETE /content/v1/pages/{id}                             (per-item)
  *   alert        DELETE /social/v4/alerts/{id}                             (per-item)
+ *   scheduled-report
+ *                DELETE /content/v1/reportschedules/{id}                   (per-item)
  *   app-studio   DELETE /content/v1/dataapps/{appId}                       (per-item)
  *   worksheet    DELETE /content/v1/dataapps/{id}                          (per-item)
  *   custom-app   DELETE /apps/v1/designs/{id}                              (per-item)
@@ -102,14 +104,15 @@
  *                    remaining way to find them — and is counted as an error.
  *   --dry-run        Preview which objects would be deleted without deleting
  *
- * Types are deleted in a fixed dependency-safe order (alert, card, page,
- * app-studio, worksheet, custom-app, code-engine, jupyter, ai-project, ai-model,
- * workflow, project-task, project, beast-mode, variable, goal, metric, fileset,
- * dataset, dataflow, account, collection, group, workspace) so dependents go
- * before what they reference (beast modes, variables, goals, metrics and filesets
- * before the datasets they sit on). workspace is last because a workspace can
- * contain any other content, so everything it holds is deleted first. Deletes
- * within a single type run concurrently; types do not overlap.
+ * Types are deleted in a fixed dependency-safe order (alert, scheduled-report,
+ * card, page, app-studio, worksheet, custom-app, code-engine, jupyter,
+ * ai-project, ai-model, workflow, project-task, project, beast-mode, variable,
+ * goal, metric, fileset, dataset, dataflow, account, collection, group,
+ * workspace) so dependents go before what they reference (beast modes,
+ * variables, goals, metrics and filesets before the datasets they sit on).
+ * workspace is last because a workspace can contain any other content, so
+ * everything it holds is deleted first. Deletes within a single type run
+ * concurrently; types do not overlap.
  */
 
 const { api, readCSV, createLogger, showHelp } = require('../lib');
@@ -123,9 +126,9 @@ Routes each row to the correct DELETE endpoint by object type. Consumes the CSV
 that bulk-list-user-content emits ("Object Type" + "Object ID" columns).
 
 Supported types: dataflow, card, dataset, group, beast-mode, variable, page,
-alert, app-studio, worksheet, custom-app, code-engine, jupyter, ai-project,
-ai-model, workflow, project, project-task, goal, metric, fileset, collection,
-account, workspace.
+alert, scheduled-report, app-studio, worksheet, custom-app, code-engine,
+jupyter, ai-project, ai-model, workflow, project, project-task, goal, metric,
+fileset, collection, account, workspace.
 (Users are not handled here — use bulk-delete-users.)
 
 ID source:
@@ -149,11 +152,12 @@ Optional:
                    rather than deleted without its outputs.
   --dry-run        Preview without deleting
 
-Types are deleted in a fixed dependency-safe order: alert, card, page,
-app-studio, worksheet, custom-app, code-engine, jupyter, ai-project, ai-model,
-workflow, project-task, project, beast-mode, variable, goal, metric, fileset,
-dataset, dataflow, account, collection, group, workspace. workspace is last
-because a workspace can contain any other content, so its contents go first.
+Types are deleted in a fixed dependency-safe order: alert, scheduled-report,
+card, page, app-studio, worksheet, custom-app, code-engine, jupyter,
+ai-project, ai-model, workflow, project-task, project, beast-mode, variable,
+goal, metric, fileset, dataset, dataflow, account, collection, group,
+workspace. workspace is last because a workspace can contain any other content,
+so its contents go first.
 Deletes within a type run concurrently; types never overlap.
 
 Objects already gone (HTTP 404/410) are reported as "already gone" and skipped,
@@ -171,6 +175,8 @@ activity-log labels emitted by bulk-list-user-content are accepted too:
                caveat as beast-mode
   page         (PAGE)
   alert        (ALERT)
+  scheduled-report
+               (REPORT_SCHEDULE, report-schedule) — emailed report schedules
   app-studio   (DATA_APP, data-app)
   worksheet    (WORKSHEET) — dataapps; same endpoint as app-studio
   custom-app   (RYUU_APP, app, ryuu)
@@ -214,6 +220,7 @@ const TYPE_ALIASES = {
 	page: ['page'],
 	project: ['project'],
 	'project-task': ['project-task'],
+	'scheduled-report': ['scheduled-report', 'report-schedule'],
 	variable: ['variable'],
 	workflow: ['workflow', 'workflow-model'],
 	worksheet: ['worksheet'],
@@ -286,6 +293,12 @@ const DELETERS = {
 	alert: {
 		label: 'alert',
 		single: (id) => api.del(`/social/v4/alerts/${id}`)
+	},
+	'scheduled-report': {
+		// Emailed report schedules (activity-log REPORT_SCHEDULE), the same resource
+		// bulk-transfer-ownership rehomes via PUT /content/v1/reportschedules/{id}.
+		label: 'scheduled report',
+		single: (id) => api.del(`/content/v1/reportschedules/${id}`)
 	},
 	'app-studio': {
 		label: 'app studio app',
@@ -391,8 +404,9 @@ const DELETERS = {
 };
 
 // Order types are deleted in. This is dependency-safe, not cosmetic: dependents
-// are removed before the things they reference (e.g. alerts before the cards and
-// datasets they watch, cards/pages/apps/notebooks and beast modes/variables/
+// are removed before the things they reference (e.g. alerts and scheduled
+// reports before the cards and pages they watch or email,
+// cards/pages/apps/notebooks and beast modes/variables/
 // goals/metrics/filesets before the datasets they sit on, datasets before the
 // dataflows that produce them, project tasks before
 // their parent project — which would otherwise take the tasks with it and 404
@@ -404,6 +418,7 @@ const DELETERS = {
 // concurrently.
 const TYPE_ORDER = [
 	'alert',
+	'scheduled-report',
 	'card',
 	'page',
 	'app-studio',

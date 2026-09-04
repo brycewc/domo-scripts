@@ -209,7 +209,6 @@ but they change what "clean" means and one of them mails people.
 
 | Type | How it shows up | What to do |
 |---|---|---|
-| Report schedule | `Report Schedule` + `Emailed` rows in the Activity Log. **The inventory does not scan these at all** (discovery needs a domostats dataset) | Identify recipients and rehome or cancel. A schedule owned by a dormant account keeps sending. `/content/v1/reportschedules/{id}` 404s, as do `/reportschedules/v1/{id}` and `/content/v1/schedules/{id}`, so this currently needs the UI |
 | Approval | `Approval` rows, often named after the person ("Quarterly No Side Agreement Certification: X") | Not a transferable asset. Let an in-flight one close or cancel it |
 | Queue task | `Queue Task` rows with ids like `07OCT25_HKG1H4` | Single-owner; no transfer path exercised yet |
 | Workflow execution | `Workflow Execution` rows | Execution records, not assets |
