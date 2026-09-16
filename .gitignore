@@ -3,6 +3,7 @@ node_modules/
 .env.*
 !.env.example
 logs
+exports/
 id-mappings/
 .yarn/*
 !.yarn/patches
