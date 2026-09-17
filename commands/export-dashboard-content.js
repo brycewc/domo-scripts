@@ -24,6 +24,7 @@
  *   --height             Render height in px (default: 1116)
  *   --locale             Locale passed to the renderer (default: en-US)
  *   --clear              Delete each page folder before writing into it
+ *   --skip-existing      Reuse any artifact already on disk instead of redoing it
  *   --no-subpages        Only export the root page, not its subpages
  *   --no-card-pdf        Skip the per-card PDF
  *   --no-card-image      Skip the per-card PNG
@@ -33,6 +34,7 @@
  *   --no-page-ppt        Skip the whole-page PowerPoint deck
  *   --no-documents       Skip downloading doc/image card files and notebook attachments
  *   --no-datasets        Skip dataset exports
+ *   --defrost-timeout    Minutes to wait for a vaulted dataset to thaw
  *   --dry-run            List what would be exported without downloading
  */
 
@@ -77,6 +79,11 @@ Optional:
                          renamed or removed in Domo. Only page folders are
                          touched: datasets/, README.md and anything else in the
                          output directory survive
+  --skip-existing        Reuse anything already on disk instead of exporting it
+                         again, so a killed run can be resumed. Cannot be
+                         combined with --clear. A dataset only counts as done
+                         once its download finished, since it streams to a
+                         .partial file and is renamed on completion
   --no-subpages          Only the root page, no recursion
   --no-card-pdf          Skip per-card PDFs
   --no-card-image        Skip per-card PNGs
@@ -85,6 +92,9 @@ Optional:
   --no-page-ppt          Skip whole-page PowerPoint decks
   --no-documents         Skip doc/image card files and notebook attachments
   --no-datasets          Skip dataset exports
+  --defrost-timeout <m>  Minutes to wait for a vaulted dataset to thaw after
+                         asking Domo to defrost it (default: 30). 0 asks for no
+                         defrost at all and lets the export fail
   --dry-run              List what would be exported without downloading
   --help                 Show this help
 
@@ -104,13 +114,21 @@ Notes:
     distinct cards whose renders come out byte-identical is listed under
     "Suspect renders" at the end of the run.
   - Dataset exports are not row-capped. A dashboard sitting on large datasets
-    can produce very large files and run for a long time.`;
+    can produce very large files and run for a long time.
+  - Domo vaults a dataset nobody has queried in a while, and every query against
+    a vaulted dataset fails. When an export fails on one, the defrost the Domo
+    UI offers is requested, the dataset is polled until it thaws, and the export
+    is retried once. Defrosting leaves the dataset queryable in Domo afterwards.`;
 
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const CSV_MIME = 'text/csv';
 const FILE_CARD_TYPES = new Set(['document', 'image']);
 const RENDER_TIMEOUT_MS = 180000;
 const PPT_TIMEOUT_MS = 600000;
+// cryoStatus on a dataset: VAULT is cold storage, ADRENALINE is queryable.
+const VAULTED_STATUS = 'VAULT';
+const DEFROST_POLL_MS = 15000;
+const DEFAULT_DEFROST_MINUTES = 30;
 // 50 ids is roughly a 550 character URL, well inside any limit, and costs one
 // request per page for all but the largest dashboards.
 const CARD_DATASET_CHUNK = 50;
@@ -247,6 +265,15 @@ async function pngToPdf(pngBytes) {
   return Buffer.from(await doc.save());
 }
 
+/** A zero-byte file is the fingerprint of a killed write, so it does not count. */
+function isComplete(destPath) {
+  try {
+    return fs.statSync(destPath).size > 0;
+  } catch {
+    return false;
+  }
+}
+
 function writeRender(bytes, destPath) {
   fs.mkdirSync(path.dirname(destPath), { recursive: true });
   fs.writeFileSync(destPath, bytes);
@@ -328,7 +355,7 @@ function dataFileRefs(card) {
   return [{ fileId, revisionId }];
 }
 
-async function downloadCardFile(ref, cardTitle, destDir, prefix) {
+async function downloadCardFile(ref, cardTitle, destDir, prefix, skipExisting) {
   const filePath = ref.revisionId ? `/data/v1/data-files/${ref.fileId}/revisions/${ref.revisionId}` : `/data/v1/data-files/${ref.fileId}`;
 
   let details = null;
@@ -338,6 +365,13 @@ async function downloadCardFile(ref, cardTitle, destDir, prefix) {
     // Details are a nicety; the download's Content-Disposition is the fallback.
   }
   const name = details && details.name;
+
+  // The final name comes from the file's own record, so a resumable check is
+  // only possible once details are in hand.
+  if (skipExisting && name) {
+    const existing = path.join(destDir, `${prefix}_${safeName(name, `file_${ref.fileId}`)}`);
+    if (isComplete(existing)) return { path: existing, bytes: fs.statSync(existing).size, reused: true };
+  }
 
   const tempPath = path.join(destDir, `${prefix}_${ref.fileId}.download`);
   let result;
@@ -403,14 +437,64 @@ async function fetchCardDatasets(cardIds) {
   return byCard;
 }
 
-async function exportDataset(dataset, destDir, format) {
-  const mime = format === 'csv' ? CSV_MIME : XLSX_MIME;
+function datasetPath(dataset, destDir, format) {
   const extension = format === 'csv' ? 'csv' : 'xlsx';
-  const fileName = `${safeName(dataset.name, 'dataset')}_${dataset.id}.${extension}`;
-  const destPath = path.join(destDir, fileName);
+  return path.join(destDir, `${safeName(dataset.name, 'dataset')}_${dataset.id}.${extension}`);
+}
+
+async function isVaulted(datasetId) {
+  try {
+    const details = await api.get(`/data/v3/datasources/${datasetId}`);
+    return !!details && details.cryoStatus === VAULTED_STATUS;
+  } catch {
+    // A failed status check must not replace whatever the export itself said.
+    return false;
+  }
+}
+
+// The defrost is asynchronous, so poll rather than retrying the export blind.
+async function defrostDataset(datasetId, timeoutMs) {
+  await api.post(`/data/ui/v3/datasources/${datasetId}/defrost`);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await delay(DEFROST_POLL_MS);
+    try {
+      const details = await api.get(`/data/v3/datasources/${datasetId}`);
+      if (details && details.cryoStatus !== VAULTED_STATUS) return true;
+    } catch {
+      // A blip while polling is no reason to abandon a defrost already underway.
+    }
+  }
+  return false;
+}
+
+async function exportDataset(dataset, destDir, format, defrostTimeoutMs) {
+  const mime = format === 'csv' ? CSV_MIME : XLSX_MIME;
+  const destPath = datasetPath(dataset, destDir, format);
+  const fileName = path.basename(destPath);
   const url = `${config.baseUrl}/query/v1/execute/export/${dataset.id}` + `?accept=${encodeURIComponent(mime)}&includeHeader=true&fileName=${encodeURIComponent(fileName)}`;
-  const result = await download(url, { headers: authHeaders() }, destPath);
-  return { path: destPath, bytes: result.bytes };
+
+  // Killing a multi-hour download must not leave a truncated file that
+  // --skip-existing would later mistake for a finished export.
+  const partialPath = `${destPath}.partial`;
+  async function attempt() {
+    const result = await download(url, { headers: authHeaders() }, partialPath);
+    fs.renameSync(partialPath, destPath);
+    return { path: destPath, bytes: result.bytes };
+  }
+
+  try {
+    return await attempt();
+  } catch (error) {
+    if (!defrostTimeoutMs || !(await isVaulted(dataset.id))) throw error;
+    const minutes = `${Math.round(defrostTimeoutMs / 60000)} min`;
+    console.log(`  Vaulted; defrosting and waiting up to ${minutes}`);
+    if (!(await defrostDataset(dataset.id, defrostTimeoutMs))) {
+      throw new Error(`still vaulted ${minutes} after a defrost was requested (export said: ${error.message})`);
+    }
+    console.log('  Defrosted; retrying export');
+    return { ...(await attempt()), defrosted: true };
+  }
 }
 
 async function getPageTree(pageId, includeSubpages, seen) {
@@ -528,6 +612,13 @@ function fileLink(label, relativePath) {
   return `[${label}](<${target}>)`;
 }
 
+/** A literal `|` in a dataset or page name would end the table cell early. */
+function mdCell(value) {
+  return String(value ?? '')
+    .replace(/\|/g, '\\|')
+    .replace(/\s*[\r\n]+\s*/g, ' ');
+}
+
 // Column order shared by both index formats. LINK_COLS are the 0-based indexes
 // turned into clickable hyperlinks in xlsx output.
 const INDEX_HEADER = [
@@ -607,7 +698,7 @@ function buildReadme(context) {
   lines.push(
     clearPages
       ? '- **Re-running on the same day** overwrites this folder in place. This run used `--clear`, so each page folder was deleted first and everything under the page folders below came from this run alone.'
-      : '- **Re-running on the same day** overwrites this folder in place. Files from an earlier run that day survive only if nothing replaced them, so a card renamed or removed in Domo can leave a stale file behind. Pass `--clear` to delete each page folder before writing into it.'
+      : '- **Re-running on the same day** overwrites this folder in place, redoing every render and download rather than picking up where it left off. Pass `--skip-existing` to reuse what is already here and resume instead, or `--clear` to delete each page folder and start clean.'
   );
   lines.push(`- **Instance:** \`${instance}.domo.com\``);
   lines.push(`- **Source:** ${isDataApp ? 'App Studio app' : 'Page'} \`${rootId}\`, <${rootUrl}>`);
@@ -658,7 +749,7 @@ function buildReadme(context) {
     lines.push('| --- | --- | --- |');
     for (const dataset of datasets) {
       const file = dataset.file ? `${fileLink(`datasets/${dataset.file}`, `datasets/${dataset.file}`)} (${formatBytes(dataset.bytes)})` : '_not exported_';
-      lines.push(`| ${dataset.name} | \`${dataset.id}\` | ${file} |`);
+      lines.push(`| ${mdCell(dataset.name)} | \`${dataset.id}\` | ${file} |`);
     }
     lines.push('');
   }
@@ -791,8 +882,23 @@ async function main() {
     process.exit(1);
   }
 
+  const rawDefrost = argv['defrost-timeout'];
+  const defrostMinutes = rawDefrost === undefined ? DEFAULT_DEFROST_MINUTES : Number(rawDefrost);
+  // A valueless flag arrives from minimist as true, which Number() reads as 1.
+  if (typeof rawDefrost === 'boolean' || !Number.isFinite(defrostMinutes) || defrostMinutes < 0) {
+    console.error(`Error: --defrost-timeout must be a non-negative number of minutes (got "${rawDefrost}")\n`);
+    process.exit(1);
+  }
+  const defrostTimeoutMs = Math.round(defrostMinutes * 60000);
+
   const dryRun = argv['dry-run'] || false;
   const clearPages = argv.clear || false;
+  const skipExisting = argv['skip-existing'] || false;
+
+  if (clearPages && skipExisting) {
+    console.error('Error: --clear and --skip-existing contradict each other (--clear deletes the files --skip-existing would reuse)\n');
+    process.exit(1);
+  }
   const includeSubpages = argv.subpages !== false;
   const wantCardPdf = argv['card-pdf'] !== false;
   const wantCardImage = argv['card-image'] !== false;
@@ -834,7 +940,9 @@ async function main() {
   console.log(`Page deck:   ${wantPagePpt ? 'ppt' : 'no'}`);
   console.log(`Doc files:   ${wantDocuments ? 'yes' : 'no'}`);
   console.log(`Datasets:    ${wantDatasets ? datasetFormat : 'no'}`);
-  console.log(`Clear first: ${clearPages ? 'yes (page folders are deleted before writing)' : 'no'}\n`);
+  console.log(`Defrost:     ${defrostMinutes > 0 ? `yes (wait up to ${defrostMinutes} min per vaulted dataset)` : 'no (a vaulted dataset fails)'}`);
+  console.log(`Clear first: ${clearPages ? 'yes (page folders are deleted before writing)' : 'no'}`);
+  console.log(`Skip existing: ${skipExisting ? 'yes (files already on disk are reused)' : 'no'}\n`);
 
   const logger = createLogger('exportDashboardContent', {
     debugMode: false,
@@ -847,7 +955,8 @@ async function main() {
       includeSubpages,
       datasetFormat,
       totalPages,
-      clearPages
+      clearPages,
+      defrostMinutes
     }
   });
 
@@ -865,6 +974,8 @@ async function main() {
   let skipCount = 0;
   let pageIndex = 0;
   let cardIndexRows = 0;
+  let reusedCount = 0;
+  let defrostedCount = 0;
 
   function record(entry) {
     logger.addResult(entry);
@@ -936,7 +1047,13 @@ async function main() {
       const deckCards = cards.filter((card) => !FILE_CARD_TYPES.has(card.type));
       const dropped = cards.length - deckCards.length;
 
-      if (deckCards.length === 0) {
+      if (skipExisting && isComplete(destPath)) {
+        console.log('  - Page deck already exported');
+        counts.pagePpt++;
+        reusedCount++;
+        pageReport.deck = { file: path.basename(destPath), cards: deckCards.length, excluded: dropped };
+        record({ kind: 'page-ppt', pageId: node.id, status: 'reused', path: destPath });
+      } else if (deckCards.length === 0) {
         console.log('  - Page deck skipped (no cards the export can render)');
         record({
           kind: 'page-ppt',
@@ -1025,15 +1142,20 @@ async function main() {
             continue;
           }
           try {
-            const result = await downloadCardFile(ref, title, cardsDir, prefix);
-            console.log(`    ✓ File (${result.bytes} bytes) → ${path.basename(result.path)}`);
+            const result = await downloadCardFile(ref, title, cardsDir, prefix, skipExisting);
+            if (result.reused) {
+              console.log(`    - File already exported → ${path.basename(result.path)}`);
+              reusedCount++;
+            } else {
+              console.log(`    ✓ File (${result.bytes} bytes) → ${path.basename(result.path)}`);
+            }
             counts.cardFile++;
             cardFiles.push(result.path);
             record({
               kind: 'card-file',
               cardId: card.id,
               pageId: node.id,
-              status: 'exported',
+              status: result.reused ? 'reused' : 'exported',
               path: result.path,
               bytes: result.bytes
             });
@@ -1046,7 +1168,13 @@ async function main() {
 
       if (!isFileCard && wantCardJson) {
         const jsonPath = path.join(cardsDir, `${prefix}_${title}.json`);
-        if (dryRun) {
+        if (skipExisting && isComplete(jsonPath)) {
+          console.log('    - Definition already exported');
+          counts.cardJson++;
+          reusedCount++;
+          cardFiles.push(jsonPath);
+          record({ kind: 'card-json', cardId: card.id, pageId: node.id, status: 'reused', path: jsonPath });
+        } else if (dryRun) {
           console.log(`    [DRY RUN] Would export definition → ${jsonPath}`);
           record({ kind: 'card-json', cardId: card.id, pageId: node.id, status: 'dry-run', path: jsonPath });
         } else {
@@ -1069,13 +1197,43 @@ async function main() {
       if (!isFileCard && (wantCardPdf || wantCardImage)) {
         const pngPath = path.join(cardsDir, `${prefix}_${title}.png`);
         const pdfPath = path.join(cardsDir, `${prefix}_${title}.pdf`);
+        const reusePng = wantCardImage && skipExisting && isComplete(pngPath);
+        const reusePdf = wantCardPdf && skipExisting && isComplete(pdfPath);
+        const needPng = wantCardImage && !reusePng;
+        const needPdf = wantCardPdf && !reusePdf;
 
-        if (dryRun) {
-          if (wantCardImage) {
+        for (const [reused, kind, destPath] of [
+          [reusePng, 'card-png', pngPath],
+          [reusePdf, 'card-pdf', pdfPath]
+        ]) {
+          if (!reused) continue;
+          console.log(`    - ${kind === 'card-png' ? 'PNG' : 'PDF'} already exported`);
+          if (kind === 'card-png') counts.cardImage++;
+          else counts.cardPdf++;
+          reusedCount++;
+          cardFiles.push(destPath);
+          record({ kind, cardId: card.id, pageId: node.id, status: 'reused', path: destPath });
+        }
+
+        // Hashing the reused PNG off disk keeps the blank-render check working
+        // on a resumed run, which would otherwise only see freshly drawn cards.
+        if (reusePng && !needPdf) {
+          trackDigest('render', crypto.createHash('sha256').update(fs.readFileSync(pngPath)).digest('hex'), {
+            cardId: card.id,
+            cardTitle: card.title,
+            pageId: node.id,
+            path: pngPath
+          });
+        }
+
+        if (!needPng && !needPdf) {
+          // Nothing left to draw for this card.
+        } else if (dryRun) {
+          if (needPng) {
             console.log(`    [DRY RUN] Would render PNG → ${pngPath}`);
             record({ kind: 'card-png', cardId: card.id, pageId: node.id, status: 'dry-run', path: pngPath });
           }
-          if (wantCardPdf) {
+          if (needPdf) {
             console.log(`    [DRY RUN] Would render PDF → ${pdfPath}`);
             record({ kind: 'card-pdf', cardId: card.id, pageId: node.id, status: 'dry-run', path: pdfPath });
           }
@@ -1090,14 +1248,14 @@ async function main() {
               path: pngPath
             });
 
-            if (wantCardImage) {
+            if (needPng) {
               const result = writeRender(png, pngPath);
               console.log(`    ✓ PNG (${result.bytes} bytes)`);
               counts.cardImage++;
               cardFiles.push(pngPath);
               record({ kind: 'card-png', cardId: card.id, pageId: node.id, status: 'exported', path: pngPath, bytes: result.bytes });
             }
-            if (wantCardPdf) {
+            if (needPdf) {
               const result = writeRender(await pngToPdf(png), pdfPath);
               console.log(`    ✓ PDF (${result.bytes} bytes)`);
               counts.cardPdf++;
@@ -1179,15 +1337,27 @@ async function main() {
     for (let i = 0; i < list.length; i++) {
       const dataset = list[i];
       console.log(`[${i + 1}/${list.length}] ${dataset.name} (${dataset.id})`);
+      const existingPath = datasetPath(dataset, datasetDir, datasetFormat);
+      if (skipExisting && isComplete(existingPath)) {
+        const bytes = fs.statSync(existingPath).size;
+        console.log(`  - Already exported (${formatBytes(bytes)})`);
+        counts.datasets++;
+        reusedCount++;
+        dataset.file = path.basename(existingPath);
+        dataset.bytes = bytes;
+        record({ kind: 'dataset', datasetId: dataset.id, datasetName: dataset.name, status: 'reused', path: existingPath, bytes });
+        continue;
+      }
       if (dryRun) {
         console.log(`  [DRY RUN] Would export as ${datasetFormat}`);
         record({ kind: 'dataset', datasetId: dataset.id, status: 'dry-run' });
         continue;
       }
       try {
-        const result = await exportDataset(dataset, datasetDir, datasetFormat);
-        console.log(`  ✓ Exported (${result.bytes} bytes)`);
+        const result = await exportDataset(dataset, datasetDir, datasetFormat, defrostTimeoutMs);
+        console.log(`  ✓ Exported (${result.bytes} bytes)${result.defrosted ? ', after defrosting' : ''}`);
         counts.datasets++;
+        if (result.defrosted) defrostedCount++;
         dataset.file = path.basename(result.path);
         dataset.bytes = result.bytes;
         record({
@@ -1196,7 +1366,8 @@ async function main() {
           datasetName: dataset.name,
           status: 'exported',
           path: result.path,
-          bytes: result.bytes
+          bytes: result.bytes,
+          defrosted: !!result.defrosted
         });
       } catch (error) {
         console.error(`  ✗ Export failed: ${error.message}`);
@@ -1294,6 +1465,8 @@ async function main() {
   console.log(`Card files:   ${counts.cardFile}`);
   console.log(`Datasets:     ${counts.datasets}`);
   console.log(`Index rows:   ${cardIndexRows}`);
+  console.log(`Reused:       ${reusedCount}`);
+  if (defrostedCount > 0) console.log(`Defrosted:    ${defrostedCount}`);
   console.log(`Skipped:      ${skipCount}`);
   console.log(`Suspect:      ${suspect.reduce((total, group) => total + group.cards.length, 0)}`);
   console.log(`Errors:       ${errorCount}`);
@@ -1303,6 +1476,8 @@ async function main() {
     ...counts,
     totalPages,
     cardIndexRows,
+    reusedCount,
+    defrostedCount,
     skipCount,
     suspectCount: suspect.reduce((total, group) => total + group.cards.length, 0),
     errorCount
