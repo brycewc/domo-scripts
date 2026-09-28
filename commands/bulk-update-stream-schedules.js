@@ -2,11 +2,12 @@
  * Bulk update Domo stream schedules
  *
  * Modes:
- *   daily  (default) — streams running more than once a day get changed to once daily
+ *   daily  (default) - streams running more than once a day get changed to once daily
  *                       at a random time within --start-hour/--end-hour. Manually
  *                       scheduled streams are skipped unless --include-manual is set.
- *   manual           — all streams in the input are set to MANUAL schedule
- *   from-file        — each stream is set to the schedule supplied in --file. The CSV
+ *   manual           - all streams in the input are set to MANUAL schedule. Streams
+ *                       that are already MANUAL are skipped.
+ *   from-file        - each stream is set to the schedule supplied in --file. The CSV
  *                       must contain a stream ID column plus at least one of
  *                       advancedScheduleJson or scheduleExpression. scheduleState
  *                       defaults to ACTIVE so the schedule actually fires; provide
@@ -575,13 +576,22 @@ async function main() {
 				const reason = isManual
 					? 'is MANUAL (use --include-manual to convert)'
 					: `type "${parsedCurrent.type}" does not run more than once a day`;
-				console.log(`  Skipped — schedule ${reason}\n`);
+				console.log(`  Skipped: schedule ${reason}\n`);
+				entry.status = 'skipped';
+				if (debugLog) debugLog.skipped = true;
+				skipCount++;
+			} else if (
+				mode === 'manual' &&
+				isManual &&
+				streamDefinition.scheduleState === 'MANUAL'
+			) {
+				console.log('  Skipped: schedule is already MANUAL\n');
 				entry.status = 'skipped';
 				if (debugLog) debugLog.skipped = true;
 				skipCount++;
 			} else if (mode === 'from-file' && !fileSchedule) {
 				console.log(
-					`  Skipped — no schedule found in file for stream ${streamId}\n`
+					`  Skipped: no schedule found in file for stream ${streamId}\n`
 				);
 				entry.status = 'skipped';
 				if (debugLog) debugLog.skipped = true;
@@ -686,14 +696,15 @@ async function main() {
 		}
 	}
 
-	const skipLabel =
-		mode === 'from-file'
-			? 'Skipped (no schedule in file)'
-			: 'Skipped (already daily or less frequent)';
+	const skipLabels = {
+		daily: 'Skipped (already daily or less frequent)',
+		'from-file': 'Skipped (no schedule in file)',
+		manual: 'Skipped (already manual)'
+	};
 	console.log('=== Summary ===');
 	console.log(`Total streams processed: ${streamIds.length}`);
 	console.log(`Successfully updated: ${successCount}`);
-	console.log(`${skipLabel}: ${skipCount}`);
+	console.log(`${skipLabels[mode]}: ${skipCount}`);
 	console.log(`Errors: ${errorCount}`);
 
 	logger.writeRunLog({ successCount, skipCount, errorCount });
