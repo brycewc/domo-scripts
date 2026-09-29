@@ -16,12 +16,16 @@
  *   node cli.js bulk-unshare-content --file "card-ids.json" --user "1250228141" --content-type "card"
  *   node cli.js bulk-unshare-content --file "dataset-ids.json" --group "12345" --content-type "dataset"
  *
+ *   # Comma-separated IDs, no file (requires --content-type)
+ *   node cli.js bulk-unshare-content --ids "123,456,789" --user "1250228141" --content-type "alert"
+ *
  * Options:
- *   --file           CSV or JSON file with content IDs (required)
+ *   --file           CSV or JSON file with content IDs (required unless --ids is set)
+ *   --ids            Comma-separated content IDs, instead of --file. Requires --content-type.
  *   --user           User ID to unshare from (required if --group is not set)
  *   --group          Group ID to unshare from (required if --user is not set)
  *   --content-type   Content type: card, badge, page, dataApp, alert, dataset.
- *                    Required for JSON files. For CSV, required when no type column is present;
+ *                    Required for JSON files and --ids. For CSV, required when no type column is present;
  *                    otherwise used as the fallback when a row's type cell is empty.
  *   --id-column      CSV column with object IDs (default: "Object ID")
  *   --type-column    CSV column with object type per row (default: "Object Type ID").
@@ -37,6 +41,7 @@
  *
  * Datasets are unshared via /data/v1/ui/bulk/share with accessLevel=NONE.
  * dataApps are unshared via /content/v1/dataapps/share/remove (with a group-owner workaround).
+ * Alerts are unsubscribed one at a time via DELETE /social/v4/alerts/{id}/subscriptions.
  * Other content types use /content/v1/share/bulk/{type}/{recipient}/{id}. All in batches of 50.
  *
  * Run logs are written to logs/bulk-unshare-content/. By default only failed batches are
@@ -49,14 +54,15 @@ const argv = require('minimist')(process.argv.slice(2));
 
 const HELP_TEXT = `Usage: node cli.js bulk-unshare-content [options]
 
-Unshare content in bulk using a CSV or JSON file of content IDs.
+Unshare content in bulk using a CSV or JSON file of content IDs, or a list passed with --ids.
 
 Options:
-  --file           CSV or JSON file with content IDs (required)
+  --file           CSV or JSON file with content IDs (required unless --ids is set)
+  --ids            Comma-separated content IDs, instead of --file. Requires --content-type.
   --user           User ID to unshare from (required if --group is not set)
   --group          Group ID to unshare from (required if --user is not set)
   --content-type   Content type: card, badge, page, dataApp, alert, dataset.
-                   Required for JSON files. For CSV, required when no type column is
+                   Required for JSON files and --ids. For CSV, required when no type column is
                    present; otherwise used as fallback when a row's type cell is empty.
   --id-column      CSV column with object IDs (default: "Object ID")
   --type-column    CSV column with object type per row (default: "Object Type ID").
@@ -71,6 +77,7 @@ Type values are case-insensitive. Aliases: CARD → badge, DATA_SOURCE / DATASET
 
 Datasets are unshared via /data/v1/ui/bulk/share with accessLevel=NONE.
 dataApps are unshared via /content/v1/dataapps/share/remove (with a group-owner workaround).
+Alerts are unsubscribed one at a time via DELETE /social/v4/alerts/{id}/subscriptions.
 Other content types use /content/v1/share/bulk/{type}/{recipient}/{id}. All in batches of 50.`;
 
 const VALID_CONTENT_TYPES = ['badge', 'page', 'dataapp', 'alert', 'dataset'];
@@ -121,8 +128,11 @@ async function unshareSingleDataset(id, recipientId, recipientType) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	if (!argv.file) {
-		throw new Error('--file parameter is required');
+	if (!argv.file && !argv.ids) {
+		throw new Error('Either --file or --ids parameter is required');
+	}
+	if (argv.file && argv.ids) {
+		throw new Error('Cannot specify both --file and --ids parameters');
 	}
 	if (!argv.user && !argv.group) {
 		throw new Error('Either --user or --group parameter is required');
@@ -148,10 +158,25 @@ async function main() {
 		}
 	}
 
-	const fileExtension = argv.file.toLowerCase().split('.').pop();
+	const fileExtension = argv.file
+		? String(argv.file).toLowerCase().split('.').pop()
+		: null;
 	let items;
 
-	if (fileExtension === 'csv') {
+	if (argv.ids) {
+		if (!contentTypeFallback) {
+			throw new Error(
+				'--content-type parameter is required with --ids: card, badge, page, dataApp, alert, dataset'
+			);
+		}
+		const ids = String(argv.ids)
+			.split(',')
+			.map((id) => id.trim())
+			.filter(Boolean);
+		if (ids.length === 0) throw new Error('No IDs provided in --ids');
+		items = ids.map((id) => ({ id, type: contentTypeFallback }));
+		console.log(`Loaded ${items.length} ${argv['content-type']} IDs from --ids`);
+	} else if (fileExtension === 'csv') {
 		const records = readCSV(argv.file);
 		if (records.length === 0) throw new Error('CSV file has no rows');
 		const columns = Object.keys(records[0]);
@@ -226,8 +251,9 @@ async function main() {
 
 	let datasetItems = itemsByType.dataset || [];
 	const dataappItems = itemsByType.dataapp || [];
+	const alertItems = itemsByType.alert || [];
 	const otherTypes = Object.keys(itemsByType).filter(
-		(t) => t !== 'dataset' && t !== 'dataapp'
+		(t) => t !== 'dataset' && t !== 'dataapp' && t !== 'alert'
 	);
 
 	const skipInvalidDatasets = Boolean(argv['skip-invalid-datasets']);
@@ -263,7 +289,8 @@ async function main() {
 		debugMode: false,
 		dryRun: false,
 		runMeta: {
-			file: argv.file,
+			file: argv.file || null,
+			ids: argv.ids ? String(argv.ids) : null,
 			recipient,
 			idColumn,
 			typeColumn,
@@ -275,6 +302,7 @@ async function main() {
 			totalItems: items.length,
 			datasetItemCount: datasetItems.length,
 			dataappItemCount: dataappItems.length,
+			alertItemCount: alertItems.length,
 			otherItemCount: otherTypes.reduce(
 				(n, t) => n + itemsByType[t].length,
 				0
@@ -490,7 +518,43 @@ async function main() {
 		}
 	}
 
-	// Other types — /content/v1/share/bulk/{type}/{recipient}/{id}
+	if (alertItems.length > 0) {
+		console.log(
+			`\nUnsubscribing ${recipientType} ${recipientId} from ${alertItems.length} alerts...`
+		);
+
+		const subscriberType = recipientType.toUpperCase();
+		for (const it of alertItems) {
+			const endpoint = `/social/v4/alerts/${it.id}/subscriptions?subscriberId=${recipientId}&type=${subscriberType}`;
+			try {
+				const result = await api.del(endpoint);
+				console.log(`  Alert ${it.id} unsubscribed`);
+				successCount++;
+				if (verbose) {
+					logger.addResult({
+						kind: 'alert',
+						recipient,
+						items: [it],
+						status: 'success',
+						response: result
+					});
+				}
+			} catch (error) {
+				console.error(`  Alert ${it.id} failed: ${error.message}`);
+				errorCount++;
+				logger.addResult({
+					kind: 'alert',
+					recipient,
+					items: [it],
+					status: 'error',
+					error: error.message
+				});
+			}
+			await new Promise((resolve) => setTimeout(resolve, 150));
+		}
+	}
+
+	// Other types: /content/v1/share/bulk/{type}/{recipient}/{id}
 	for (const type of otherTypes) {
 		const typeItems = itemsByType[type];
 		const ids = typeItems
@@ -559,10 +623,11 @@ async function main() {
 	);
 	console.log('\n=== Summary ===');
 	console.log(
-		`Total items processed: ${datasetItems.length + dataappItems.length + otherItemCount}`
+		`Total items processed: ${datasetItems.length + dataappItems.length + alertItems.length + otherItemCount}`
 	);
 	if (datasetItems.length > 0) console.log(`  Datasets: ${datasetItems.length}`);
 	if (dataappItems.length > 0) console.log(`  DataApps: ${dataappItems.length}`);
+	if (alertItems.length > 0) console.log(`  Alerts: ${alertItems.length}`);
 	for (const type of otherTypes) {
 		console.log(`  ${type}: ${itemsByType[type].length}`);
 	}
@@ -576,6 +641,7 @@ async function main() {
 		totalItems: items.length,
 		datasetItems: datasetItems.length,
 		dataappItems: dataappItems.length,
+		alertItems: alertItems.length,
 		otherItems: otherItemCount,
 		skippedInvalidDatasets: invalidDatasetIds.length,
 		successfulBatches: successCount,
