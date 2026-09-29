@@ -90,7 +90,7 @@ async function searchFunctions(ownerIds, datasetIds, includeVariables, limit, of
 }
 
 function activeLinkCount(fn) {
-	return Object.values(fn.activeLinks || {}).reduce((sum, ids) => sum + ids.length, 0);
+	return Object.values(fn.activeLinks || {}).reduce((sum, ids) => sum + (Array.isArray(ids) ? ids.length : 0), 0);
 }
 
 async function bulkDeleteFunctions(ids) {
@@ -112,16 +112,15 @@ async function findUnusedBeastModes(ownerIds, datasetIds, includeVariables, incl
 		if (functions.length === 0) break;
 
 		for (const fn of functions) {
-			// The inactive filter should guarantee this, but deletion is
-			// irreversible — never trust a beast mode that has active links.
+			// Redundant with the inactive filter, but deletes are irreversible.
 			if (activeLinkCount(fn) > 0) continue;
 			// The API has no created filter, so this one is client-side.
 			// Results are sorted by created ascending, so the first result at
-			// or past the cutoff means every remaining result is too — stop.
+			// or past the cutoff means every remaining result is too: stop.
 			if (createdBeforeMs) {
 				if (typeof fn.created !== 'number') continue;
 				if (fn.created >= createdBeforeMs) {
-					return { candidates, lockedSkipped, totalHits: result.totalHits };
+					return { candidates, lockedSkipped };
 				}
 			}
 			if (fn.locked && !includeLocked) {
@@ -135,7 +134,7 @@ async function findUnusedBeastModes(ownerIds, datasetIds, includeVariables, incl
 				created: fn.created
 			});
 			if (max && candidates.length >= max) {
-				return { candidates, lockedSkipped, totalHits: result.totalHits };
+				return { candidates, lockedSkipped };
 			}
 		}
 
@@ -145,7 +144,7 @@ async function findUnusedBeastModes(ownerIds, datasetIds, includeVariables, incl
 		await new Promise((r) => setTimeout(r, 150));
 	}
 
-	return { candidates, lockedSkipped, totalHits: candidates.length };
+	return { candidates, lockedSkipped };
 }
 
 async function main() {
