@@ -18,10 +18,23 @@
  *   --add-groups       Comma-separated group IDs to add
  *   --remove-users     Comma-separated user IDs to remove
  *   --remove-groups    Comma-separated group IDs to remove
+ *   --retry-errors [file]  Retry the policy update of a failed run (default: latest run log)
+ *   --max-age <hours>      Allow a source log older than 24 hours
  */
 
-const { api, createLogger, showHelp } = require('../lib');
+const { api, createLogger, loadSource, printSource, confirmSource, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'bulk-update-column-pdp-policy';
+const SELECTION_FLAGS = [
+	'dataset-id',
+	'filter-group-id',
+	'policy-id',
+	'add-users',
+	'add-groups',
+	'remove-users',
+	'remove-groups'
+];
 
 const HELP_TEXT = `Usage:
   node cli.js bulk-update-column-pdp-policy --dataset-id "<id>" --filter-group-id 704911 --policy-id 22 --add-users "111,222"
@@ -36,7 +49,11 @@ Options:
   --add-users        Comma-separated user IDs to add
   --add-groups       Comma-separated group IDs to add
   --remove-users     Comma-separated user IDs to remove
-  --remove-groups    Comma-separated group IDs to remove`;
+  --remove-groups    Comma-separated group IDs to remove
+
+Retrying an earlier run (reuses the log's policy and user/group changes):
+  --retry-errors [file]  Retry the failed and unreached items of a run (default: the latest run log)
+  --max-age <hours>      Allow a source log older than 24 hours`;
 
 function parseIdList(value) {
 	if (!value) return [];
@@ -107,13 +124,34 @@ async function validateGroupIds(groupIds) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	const datasetId = argv['dataset-id'];
-	const filterGroupId = parseInt(argv['filter-group-id'], 10);
-	const policyId = parseInt(argv['policy-id'], 10);
-	const addUsers = parseIdList(argv['add-users']);
-	const addGroups = parseIdList(argv['add-groups']);
-	const removeUsers = parseIdList(argv['remove-users']);
-	const removeGroups = parseIdList(argv['remove-groups']);
+	const source = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		toEntries: (row) =>
+			row.datasetId == null || row.filterGroupId == null || row.policyId == null
+				? null
+				: { datasetId: row.datasetId, filterGroupId: row.filterGroupId, policyId: row.policyId }
+	});
+	if (source) {
+		printSource(source);
+		if (source.entries.length === 0) {
+			console.log('The source log has nothing left to retry.');
+			process.exit(0);
+		}
+	}
+
+	const target = source
+		? source.entries[0]
+		: {
+				datasetId: argv['dataset-id'],
+				filterGroupId: parseInt(argv['filter-group-id'], 10),
+				policyId: parseInt(argv['policy-id'], 10)
+			};
+	const { datasetId, filterGroupId, policyId } = target;
+	const addUsers = source ? source.meta.addUsers || [] : parseIdList(argv['add-users']);
+	const addGroups = source ? source.meta.addGroups || [] : parseIdList(argv['add-groups']);
+	const removeUsers = source ? source.meta.removeUsers || [] : parseIdList(argv['remove-users']);
+	const removeGroups = source ? source.meta.removeGroups || [] : parseIdList(argv['remove-groups']);
 
 	if (!datasetId || isNaN(filterGroupId) || isNaN(policyId)) {
 		console.error(
@@ -136,9 +174,10 @@ async function main() {
 	}
 
 	const debugMode = false;
-	const logger = createLogger('bulk-update-column-pdp-policy', {
+	const logger = createLogger(COMMAND, {
 		debugMode,
-		runMeta: { datasetId, filterGroupId, policyId }
+		source,
+		runMeta: { datasetId, filterGroupId, policyId, addUsers, addGroups, removeUsers, removeGroups }
 	});
 
 	console.log('Update PDP Column Policy');
@@ -153,6 +192,34 @@ async function main() {
 	if (removeGroups.length)
 		console.log(`Remove groups:   ${removeGroups.join(', ')}`);
 
+	if (source && !(await confirmSource('\nRetry this policy update? (yes/no): ', argv))) {
+		console.log('Cancelled.');
+		process.exit(0);
+	}
+	logger.beginExecution([target], (entry) => `${entry.datasetId}:${entry.filterGroupId}:${entry.policyId}`);
+
+	let policy;
+	try {
+		policy = await applyChanges(target, { addUsers, addGroups, removeUsers, removeGroups });
+	} catch (err) {
+		console.error(`\nError: ${err.message}`);
+		logger.addResult({ ...target, status: 'error', error: err.message });
+		logger.writeRunLog({ total: 1, updated: 0, errors: 1 });
+		console.error(`\nThe policy update failed. Run "node cli.js ${COMMAND} --retry-errors" to retry it.`);
+		process.exit(1);
+	}
+	console.log('\nPolicy updated successfully!');
+
+	logger.addResult({
+		...target,
+		status: 'updated',
+		userIds: policy.userIds,
+		groupIds: policy.groupIds
+	});
+	logger.writeRunLog({ total: 1, updated: 1, errors: 0 });
+}
+
+async function applyChanges({ datasetId, filterGroupId, policyId }, { addUsers, addGroups, removeUsers, removeGroups }) {
 	// Fetch the filter group
 	console.log('\nFetching filter group...');
 	const filterGroup = await getFilterGroup(datasetId, filterGroupId);
@@ -166,10 +233,7 @@ async function main() {
 		const available = columnPolicies
 			.map((p) => `${p.policyId} (${p.values?.join(', ') || 'no values'})`)
 			.join('; ');
-		console.error(
-			`\nError: Policy ID ${policyId} not found. Available column policies: ${available}`
-		);
-		process.exit(1);
+		throw new Error(`Policy ID ${policyId} not found. Available column policies: ${available}`);
 	}
 
 	console.log(
@@ -232,22 +296,8 @@ async function main() {
 		`  Final groups: [${policy.groupIds.length}] ${policy.groupIds.join(', ')}`
 	);
 
-	try {
-		await updateFilterGroup(datasetId, filterGroupId, filterGroup);
-	} catch (err) {
-		logger.addResult({ policyId, status: 'error', error: err.message });
-		logger.writeRunLog({ total: 1, updated: 0, errors: 1 });
-		throw err;
-	}
-	console.log('\nPolicy updated successfully!');
-
-	logger.addResult({
-		policyId,
-		status: 'updated',
-		userIds: policy.userIds,
-		groupIds: policy.groupIds
-	});
-	logger.writeRunLog({ total: 1, updated: 1, errors: 0 });
+	await updateFilterGroup(datasetId, filterGroupId, filterGroup);
+	return policy;
 }
 
 main().catch((err) => {

@@ -24,6 +24,7 @@
  *   node cli.js bulk-update-stream-schedules --file "streams.csv" --start-hour 6 --end-hour 20 --include-manual
  *   node cli.js bulk-update-stream-schedules --file "streams.csv" --mode manual
  *   node cli.js bulk-update-stream-schedules --mode from-file --file "restore.csv" --column "Stream ID" --schedule-expression-column "Schedule Expression" --schedule-json-column "advancedScheduleJson"
+ *   node cli.js bulk-update-stream-schedules --retry-errors
  *
  * Options:
  *   --file, -f                       CSV file with IDs (and schedules in from-file mode)
@@ -47,14 +48,40 @@
  *   --filter-column                  CSV column to filter on (optional, requires --filter-value)
  *   --filter-value                   Value the filter-column must equal to include the row
  *   --dry-run                        Preview changes without applying them
+ *   --retry-errors [file]            Retry the failed and unreached streams of a run (default: latest
+ *                                      run log), reusing its mode, hours, timezone, and file schedules
+ *   --max-age <hours>                Allow a source log older than 24 hours
  */
 
 const api = require('../lib/api');
 const { readCSV } = require('../lib/csv');
 const { resolveIds } = require('../lib/input');
 const { createLogger } = require('../lib/log');
+const { loadSource, printSource, confirmSource } = require('../lib/plan');
 const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'bulk-update-stream-schedules';
+const SELECTION_FLAGS = [
+	'file',
+	'f',
+	'id',
+	'ids',
+	'dataset',
+	'column',
+	'c',
+	'mode',
+	'start-hour',
+	'end-hour',
+	'timezone',
+	'include-manual',
+	'schedule-json-column',
+	'schedule-expression-column',
+	'schedule-state-column',
+	'filter-column',
+	'filter-value',
+	'dry-run'
+];
 
 const HELP_TEXT = `Usage: node cli.js bulk-update-stream-schedules [options]
 
@@ -75,7 +102,11 @@ Options:
   --schedule-state-column       Column with scheduleState override (default: "scheduleState")
   --filter-column               CSV column to filter on
   --filter-value                Value the filter-column must equal
-  --dry-run                     Preview changes without applying`;
+  --dry-run                     Preview changes without applying
+
+Retrying an earlier run (reuses the log's mode, hours, timezone, and file schedules):
+  --retry-errors [file]         Retry the failed and unreached items of a run (default: the latest run log)
+  --max-age <hours>             Allow a source log older than 24 hours`;
 
 // -- Schedule helpers --------------------------------------------------------
 
@@ -102,8 +133,7 @@ function generateRandomTime(startHour, endHour) {
 	return `${String(displayHour).padStart(2, '0')}:${paddedMinute} ${period}`;
 }
 
-function modifyScheduleToDaily(streamDefinition, startHour, endHour, timezone) {
-	const at = generateRandomTime(startHour, endHour);
+function modifyScheduleToDaily(streamDefinition, at, timezone) {
 	const currentSchedule = JSON.parse(
 		streamDefinition.advancedScheduleJson || '{}'
 	);
@@ -112,7 +142,7 @@ function modifyScheduleToDaily(streamDefinition, startHour, endHour, timezone) {
 	if (currentSchedule.type === 'ADVANCED') {
 		// Keep as ADVANCED type but switch from interval-based to time-based,
 		// preserving existing month/dayOfMonth/dayOfWeek/weekOfMonths values.
-		// Only include dayOfMonth when it has values — sending an empty array
+		// Only include dayOfMonth when it has values: sending an empty array
 		// alongside a populated dayOfWeek triggers a server NPE
 		// ("Cannot read field 'scheduler'..."). The UI omits it in that case.
 		newSchedule = {
@@ -356,11 +386,32 @@ async function resolveStreamsFromDatasets(datasetIds) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	const mode = argv.mode || 'daily';
-	const startHour = argv['start-hour'] != null ? Number(argv['start-hour']) : 0;
-	const endHour = argv['end-hour'] != null ? Number(argv['end-hour']) : 23;
-	const timezone = argv.timezone || 'UTC';
-	const includeManual = argv['include-manual'] || false;
+	const source = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		toEntries: (row) => {
+			if (row.streamId == null) return null;
+			const entry = { streamId: row.streamId };
+			if (row.datasetId) entry.datasetId = row.datasetId;
+			if (row.schedule) entry.schedule = row.schedule;
+			return entry;
+		}
+	});
+	const meta = source ? source.meta : null;
+
+	const mode = meta ? meta.mode || 'daily' : argv.mode || 'daily';
+	const startHour = meta
+		? (meta.startHour ?? 0)
+		: argv['start-hour'] != null
+			? Number(argv['start-hour'])
+			: 0;
+	const endHour = meta
+		? (meta.endHour ?? 23)
+		: argv['end-hour'] != null
+			? Number(argv['end-hour'])
+			: 23;
+	const timezone = meta ? meta.timezone || 'UTC' : argv.timezone || 'UTC';
+	const includeManual = meta ? Boolean(meta.includeManual) : argv['include-manual'] || false;
 	const dryRun = argv['dry-run'] || false;
 
 	if (!['daily', 'manual', 'from-file'].includes(mode)) {
@@ -382,14 +433,19 @@ async function main() {
 		process.exit(1);
 	}
 
-	const datasetMode = Boolean(argv.dataset);
-	const idColumn =
-		argv.column || argv.c || (datasetMode ? 'DataSet ID' : 'streamId');
-	const jsonColumn =
-		argv['schedule-json-column'] || 'advancedScheduleJson';
-	const expressionColumn =
-		argv['schedule-expression-column'] || 'scheduleExpression';
-	const stateColumn = argv['schedule-state-column'] || 'scheduleState';
+	const datasetMode = meta ? Boolean(meta.dataset) : Boolean(argv.dataset);
+	const idColumn = meta
+		? meta.column
+		: argv.column || argv.c || (datasetMode ? 'DataSet ID' : 'streamId');
+	const jsonColumn = meta
+		? meta.scheduleJsonColumn
+		: argv['schedule-json-column'] || 'advancedScheduleJson';
+	const expressionColumn = meta
+		? meta.scheduleExpressionColumn
+		: argv['schedule-expression-column'] || 'scheduleExpression';
+	const stateColumn = meta
+		? meta.scheduleStateColumn
+		: argv['schedule-state-column'] || 'scheduleState';
 
 	let streamIds;
 	let debugMode;
@@ -397,7 +453,27 @@ async function main() {
 	let datasetByStream = null; // streamId -> datasetId, dataset mode only
 	let datasetsWithoutStream = 0;
 
-	if (mode === 'from-file') {
+	if (source) {
+		let entries = source.entries;
+		if (mode === 'from-file') {
+			const withSchedule = entries.filter((e) => e.schedule);
+			if (withSchedule.length < entries.length) {
+				console.log(
+					`Dropping ${entries.length - withSchedule.length} log row(s) with no recorded schedule to apply`
+				);
+			}
+			entries = withSchedule;
+			scheduleMap = new Map(entries.map((e) => [String(e.streamId), e.schedule]));
+		}
+		streamIds = entries.map((e) => e.streamId);
+		if (datasetMode) {
+			datasetByStream = new Map(
+				entries.filter((e) => e.datasetId).map((e) => [String(e.streamId), String(e.datasetId)])
+			);
+		}
+		datasetsWithoutStream = meta.datasetsWithoutStream;
+		debugMode = false;
+	} else if (mode === 'from-file') {
 		const filePath = argv.file || argv.f;
 		if (!filePath) {
 			console.error('Error: --file is required when --mode from-file');
@@ -451,11 +527,12 @@ async function main() {
 		}
 	}
 
-	const logger = createLogger('bulk-update-stream-schedules', {
+	const logger = createLogger(COMMAND, {
 		debugMode,
 		dryRun,
+		source,
 		runMeta: {
-			file: argv.file || argv.f || null,
+			file: meta ? meta.file : argv.file || argv.f || null,
 			column: idColumn,
 			dataset: datasetMode || undefined,
 			datasetsWithoutStream: datasetMode
@@ -501,14 +578,38 @@ async function main() {
 		}
 	}
 	if (mode === 'from-file') {
-		console.log(`Schedule file: ${argv.file || argv.f}`);
+		console.log(`Schedule file: ${meta ? meta.file : argv.file || argv.f}`);
 		console.log(`ID column: "${idColumn}"`);
 		console.log(`JSON column: "${jsonColumn}"`);
 		console.log(`Expression column: "${expressionColumn}"`);
 		console.log(`State column: "${stateColumn}" (defaults to ACTIVE)`);
 	}
 	if (dryRun) console.log('DRY RUN (no changes will be made)');
+	if (source) {
+		console.log('');
+		printSource(source);
+		if (streamIds.length === 0) {
+			console.log('The source log has nothing left to retry.');
+			process.exit(0);
+		}
+		if (!(await confirmSource(`Retry ${streamIds.length} stream(s)? (yes/no): `, argv))) {
+			console.log('Cancelled.');
+			process.exit(0);
+		}
+	}
 	console.log(`Found ${streamIds.length} stream(s) to process\n`);
+
+	logger.beginExecution(
+		streamIds.map((streamId) => {
+			const planned = { streamId };
+			const datasetId = datasetByStream && datasetByStream.get(String(streamId));
+			if (datasetId) planned.datasetId = datasetId;
+			const schedule = scheduleMap && scheduleMap.get(String(streamId));
+			if (schedule) planned.schedule = schedule;
+			return planned;
+		}),
+		(entry) => String(entry.streamId)
+	);
 
 	let successCount = 0;
 	let skipCount = 0;
@@ -532,6 +633,9 @@ async function main() {
 
 		const entry = { streamId, status: null, name: null, error: null };
 		if (datasetId) entry.datasetId = datasetId;
+		const fileSchedule =
+			mode === 'from-file' ? scheduleMap.get(String(streamId)) : null;
+		if (fileSchedule) entry.schedule = fileSchedule;
 
 		try {
 			console.log('  Fetching stream definition...');
@@ -569,8 +673,7 @@ async function main() {
 				mode === 'daily' &&
 				(isMoreThanOnceADay(currentSchedule) || (includeManual && isManual));
 
-			const fileSchedule =
-				mode === 'from-file' ? scheduleMap.get(String(streamId)) : null;
+			const dailyTime = mode === 'daily' ? generateRandomTime(startHour, endHour) : null;
 
 			if (mode === 'daily' && !shouldProcessForDaily) {
 				const reason = isManual
@@ -622,12 +725,11 @@ async function main() {
 					entry.previewSchedule = fileSchedule;
 					if (debugLog) debugLog.previewSchedule = fileSchedule;
 				} else {
-					const previewTime = generateRandomTime(startHour, endHour);
 					console.log(
-						`  [DRY RUN] Would change to daily at ${previewTime} ${timezone}\n`
+						`  [DRY RUN] Would change to daily at ${dailyTime} ${timezone}\n`
 					);
-					entry.previewTime = previewTime;
-					if (debugLog) debugLog.previewTime = previewTime;
+					entry.previewTime = dailyTime;
+					if (debugLog) debugLog.previewTime = dailyTime;
 				}
 				entry.status = 'dry-run';
 				if (debugLog) debugLog.dryRun = true;
@@ -645,8 +747,7 @@ async function main() {
 				} else {
 					modifiedDefinition = modifyScheduleToDaily(
 						streamDefinition,
-						startHour,
-						endHour,
+						dailyTime,
 						timezone
 					);
 				}
@@ -711,7 +812,9 @@ async function main() {
 
 	if (errorCount > 0) {
 		console.error(
-			'\nSome streams failed to update. Check the error messages above.'
+			dryRun
+				? '\nSome streams could not be checked. Check the error messages above.'
+				: `\nSome streams failed to update. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`
 		);
 		process.exit(1);
 	} else {

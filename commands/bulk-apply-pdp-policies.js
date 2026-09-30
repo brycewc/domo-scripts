@@ -6,7 +6,7 @@
  * enables PDP and applies matching policies on each target DataSet.
  *
  * By default, policies are added on top of whatever already exists on the
- * target — a policy whose name matches an existing one is updated in place,
+ * target: a policy whose name matches an existing one is updated in place,
  * and any others are created. Pass --clean to instead delete all existing
  * custom policies first and write only the source set.
  *
@@ -16,6 +16,7 @@
  *   node cli.js bulk-apply-pdp-policies --file "datasets.csv" --all-rows-users "123,456" --all-rows-groups "789" --source-dataset-id "SRC_ID" --allowed-columns "ae_email"
  *   node cli.js bulk-apply-pdp-policies --dataset-id "TARGET_ID" --source-dataset-id "SRC_ID" --allowed-columns "ae_email,sc_email"
  *   node cli.js bulk-apply-pdp-policies --dataset-ids "id1,id2,id3" --source-dataset-id "SRC_ID" --allowed-columns "ae_email"
+ *   node cli.js bulk-apply-pdp-policies --retry-errors
  *
  * Options:
  *   --file, -f          CSV file with target dataset IDs
@@ -27,10 +28,30 @@
  *   --all-rows-users    Comma-separated user IDs to assign to the All Rows policy
  *   --all-rows-groups   Comma-separated group IDs to assign to the All Rows policy
  *   --clean             Delete all existing custom policies before writing the new set
+ *   --retry-errors [file]  Retry the failed and unreached datasets of a run (default: latest run log)
+ *   --max-age <hours>      Allow a source log older than 24 hours
  */
 
-const { api, resolveIds, createLogger, showHelp } = require('../lib');
+const { api, resolveIds, createLogger, loadSource, printSource, confirmSource, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'bulk-apply-pdp-policies';
+const SELECTION_FLAGS = [
+	'file',
+	'f',
+	'dataset-id',
+	'dataset-ids',
+	'column',
+	'c',
+	'filter-column',
+	'filter-value',
+	'source-dataset-id',
+	's',
+	'allowed-columns',
+	'all-rows-users',
+	'all-rows-groups',
+	'clean'
+];
 
 const HELP_TEXT = `Usage: node cli.js bulk-apply-pdp-policies [options]
 
@@ -43,7 +64,11 @@ Options:
   --allowed-columns   Allowed PDP filter columns, comma-separated (optional; copies all policies if omitted)
   --all-rows-users    User IDs for the All Rows policy
   --all-rows-groups   Group IDs for the All Rows policy
-  --clean             Delete existing custom policies first (default: add/update in place)`;
+  --clean             Delete existing custom policies first (default: add/update in place)
+
+Retrying an earlier run (reuses the log's source dataset and policy options):
+  --retry-errors [file]  Retry the failed and unreached items of a run (default: the latest run log)
+  --max-age <hours>      Allow a source log older than 24 hours`;
 
 
 async function getPdpPolicies(datasetId) {
@@ -102,44 +127,71 @@ async function createPdpPolicy(datasetId, policy) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	const sourceDatasetId = argv['source-dataset-id'] || argv.s;
+	const source = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		toEntries: (row) => (row.datasetId == null ? null : String(row.datasetId))
+	});
+	const meta = source ? source.meta : null;
+
+	const sourceDatasetId = meta ? meta.sourceDatasetId : argv['source-dataset-id'] || argv.s;
 	if (!sourceDatasetId) {
 		console.error('Error: --source-dataset-id is required.');
 		process.exit(1);
 	}
 
-	const clean = Boolean(argv.clean);
-	const allowedColumns = argv['allowed-columns']
-		? String(argv['allowed-columns'])
-				.split(',')
-				.map((c) => c.trim())
-				.filter(Boolean)
-		: [];
-	const allRowsUserIds = argv['all-rows-users']
-		? String(argv['all-rows-users'])
-				.split(',')
-				.map((id) => Number(id.trim()))
-				.filter(Boolean)
-		: [];
-	const allRowsGroupIds = argv['all-rows-groups']
-		? String(argv['all-rows-groups'])
-				.split(',')
-				.map((id) => Number(id.trim()))
-				.filter(Boolean)
-		: [];
+	const clean = meta ? Boolean(meta.clean) : Boolean(argv.clean);
+	const allowedColumns = meta
+		? meta.allowedColumns || []
+		: argv['allowed-columns']
+			? String(argv['allowed-columns'])
+					.split(',')
+					.map((c) => c.trim())
+					.filter(Boolean)
+			: [];
+	const allRowsUserIds = meta
+		? meta.allRowsUserIds || []
+		: argv['all-rows-users']
+			? String(argv['all-rows-users'])
+					.split(',')
+					.map((id) => Number(id.trim()))
+					.filter(Boolean)
+			: [];
+	const allRowsGroupIds = meta
+		? meta.allRowsGroupIds || []
+		: argv['all-rows-groups']
+			? String(argv['all-rows-groups'])
+					.split(',')
+					.map((id) => Number(id.trim()))
+					.filter(Boolean)
+			: [];
 
-	const { ids: datasetIds, debugMode } = resolveIds(argv, {
-		name: 'dataset',
-		columnDefault: 'DataSet ID'
-	});
+	let datasetIds;
+	let debugMode = false;
+	if (source) {
+		datasetIds = source.entries;
+	} else {
+		({ ids: datasetIds, debugMode } = resolveIds(argv, {
+			name: 'dataset',
+			columnDefault: 'DataSet ID'
+		}));
+	}
 
-	const logger = createLogger('bulk-apply-pdp-policies', {
+	const logger = createLogger(COMMAND, {
 		debugMode,
+		source,
 		runMeta: { sourceDatasetId, allowedColumns, allRowsUserIds, allRowsGroupIds, clean }
 	});
 
 	console.log('Bulk Apply PDP Policies');
 	console.log('=======================\n');
+	if (source) {
+		printSource(source);
+		if (datasetIds.length === 0) {
+			console.log('The source log has nothing left to retry.');
+			process.exit(0);
+		}
+	}
 
 	// Step 1: Read source PDP policies
 	console.log(`Fetching PDP policies from source dataset: ${sourceDatasetId}`);
@@ -186,8 +238,17 @@ async function main() {
 
 	console.log(`\nTarget datasets: ${datasetIds.length}`);
 
+	if (source && !(await confirmSource(`\nRetry applying these policies to ${datasetIds.length} dataset(s)? (yes/no): `, argv))) {
+		console.log('Cancelled.');
+		process.exit(0);
+	}
+
 	// Step 2: Apply policies to each target dataset
 	console.log(`\nProcessing ${datasetIds.length} dataset(s)...\n`);
+	logger.beginExecution(
+		datasetIds.map((datasetId) => ({ datasetId })),
+		(entry) => String(entry.datasetId)
+	);
 
 	let successCount = 0;
 	let errorCount = 0;
@@ -315,7 +376,7 @@ async function main() {
 	});
 
 	if (errorCount > 0) {
-		console.error('\nSome datasets failed. Check the error messages above.');
+		console.error(`\nSome datasets failed. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`);
 		process.exit(1);
 	} else {
 		console.log('\nAll PDP policies applied successfully!');

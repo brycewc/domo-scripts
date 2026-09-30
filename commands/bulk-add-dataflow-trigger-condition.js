@@ -10,6 +10,7 @@
  *   node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv" --column "id"
  *   node cli.js bulk-add-dataflow-trigger-condition --id 123
  *   node cli.js bulk-add-dataflow-trigger-condition --ids "123,456,789"
+ *   node cli.js bulk-add-dataflow-trigger-condition --retry-errors
  *
  * Options:
  *   --file, -f       CSV file with dataflow IDs
@@ -25,13 +26,33 @@
  *   --description    Version description recorded on the dataflow. {value} and {unit}
  *                    are replaced with the condition value/unit
  *                    (default: "Updated the schedule settings to limit triggers to {value}")
+ *   --retry-errors [file]  Retry the failed and unreached dataflows of a run (default: latest run log)
+ *   --max-age <hours>      Allow a source log older than 24 hours
  */
 
 const api = require('../lib/api');
 const { resolveIds } = require('../lib/input');
 const { createLogger } = require('../lib/log');
+const { loadSource, printSource, confirmSource } = require('../lib/plan');
 const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'bulk-add-dataflow-trigger-condition';
+const SELECTION_FLAGS = [
+	'file',
+	'f',
+	'column',
+	'c',
+	'id',
+	'ids',
+	'filter-column',
+	'filter-value',
+	'value',
+	'unit',
+	'negated',
+	'type',
+	'description'
+];
 
 const HELP_TEXT = `Usage:
   node cli.js bulk-add-dataflow-trigger-condition --file "dataflows.csv"
@@ -52,26 +73,32 @@ Options:
   --type           Condition type (default: "DATAFLOW_LAST_RUN")
   --description    Version description recorded on the dataflow. {value} and {unit}
                    are replaced with the condition value/unit
-                   (default: "Updated the schedule settings to limit triggers to {value}")`;
+                   (default: "Updated the schedule settings to limit triggers to {value}")
 
-const CONDITION_TO_ADD = {
-	value: argv.value !== undefined ? argv.value : 1440,
-	unit: argv.unit || 'MINUTE',
-	negated: argv.negated !== undefined ? argv.negated : true,
-	type: argv.type || 'DATAFLOW_LAST_RUN'
-};
+Retrying an earlier run (reuses the log's condition and description):
+  --retry-errors [file]  Retry the failed and unreached items of a run (default: the latest run log)
+  --max-age <hours>      Allow a source log older than 24 hours`;
 
-function hasMatchingCondition(triggerConditions) {
+function conditionFromArgs() {
+	return {
+		value: argv.value !== undefined ? argv.value : 1440,
+		unit: argv.unit || 'MINUTE',
+		negated: argv.negated !== undefined ? argv.negated : true,
+		type: argv.type || 'DATAFLOW_LAST_RUN'
+	};
+}
+
+function hasMatchingCondition(triggerConditions, condition) {
 	return triggerConditions.some(
 		(c) =>
-			c.type === CONDITION_TO_ADD.type &&
-			c.value === CONDITION_TO_ADD.value &&
-			c.unit === CONDITION_TO_ADD.unit &&
-			c.negated === CONDITION_TO_ADD.negated
+			c.type === condition.type &&
+			c.value === condition.value &&
+			c.unit === condition.unit &&
+			c.negated === condition.negated
 	);
 }
 
-function addTriggerConditions(definition, description) {
+function addTriggerConditions(definition, condition, description) {
 	const triggers = definition.triggerSettings?.triggers;
 	if (!Array.isArray(triggers) || triggers.length === 0) {
 		return { modified: false, triggersUpdated: 0 };
@@ -84,12 +111,12 @@ function addTriggerConditions(definition, description) {
 			trigger.triggerConditions = [];
 		}
 
-		if (hasMatchingCondition(trigger.triggerConditions)) {
+		if (hasMatchingCondition(trigger.triggerConditions, condition)) {
 			console.log(`    Trigger "${trigger.title || trigger.triggerId}" already has condition, skipping`);
 			continue;
 		}
 
-		trigger.triggerConditions.push({ ...CONDITION_TO_ADD });
+		trigger.triggerConditions.push({ ...condition });
 		triggersUpdated++;
 		console.log(`    Added condition to trigger "${trigger.title || trigger.triggerId}"`);
 	}
@@ -123,35 +150,76 @@ function addTriggerConditions(definition, description) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	if (!argv.file && !argv.f && !argv.id && !argv.ids) {
+	const source = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		toEntries: (row) => (row.dataflowId == null ? null : String(row.dataflowId))
+	});
+
+	if (!source && !argv.file && !argv.f && !argv.id && !argv.ids) {
 		console.error('Error: --file, --id, or --ids is required\n');
 		console.error(HELP_TEXT);
 		process.exit(1);
 	}
 
-	const descriptionTemplate =
-		typeof argv.description === 'string' && argv.description
-			? argv.description
-			: 'Updated the schedule settings to limit trigger';
-	const description = descriptionTemplate
-		.replaceAll('{value}', CONDITION_TO_ADD.value)
-		.replaceAll('{unit}', CONDITION_TO_ADD.unit);
+	let condition;
+	let description;
+	if (source) {
+		({ condition, description } = source.meta);
+		if (!condition) {
+			console.error(`Error: ${source.relPath} does not record the trigger condition, so it cannot be retried.`);
+			process.exit(1);
+		}
+	} else {
+		condition = conditionFromArgs();
+		const descriptionTemplate =
+			typeof argv.description === 'string' && argv.description
+				? argv.description
+				: 'Updated the schedule settings to limit trigger';
+		description = descriptionTemplate
+			.replaceAll('{value}', condition.value)
+			.replaceAll('{unit}', condition.unit);
+	}
 
-	const { ids: dataflowIds, debugMode } = resolveIds(argv, {
-		idFlag: 'id',
-		idsFlag: 'ids',
-		columnDefault: 'DataFlow ID'
-	});
+	let dataflowIds;
+	let debugMode = false;
+	if (source) {
+		dataflowIds = source.entries;
+	} else {
+		({ ids: dataflowIds, debugMode } = resolveIds(argv, {
+			idFlag: 'id',
+			idsFlag: 'ids',
+			columnDefault: 'DataFlow ID'
+		}));
+	}
 
-	const logger = createLogger('bulk-add-dataflow-trigger-condition', {
+	const logger = createLogger(COMMAND, {
 		debugMode,
+		source,
 		runMeta: {
-			file: argv.file || argv.f || null,
-			column: argv.column || argv.c || 'DataFlow ID',
+			file: source ? source.meta.file : argv.file || argv.f || null,
+			column: source ? source.meta.column : argv.column || argv.c || 'DataFlow ID',
+			condition,
 			description,
 			totalDataflows: dataflowIds.length
 		}
 	});
+
+	if (source) {
+		printSource(source);
+		if (dataflowIds.length === 0) {
+			console.log('The source log has nothing left to retry.');
+			process.exit(0);
+		}
+		if (!(await confirmSource(`Retry ${dataflowIds.length} dataflow(s)? (yes/no): `, argv))) {
+			console.log('Cancelled.');
+			process.exit(0);
+		}
+	}
+	logger.beginExecution(
+		dataflowIds.map((dataflowId) => ({ dataflowId })),
+		(entry) => String(entry.dataflowId)
+	);
 
 	if (debugMode) {
 		console.log(`Processing single dataflow ${dataflowIds[0]} (debug log enabled)\n`);
@@ -183,7 +251,7 @@ async function main() {
 				debugLog.originalTriggerSettings = JSON.parse(JSON.stringify(definition.triggerSettings || null));
 			}
 
-			const { modified, triggersUpdated } = addTriggerConditions(definition, description);
+			const { modified, triggersUpdated } = addTriggerConditions(definition, condition, description);
 
 			if (debugLog) {
 				debugLog.modified = modified;
@@ -235,7 +303,7 @@ async function main() {
 	logger.writeRunLog({ successCount, skipCount, errorCount });
 
 	if (errorCount > 0) {
-		console.error('\nSome dataflows failed to update. Check the error messages above.');
+		console.error(`\nSome dataflows failed to update. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`);
 		process.exit(1);
 	} else {
 		console.log('\nAll dataflows processed successfully!');

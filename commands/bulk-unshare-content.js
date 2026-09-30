@@ -2,22 +2,25 @@
  * Unshare content in bulk using a CSV or JSON file of content IDs
  *
  * Usage:
- *   # CSV with mixed types — needs the type column
+ *   # CSV with mixed types: needs the type column
  *   node cli.js bulk-unshare-content --file "content.csv" --user "1250228141"
  *
- *   # CSV that is all one type — no type column needed, --content-type applies to every row
+ *   # CSV that is all one type: no type column needed, --content-type applies to every row
  *   node cli.js bulk-unshare-content --file "cards.csv" --user "1250228141" --content-type "card"
  *
  *   # CSV with custom column names
  *   node cli.js bulk-unshare-content --file "items.csv" --group "12345" \
  *     --id-column "ID" --type-column "Type"
  *
- *   # JSON file (array of integers) — requires --content-type
+ *   # JSON file (array of integers): requires --content-type
  *   node cli.js bulk-unshare-content --file "card-ids.json" --user "1250228141" --content-type "card"
  *   node cli.js bulk-unshare-content --file "dataset-ids.json" --group "12345" --content-type "dataset"
  *
  *   # Comma-separated IDs, no file (requires --content-type)
  *   node cli.js bulk-unshare-content --ids "123,456,789" --user "1250228141" --content-type "alert"
+ *
+ *   # Retry the failed and unreached items of the latest run
+ *   node cli.js bulk-unshare-content --retry-errors
  *
  * Options:
  *   --file           CSV or JSON file with content IDs (required unless --ids is set)
@@ -36,6 +39,10 @@
  *                    Before unsharing, look up every dataset ID and drop any that don't
  *                    exist (one bad ID otherwise fails its whole batch of 50). Datasets only;
  *                    the dropped IDs are recorded in the run log.
+ *   --retry-errors [file]
+ *                    Retry the failed and unreached items of a run (default: latest run log)
+ *   --max-age <hours>
+ *                    Allow a source log older than 24 hours
  *
  * Type values are case-insensitive. Aliases accepted: CARD → badge, DATA_SOURCE / DATASET → dataset.
  *
@@ -48,9 +55,22 @@
  * recorded (so invalid IDs can be recovered afterward); pass --verbose to also log successes.
  */
 
-const { api, readCSV, config, showHelp, createLogger, partitionExistingDatasets } = require('../lib');
+const {
+	api,
+	readCSV,
+	config,
+	showHelp,
+	createLogger,
+	loadSource,
+	printSource,
+	confirmSource,
+	partitionExistingDatasets
+} = require('../lib');
 const fs = require('fs');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'bulk-unshare-content';
+const SELECTION_FLAGS = ['file', 'ids', 'user', 'group', 'content-type', 'id-column', 'type-column', 'skip-invalid-datasets', 'dry-run', 'dry'];
 
 const HELP_TEXT = `Usage: node cli.js bulk-unshare-content [options]
 
@@ -72,6 +92,10 @@ Options:
   --skip-invalid-datasets
                    Before unsharing, look up every dataset ID and drop any that don't
                    exist (datasets only). Dropped IDs are recorded in the run log.
+  --retry-errors [file]  Retry the failed and unreached items of a run (default: the latest run log).
+                   Reuses the run's recipient; the file / --ids are not read.
+  --max-age <hours>      Allow a source log older than 24 hours
+  --yes, -y        Skip the confirmation prompt for --retry-errors
 
 Type values are case-insensitive. Aliases: CARD → badge, DATA_SOURCE / DATASET → dataset.
 
@@ -125,9 +149,23 @@ async function unshareSingleDataset(id, recipientId, recipientType) {
 	return result;
 }
 
-async function main() {
-	showHelp(argv, HELP_TEXT);
+function itemKey(item) {
+	return `${item.type}:${item.id}`;
+}
 
+// Error rows are whole batches; unreached rows are single items. Older logs stored
+// bare ids for non-dataset batches, so the row's kind supplies the type.
+function rowToItems(row) {
+	const failedIds = Array.isArray(row.failedIds) ? new Set(row.failedIds.map(String)) : null;
+	const items = (Array.isArray(row.items) ? row.items : [row])
+		.map((item) => (item !== null && typeof item === 'object' ? item : { id: item, type: row.kind }))
+		.filter((item) => item.id != null && VALID_CONTENT_TYPES.includes(item.type))
+		.filter((item) => !failedIds || failedIds.has(String(item.id)))
+		.map((item) => ({ id: String(item.id), type: item.type }));
+	return items.length > 0 ? items : null;
+}
+
+function loadItemsFromArgs() {
 	if (!argv.file && !argv.ids) {
 		throw new Error('Either --file or --ids parameter is required');
 	}
@@ -238,6 +276,48 @@ async function main() {
 		throw new Error('File must have .csv or .json extension');
 	}
 
+	return { items, recipient, meta: { file: argv.file || null, ids: argv.ids ? String(argv.ids) : null, idColumn, typeColumn, contentTypeFallback } };
+}
+
+async function main() {
+	showHelp(argv, HELP_TEXT);
+
+	const source = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		toEntries: rowToItems
+	});
+
+	let items;
+	let recipient;
+	let meta;
+	if (source) {
+		const { file, ids, idColumn, typeColumn, contentTypeFallback } = source.meta;
+		items = source.entries;
+		recipient = source.meta.recipient;
+		meta = { file, ids, idColumn, typeColumn, contentTypeFallback };
+		if (!recipient || !recipient.type || recipient.id == null) {
+			throw new Error(`${source.relPath} does not record the recipient, so it cannot be retried.`);
+		}
+		printSource(source);
+		if (items.length === 0) {
+			console.log('The source log has nothing left to unshare.');
+			return;
+		}
+		const ok = await confirmSource(
+			`Unshare ${items.length} item(s) from ${recipient.type} ${recipient.id} again? (yes/no): `,
+			argv
+		);
+		if (!ok) {
+			console.log('Aborted. No changes were made.');
+			process.exit(0);
+		}
+	} else {
+		({ items, recipient, meta } = loadItemsFromArgs());
+	}
+	const recipientType = recipient.type;
+	const recipientId = recipient.id;
+
 	// Group items by type
 	const itemsByType = {};
 	for (const item of items) {
@@ -256,9 +336,9 @@ async function main() {
 		(t) => t !== 'dataset' && t !== 'dataapp' && t !== 'alert'
 	);
 
-	const skipInvalidDatasets = Boolean(argv['skip-invalid-datasets']);
+	const skipInvalidDatasets = source ? Boolean(source.meta.skipInvalidDatasets) : Boolean(argv['skip-invalid-datasets']);
 	let invalidDatasetIds = [];
-	if (skipInvalidDatasets && datasetItems.length > 0) {
+	if (!source && skipInvalidDatasets && datasetItems.length > 0) {
 		console.log(
 			`\nValidating ${datasetItems.length} dataset ID(s) before unsharing...`
 		);
@@ -285,16 +365,13 @@ async function main() {
 	}
 
 	const verbose = Boolean(argv.verbose);
-	const logger = createLogger('bulk-unshare-content', {
+	const logger = createLogger(COMMAND, {
 		debugMode: false,
 		dryRun: false,
+		source,
 		runMeta: {
-			file: argv.file || null,
-			ids: argv.ids ? String(argv.ids) : null,
+			...meta,
 			recipient,
-			idColumn,
-			typeColumn,
-			contentTypeFallback,
 			verbose,
 			skipInvalidDatasets,
 			invalidDatasetCount: invalidDatasetIds.length,
@@ -309,8 +386,13 @@ async function main() {
 			)
 		}
 	});
+	const numericItems = (type) => itemsByType[type].filter((it) => !isNaN(parseInt(it.id, 10)));
+	logger.beginExecution(
+		[...datasetItems, ...dataappItems, ...alertItems, ...otherTypes.flatMap(numericItems)],
+		itemKey
+	);
 
-	// Datasets — /data/v1/ui/bulk/share with accessLevel=NONE
+	// Datasets: /data/v1/ui/bulk/share with accessLevel=NONE
 	if (datasetItems.length > 0) {
 		console.log(
 			`\nUnsharing ${datasetItems.length} datasets from ${recipientType} ${recipientId}...`
@@ -349,7 +431,8 @@ async function main() {
 						batchNumber,
 						totalBatches,
 						items: batch,
-						status: 'partial-failure',
+						status: 'error',
+						partialFailure: true,
 						failed,
 						failedIds
 					});
@@ -419,6 +502,7 @@ async function main() {
 					await new Promise((resolve) => setTimeout(resolve, 150));
 				}
 			}
+			logger.markProcessed(batch);
 
 			if (start + batchSize < datasetItems.length) {
 				await new Promise((resolve) => setTimeout(resolve, 100));
@@ -426,7 +510,7 @@ async function main() {
 		}
 	}
 
-	// DataApps — owner-flip workaround + /content/v1/dataapps/share/remove
+	// DataApps: owner-flip workaround + /content/v1/dataapps/share/remove
 	if (dataappItems.length > 0) {
 		console.log(
 			`\nUnsharing ${dataappItems.length} dataApps from ${recipientType} ${recipientId}...`
@@ -498,6 +582,7 @@ async function main() {
 					error: error.message
 				});
 			}
+			logger.markProcessed(batch);
 
 			if (start + batchSize < dataappItems.length) {
 				await new Promise((resolve) => setTimeout(resolve, 100));
@@ -550,28 +635,26 @@ async function main() {
 					error: error.message
 				});
 			}
+			logger.markProcessed([it]);
 			await new Promise((resolve) => setTimeout(resolve, 150));
 		}
 	}
 
 	// Other types: /content/v1/share/bulk/{type}/{recipient}/{id}
 	for (const type of otherTypes) {
-		const typeItems = itemsByType[type];
-		const ids = typeItems
-			.map((it) => parseInt(it.id, 10))
-			.filter((id) => !isNaN(id));
+		const typeItems = numericItems(type);
 
 		const endpoint = `/content/v1/share/bulk/${type}/${recipientType}/${recipientId}`;
 
 		console.log(
-			`\nUnsharing ${ids.length} ${type}s from ${recipientType} ${recipientId}...`
+			`\nUnsharing ${typeItems.length} ${type}s from ${recipientType} ${recipientId}...`
 		);
 		console.log(`Endpoint: ${config.baseUrl}${endpoint}`);
 		console.log('Processing in batches of 50...');
 
-		const totalBatches = Math.ceil(ids.length / batchSize);
-		for (let start = 0; start < ids.length; start += batchSize) {
-			const batch = ids.slice(start, start + batchSize);
+		const totalBatches = Math.ceil(typeItems.length / batchSize);
+		for (let start = 0; start < typeItems.length; start += batchSize) {
+			const batch = typeItems.slice(start, start + batchSize);
 			const batchNumber = Math.floor(start / batchSize) + 1;
 
 			console.log(
@@ -579,7 +662,10 @@ async function main() {
 			);
 
 			try {
-				const result = await api.post(endpoint, batch);
+				const result = await api.post(
+					endpoint,
+					batch.map((it) => parseInt(it.id, 10))
+				);
 				console.log(
 					`  Batch ${batchNumber} success:`,
 					result ? JSON.stringify(result, null, 2) : 'No response body'
@@ -609,8 +695,9 @@ async function main() {
 					error: error.message
 				});
 			}
+			logger.markProcessed(batch);
 
-			if (start + batchSize < ids.length) {
+			if (start + batchSize < typeItems.length) {
 				await new Promise((resolve) => setTimeout(resolve, 100));
 			}
 		}
@@ -649,7 +736,7 @@ async function main() {
 	});
 
 	if (errorCount > 0) {
-		console.error('\nSome batches failed. Check the run log for details.');
+		console.error(`\nSome batches failed. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`);
 		process.exit(1);
 	} else {
 		console.log('\nAll batches completed successfully!');

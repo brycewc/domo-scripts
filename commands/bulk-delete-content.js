@@ -79,6 +79,10 @@
  *   # Delete dataflows AND the datasets they output
  *   node cli.js bulk-delete-content --object-types "dataflow" --ids "123,456" --delete-output-datasets
  *
+ *   # Delete exactly what a dry run listed, or retry a run's failures
+ *   node cli.js bulk-delete-content --from-dry-run
+ *   node cli.js bulk-delete-content --retry-errors
+ *
  * Options:
  *   --file, -f       CSV file with object IDs (and optionally a type column)
  *   --id, --ids      Single ID / comma-separated IDs (requires a single --object-types)
@@ -100,9 +104,16 @@
  *                    is complete) to enumerate its outputs; the outputs join the
  *                    normal dataset pass, which already runs before the dataflow
  *                    pass. A dataflow whose outputs cannot be listed is NOT
- *                    deleted — deleting it would orphan output datasets with no
- *                    remaining way to find them — and is counted as an error.
+ *                    deleted (deleting it would orphan output datasets with no
+ *                    remaining way to find them) and is counted as an error.
  *   --dry-run        Preview which objects would be deleted without deleting
+ *   --from-dry-run [file]
+ *                    Delete exactly what a dry run listed (default: latest dry run).
+ *                    With --delete-output-datasets, dataflow outputs are listed again.
+ *   --retry-errors [file]
+ *                    Retry the failed and unreached deletes of a run (default: latest run)
+ *   --max-age <hours>
+ *                    Allow a source log older than 24 hours
  *
  * Types are deleted in a fixed dependency-safe order (alert, scheduled-report,
  * card, page, app-studio, worksheet, custom-app, code-engine, jupyter,
@@ -115,8 +126,22 @@
  * concurrently; types do not overlap.
  */
 
-const { api, readCSV, createLogger, showHelp } = require('../lib');
+const { api, readCSV, createLogger, loadSource, printSource, confirmSource, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'bulk-delete-content';
+const SELECTION_FLAGS = [
+	'file',
+	'f',
+	'id',
+	'ids',
+	'id-column',
+	'type-column',
+	'object-types',
+	'delete-output-datasets',
+	'dry-run',
+	'dry'
+];
 
 const HELP_TEXT = `Usage: node cli.js bulk-delete-content [options]
 
@@ -151,6 +176,12 @@ Optional:
                    outputs can't be listed is skipped and counted as an error
                    rather than deleted without its outputs.
   --dry-run        Preview without deleting
+
+Reusing an earlier run (skips reading the ID source; the log's options are reused):
+  --from-dry-run [file]  Delete exactly what a dry run listed (default: the latest dry run log)
+  --retry-errors [file]  Retry the failed and unreached deletes of a run (default: the latest run log)
+  --max-age <hours>      Allow a source log older than 24 hours
+  --yes, -y              Skip the confirmation prompt for --from-dry-run / --retry-errors
 
 Types are deleted in a fixed dependency-safe order: alert, scheduled-report,
 card, page, app-studio, worksheet, custom-app, code-engine, jupyter,
@@ -548,6 +579,28 @@ function buildObjectsByType(requestedTypes) {
 	return objectsByType;
 }
 
+function rowToEntry(row) {
+	if (!DELETERS[row.objectType] || row.objectId == null || row.objectId === '') return null;
+	return { objectType: row.objectType, objectId: String(row.objectId) };
+}
+
+function groupEntriesByType(entries) {
+	const objectsByType = {};
+	const seen = new Set();
+	for (const { objectType, objectId } of entries) {
+		const key = entryKey({ objectType, objectId });
+		if (seen.has(key)) continue;
+		seen.add(key);
+		if (!objectsByType[objectType]) objectsByType[objectType] = [];
+		objectsByType[objectType].push(objectId);
+	}
+	return objectsByType;
+}
+
+function entryKey(entry) {
+	return `${entry.objectType}:${entry.objectId}`;
+}
+
 // --delete-output-datasets: fetch each dataflow's definition and append its
 // output dataset IDs to the dataset work list (deduped against datasets already
 // listed), so the outputs are deleted in the normal dataset pass — which
@@ -715,19 +768,23 @@ async function deleteType(type, ids, { dryRun, batchSize, concurrency, logger })
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
+	const source = loadSource(COMMAND, argv, { selectionFlags: SELECTION_FLAGS, toEntries: rowToEntry });
+	const meta = source ? source.meta : {};
 	const dryRun = argv['dry-run'] || argv.dry || false;
-	const batchSize = parseInt(argv['batch-size'] || argv.b || '50', 10);
-	const concurrency = Math.max(1, parseInt(argv.concurrency || '5', 10));
-	const deleteOutputDatasets = argv['delete-output-datasets'] || false;
+	const batchSize = parseInt(argv['batch-size'] || argv.b || meta.batchSize || '50', 10);
+	const concurrency = Math.max(1, parseInt(argv.concurrency || meta.concurrency || '5', 10));
+	const deleteOutputDatasets = source ? Boolean(meta.deleteOutputDatasets) : argv['delete-output-datasets'] || false;
 
-	const requestedTypes = parseRequestedTypes();
-	const objectsByType = buildObjectsByType(requestedTypes);
+	const requestedTypes = source ? meta.requestedTypes : parseRequestedTypes();
+	const objectsByType = source ? groupEntriesByType(source.entries) : buildObjectsByType(requestedTypes);
 
 	console.log('Bulk Delete Content');
 	console.log('===================\n');
-	if (dryRun) console.log('*** DRY RUN — no content will be deleted ***\n');
+	if (dryRun) console.log('*** DRY RUN: no content will be deleted ***\n');
+	if (source) printSource(source);
 
 	let outputExpansion = null;
+	// Also in source mode: older logs, and dataflows that gained outputs since the plan, would otherwise orphan them.
 	if (deleteOutputDatasets) {
 		if ((objectsByType.dataflow || []).length > 0) {
 			outputExpansion = await expandDataflowOutputs(objectsByType, concurrency);
@@ -741,17 +798,18 @@ async function main() {
 	const totalObjects = typesToProcess.reduce((n, t) => n + objectsByType[t].length, 0);
 
 	if (totalObjects === 0 && expansionFailures.length === 0) {
-		console.log('No supported objects to delete.');
+		console.log(source ? 'The source log has nothing left to delete.' : 'No supported objects to delete.');
 		process.exit(0);
 	}
 
-	const logger = createLogger('bulk-delete-content', {
+	const logger = createLogger(COMMAND, {
 		debugMode: false,
 		dryRun,
+		source,
 		runMeta: {
-			file: argv.file || argv.f || null,
-			idColumn: argv['id-column'] || 'Object ID',
-			typeColumn: argv['type-column'] || 'Object Type',
+			file: source ? meta.file : argv.file || argv.f || null,
+			idColumn: source ? meta.idColumn : argv['id-column'] || 'Object ID',
+			typeColumn: source ? meta.typeColumn : argv['type-column'] || 'Object Type',
 			requestedTypes: requestedTypes || 'all',
 			batchSize,
 			concurrency,
@@ -765,16 +823,29 @@ async function main() {
 	console.log(`Objects:     ${totalObjects}`);
 	for (const t of typesToProcess) console.log(`  ${t}: ${objectsByType[t].length}`);
 
+	if (source) {
+		const ok = await confirmSource(`\nPermanently delete ${totalObjects} object(s)? (yes/no): `, argv);
+		if (!ok) {
+			console.log('Aborted. No changes were made.');
+			process.exit(0);
+		}
+	}
+
 	const summary = { totals: {}, deleted: 0, errors: 0, skipped: 0 };
 	for (const f of expansionFailures) {
 		logger.addResult({
 			objectType: 'dataflow',
 			objectId: f.dataflowId,
 			status: 'error',
-			error: `not deleted — could not list output datasets: ${f.error}`
+			phase: 'discover',
+			error: `not deleted, could not list output datasets: ${f.error}`
 		});
 		summary.errors++;
 	}
+	logger.beginExecution(
+		typesToProcess.flatMap((objectType) => objectsByType[objectType].map((objectId) => ({ objectType, objectId }))),
+		entryKey
+	);
 	for (const type of typesToProcess) {
 		const { deleted, errors, skipped } = await deleteType(type, objectsByType[type], { dryRun, batchSize, concurrency, logger });
 		summary.totals[type] = { deleted, errors, skipped };
@@ -813,11 +884,11 @@ async function main() {
 	});
 
 	if (dryRun) {
-		console.log('\nRe-run without --dry-run to execute the deletion.');
+		console.log(`\nRun "node cli.js ${COMMAND} --from-dry-run" to apply this plan.`);
 		process.exit(summary.errors > 0 ? 1 : 0);
 	}
 	if (summary.errors > 0) {
-		console.error('\nSome deletions failed. Check the error messages above.');
+		console.error(`\nSome deletions failed. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`);
 		process.exit(1);
 	}
 	console.log('\nAll content deleted successfully!');

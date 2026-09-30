@@ -2,10 +2,10 @@
  * Share content in bulk using a CSV or JSON file of content IDs
  *
  * Usage:
- *   # CSV with mixed types — needs the type column
+ *   # CSV with mixed types: needs the type column
  *   node cli.js bulk-share-content --file "content.csv" --user "1250228141"
  *
- *   # CSV that is all one type — no type column needed, --content-type applies to every row
+ *   # CSV that is all one type: no type column needed, --content-type applies to every row
  *   node cli.js bulk-share-content --file "cards.csv" --user "1250228141" --content-type "card"
  *
  *   # CSV with custom column names
@@ -19,9 +19,12 @@
  *   # CSV with a per-row user column (each row shares to a different user)
  *   node cli.js bulk-share-content --file "items.csv" --user-column "User ID"
  *
- *   # JSON file (array of integers) — requires --content-type
+ *   # JSON file (array of integers): requires --content-type
  *   node cli.js bulk-share-content --file "card-ids.json" --user "1250228141" --content-type "card"
  *   node cli.js bulk-share-content --file "dataset-ids.json" --user "1250228141" --content-type "dataset" --access-level "CAN_VIEW"
+ *
+ *   # Retry the failed and unreached items of the latest run
+ *   node cli.js bulk-share-content --retry-errors
  *
  * Options:
  *   --file                  CSV or JSON file with content IDs (required)
@@ -46,6 +49,8 @@
  *   --skip-invalid-datasets Before sharing, look up every dataset ID and drop any that don't exist
  *                           (one bad ID otherwise fails its whole batch of 50). Datasets only;
  *                           the dropped IDs are recorded in the run log.
+ *   --retry-errors [file]   Retry the failed and unreached items of a run (default: latest run log)
+ *   --max-age <hours>       Allow a source log older than 24 hours
  *
  * Type values are case-insensitive. Aliases accepted: CARD → badge, DATA_SOURCE / DATASET → dataset.
  *
@@ -57,9 +62,26 @@ const api = require('../lib/api');
 const { readCSV } = require('../lib/csv');
 const { showHelp } = require('../lib/help');
 const { createLogger } = require('../lib/log');
+const { loadSource, printSource, confirmSource } = require('../lib/plan');
 const { partitionExistingDatasets } = require('../lib/datasets');
 const fs = require('fs');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'bulk-share-content';
+const SELECTION_FLAGS = [
+	'file',
+	'user',
+	'group',
+	'content-type',
+	'id-column',
+	'type-column',
+	'user-column',
+	'access-level',
+	'access-level-column',
+	'skip-invalid-datasets',
+	'dry-run',
+	'dry'
+];
 
 const HELP_TEXT = `Usage: node cli.js bulk-share-content [options]
 
@@ -87,6 +109,10 @@ Options:
                           in the API response counts as a failure.
   --skip-invalid-datasets Before sharing, look up every dataset ID and drop any that don't
                           exist (datasets only). Dropped IDs are recorded in the run log.
+  --retry-errors [file]   Retry the failed and unreached items of a run (default: the latest run log).
+                          Reuses the run's recipients and access levels; the file is not read.
+  --max-age <hours>       Allow a source log older than 24 hours
+  --yes, -y               Skip the confirmation prompt for --retry-errors
 
 Type values are case-insensitive. Aliases: CARD → badge, DATA_SOURCE / DATASET → dataset.`;
 
@@ -108,9 +134,21 @@ function normalizeAccessLevel(raw) {
 	return VALID_ACCESS_LEVELS.includes(upper) ? upper : null;
 }
 
-async function main() {
-	showHelp(argv, HELP_TEXT);
+function itemKey(item) {
+	return `${item.type}:${item.id}|${item.recipient.type}:${item.recipient.id}|${item.accessLevel}`;
+}
 
+// Error rows are whole batches; unreached rows are single items.
+function rowToItems(row) {
+	const failedIds = Array.isArray(row.failedIds) ? new Set(row.failedIds.map(String)) : null;
+	const items = (Array.isArray(row.items) ? row.items : [row])
+		.filter((item) => item && item.id != null && item.type && item.recipient)
+		.filter((item) => !failedIds || failedIds.has(String(item.id)))
+		.map((item) => ({ id: String(item.id), type: item.type, accessLevel: item.accessLevel, recipient: item.recipient }));
+	return items.length > 0 ? items : null;
+}
+
+async function loadItemsFromArgs() {
 	if (!argv.file) {
 		throw new Error('--file parameter is required');
 	}
@@ -289,11 +327,12 @@ async function main() {
 		}
 	}
 
-	const verbose = Boolean(argv.verbose);
-	const logger = createLogger('bulk-share-content', {
-		debugMode: false,
-		dryRun: false,
-		runMeta: {
+	return {
+		fileJson,
+		contentItems,
+		datasetItems,
+		invalidDatasetIds,
+		meta: {
 			file: argv.file,
 			fallbackRecipient,
 			userColumn,
@@ -302,8 +341,55 @@ async function main() {
 			contentTypeFallback,
 			accessLevelColumn,
 			defaultAccessLevel,
+			skipInvalidDatasets
+		}
+	};
+}
+
+async function main() {
+	showHelp(argv, HELP_TEXT);
+
+	const source = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		toEntries: rowToItems
+	});
+
+	let fileJson;
+	let contentItems;
+	let datasetItems;
+	let invalidDatasetIds = [];
+	let meta;
+	if (source) {
+		fileJson = source.entries;
+		contentItems = fileJson.filter((item) => item.type !== 'dataset');
+		datasetItems = fileJson.filter((item) => item.type === 'dataset');
+		const { file, fallbackRecipient, userColumn, idColumn, typeColumn, contentTypeFallback, accessLevelColumn, defaultAccessLevel, skipInvalidDatasets } =
+			source.meta;
+		meta = { file, fallbackRecipient, userColumn, idColumn, typeColumn, contentTypeFallback, accessLevelColumn, defaultAccessLevel, skipInvalidDatasets };
+		printSource(source);
+		if (fileJson.length === 0) {
+			console.log('The source log has nothing left to share.');
+			return;
+		}
+		console.log(`Retrying ${contentItems.length} content item(s) and ${datasetItems.length} dataset(s).`);
+		const ok = await confirmSource('Share them again? (yes/no): ', argv);
+		if (!ok) {
+			console.log('Aborted. No changes were made.');
+			process.exit(0);
+		}
+	} else {
+		({ fileJson, contentItems, datasetItems, invalidDatasetIds, meta } = await loadItemsFromArgs());
+	}
+
+	const verbose = Boolean(argv.verbose);
+	const logger = createLogger(COMMAND, {
+		debugMode: false,
+		dryRun: false,
+		source,
+		runMeta: {
+			...meta,
 			verbose,
-			skipInvalidDatasets,
 			invalidDatasetCount: invalidDatasetIds.length,
 			invalidDatasetIds,
 			totalItems: fileJson.length,
@@ -311,6 +397,7 @@ async function main() {
 			datasetItemCount: datasetItems.length
 		}
 	});
+	logger.beginExecution(contentItems.concat(datasetItems), itemKey);
 
 	let successCount = 0;
 	let errorCount = 0;
@@ -390,6 +477,7 @@ async function main() {
 						error: error.message
 					});
 				}
+				logger.markProcessed(batch);
 
 				if (start + batchSize < items.length) {
 					await new Promise((resolve) => setTimeout(resolve, 100));
@@ -469,7 +557,8 @@ async function main() {
 							batchNumber,
 							totalBatches,
 							items: batch,
-							status: 'partial-failure',
+							status: 'error',
+							partialFailure: true,
 							failed,
 							failedIds
 						});
@@ -503,6 +592,7 @@ async function main() {
 						error: error.message
 					});
 				}
+				logger.markProcessed(batch);
 
 				if (start + batchSize < items.length) {
 					await new Promise((resolve) => setTimeout(resolve, 100));
@@ -533,7 +623,7 @@ async function main() {
 	});
 
 	if (errorCount > 0) {
-		console.error('\nSome operations failed. Check the run log for details.');
+		console.error(`\nSome operations failed. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`);
 		process.exit(1);
 	} else {
 		console.log('\nAll operations completed successfully!');

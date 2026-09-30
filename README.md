@@ -150,7 +150,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-update-stream-update-method` | Change stream update mode from Replace to Append |
 | `bulk-update-users` | Bulk update user attributes from a CSV via PATCH (one row per user) |
 | `check-credentials` | Validate the configured API credentials against the selected instance |
-| `clear-logs` | Delete every log file under `logs/` (supports `--dry-run` and `--command` filter) |
+| `clear-logs` | Delete log files under `logs/`, keeping dry-run plans and retryable run logs unless `--include-plans` (supports `--dry-run` and `--command` filter) |
 | `delete-unused-beast-modes` | Find and bulk-delete beast modes with no active links (not used in any card or view), optionally filtered by owner, dataset, or creation date; variables excluded unless `--include-variables` |
 | `export-dashboard-content` | Walk a dashboard and every subdashboard, exporting each page as a PowerPoint deck, each card as a PDF render, a PNG render and its definition as JSON (chart cards get the Analyzer definition: chart config, the query each component runs, slicers, beast modes, drill path, dataset columns; notebook cards get their markup and rendered HTML), the original file behind every doc/image card, every file embedded in a notebook card, and every dataset the cards read from as Excel. Output mirrors the page hierarchy; datasets are deduplicated at the root, and a `cards.xlsx` index there maps every card to the dataset behind it and to its exported files (`--index-format csv`, `--no-card-index`). A re-run redoes everything by default: `--skip-existing` reuses what is already on disk so a killed run can be resumed, `--clear` wipes each page folder first. A dataset Domo has vaulted cannot be queried, so a failed dataset export is retried once after requesting a defrost and waiting for it to thaw (`--defrost-timeout <minutes>`, default 30, `0` to skip) |
 | `extract-card-ids` | Extract card IDs from a page export JSON |
@@ -174,19 +174,48 @@ Most bulk commands that process a list of IDs support these options:
 | `--filter-column` | Filter CSV rows: column name to match |
 | `--filter-value` | Filter CSV rows: required value |
 | `--dry-run` | Preview changes without applying them |
+| `--from-dry-run [file]` | Run exactly what a dry run planned, without rediscovering it (default: the latest dry run log) |
+| `--retry-errors [file]` | Retry the failed and unreached items of an earlier run (default: the latest run log) |
+| `--max-age <hours>` | Allow `--from-dry-run` / `--retry-errors` to use a log older than 24 hours |
+
+## Reusing a Dry Run or Retrying a Run
+
+Dry runs of large jobs can take a long time, and most of that time is discovery (searching, fetching, deciding what to change). Instead of repeating it, run the plan the dry run already wrote:
+
+```bash
+node cli.js delete-unused-beast-modes --created-before 2026-06-01 --dry-run   # slow: scans every beast mode
+node cli.js delete-unused-beast-modes --from-dry-run                          # deletes exactly that list
+```
+
+If a real run has failures, or is interrupted (Ctrl-C, crash, lost connection), retry just what did not finish:
+
+```bash
+node cli.js delete-unused-beast-modes --retry-errors
+```
+
+How it works:
+
+- A dry run's log (`logs/<command>/dry_run_<timestamp>.json`) is the plan. `--from-dry-run` takes its `dry-run` rows and runs them through the command's normal execute step.
+- A real run checkpoints its log every 30 seconds and on exit, recording planned items it never reached under `unreached`. `--retry-errors` takes the `error` rows plus those unreached items. Items that failed before any change was attempted (a failed lookup during discovery) are listed but not retried. Retrying a retry works the same way.
+- The options recorded in the log are reused. Flags that change what the run selects or how it acts (filters, input files, IDs, `--dry-run`) are rejected alongside these flags. Execution-only flags such as `--batch-size`, `--concurrency` and `--yes` are still allowed.
+- The log must come from the same command and the same instance as the current `--env`, and be less than 24 hours old unless `--max-age` is passed. You are warned when a later run already used the same log, and asked to confirm before anything changes.
+- Commands that save whole objects (dataflows, streams, beast mode templates) re-fetch each object, check it still matches what the dry run saw, and skip it if it changed, so a plan never overwrites newer edits.
+- Commands that fetch and change each item in one step support only `--retry-errors`, since replaying their dry run would save nothing. Run `node cli.js <command> --help` to see which flags a command supports.
+- `clear-logs` keeps plans and retryable run logs unless `--include-plans` is passed.
 
 ## Project Structure
 
 ```
 domo-scripts/
-├── cli.js              # Entry point — dispatches to commands
+├── cli.js              # Entry point, dispatches to commands
 ├── lib/
 │   ├── index.js        # Re-exports all shared modules
 │   ├── config.js       # Environment config and auth
 │   ├── api.js          # Authenticated Domo API client (get/put/post/del)
 │   ├── csv.js          # CSV parsing with optional filtering
 │   ├── input.js        # Resolve IDs from CSV/flags
-│   └── log.js          # Debug and run log utilities
+│   ├── log.js          # Debug and run log utilities
+│   └── plan.js         # Loads dry-run plans and run logs for --from-dry-run / --retry-errors
 ├── commands/           # One file per command (29 total)
 ├── logs/               # Generated run/debug logs (git-ignored)
 ├── .env                # Your credentials (git-ignored)
@@ -206,6 +235,6 @@ domo-scripts/
 
 Commands that support logging write JSON files to `logs/<commandName>/`:
 
-- **Run logs** (`run_<timestamp>.json`) — summary of all items processed in a bulk run
-- **Debug logs** (`debug_<itemId>_<timestamp>.json`) — detailed per-item logs when using `--<entity>Id`
-- Dry-run variants are prefixed with `dry_`
+- **Run logs** (`run_<timestamp>.json`): summary of all items processed in a bulk run. Written as the run goes, so an interrupted run still leaves a log that `--retry-errors` can finish.
+- **Debug logs** (`debug_<itemId>_<timestamp>.json`): detailed per-item logs when using `--<entity>-id`
+- Dry-run variants are prefixed with `dry_`. Dry runs always write a run log (even for a single ID), because it is the plan `--from-dry-run` reads.

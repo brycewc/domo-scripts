@@ -180,6 +180,15 @@ The `commandName` argument becomes the subdirectory under `logs/`. Use camelCase
 
 Skip the logger only for commands that don't iterate over items, or whose output is itself the log (like `bulk-export-dataset-versions`).
 
+## Supporting `--from-dry-run` and `--retry-errors`
+
+Any command that mutates a list of items should support `--retry-errors`, and a command with an expensive discovery step before a `--dry-run` branch should also support `--from-dry-run`. Follow the "Replay and retry contract" in [CLAUDE.md](../../../CLAUDE.md) and copy the pattern from [delete-unused-beast-modes.js](../../../commands/delete-unused-beast-modes.js):
+
+1. `const source = loadSource(COMMAND, argv, { selectionFlags, toEntries })` right after `showHelp`, where `COMMAND` is the same string passed to `createLogger`.
+2. In source mode read options from `source.meta`, `printSource(source)`, and use `source.entries` instead of discovering.
+3. Pass `source` to `createLogger`, and call `logger.beginExecution(entries, keyOf)` after confirmation and before the first mutation.
+4. Add the `--from-dry-run [file]`, `--retry-errors [file]` and `--max-age <hours>` lines to `HELP_TEXT`.
+
 ## Things to avoid
 
 - **Don't** create new files in `lib/` unless the helper is genuinely shared by multiple commands. Inline command-specific helpers near the top of the command file.
@@ -197,6 +206,7 @@ Skip the logger only for commands that don't iterate over items, or whose output
 - [ ] Uses `lib/api`, `lib/input`, `lib/log` as appropriate (not custom replacements)
 - [ ] Banner, progress lines, summary block, exit code
 - [ ] Rate-limit delay between iterations
+- [ ] `--retry-errors` (and `--from-dry-run` if discovery is expensive) wired through `loadSource`
 - [ ] **Registered in [cli.js](../../../cli.js) `commands` map** ← registration site 1 of 2
 - [ ] **Row added to [README.md](../../../README.md) command table** ← registration site 2 of 2 (most-forgotten step)
 - [ ] `node cli.js <name> --help` prints help and exits 0

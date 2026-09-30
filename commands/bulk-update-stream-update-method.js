@@ -6,6 +6,7 @@
  *   node cli.js bulk-update-stream-update-method --file "stream-ids.csv" --column "streamId"
  *   node cli.js bulk-update-stream-update-method --id 12345
  *   node cli.js bulk-update-stream-update-method --ids "123,456,789"
+ *   node cli.js bulk-update-stream-update-method --retry-errors
  *
  * Options:
  *   --file, -f        CSV file with stream IDs
@@ -14,10 +15,15 @@
  *   --column, -c      CSV column containing stream IDs (default: "streamId")
  *   --filter-column   CSV column to filter on (optional, requires --filter-value)
  *   --filter-value    Value the filter-column must equal to include the row
+ *   --retry-errors [file]  Retry the failed and unreached streams of a run (default: latest run log)
+ *   --max-age <hours>      Allow a source log older than 24 hours
  */
 
-const { api, resolveIds, createLogger, showHelp } = require('../lib');
+const { api, resolveIds, createLogger, loadSource, printSource, confirmSource, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'bulk-update-stream-update-method';
+const SELECTION_FLAGS = ['file', 'f', 'id', 'ids', 'column', 'c', 'filter-column', 'filter-value'];
 
 const HELP_TEXT = `Usage: node cli.js bulk-update-stream-update-method [options]
 
@@ -29,7 +35,11 @@ Options:
   --ids             Comma-separated stream IDs
   --column, -c      CSV column containing stream IDs (default: "streamId")
   --filter-column   CSV column to filter on (optional, requires --filter-value)
-  --filter-value    Value the filter-column must equal to include the row`;
+  --filter-value    Value the filter-column must equal to include the row
+
+Retrying an earlier run:
+  --retry-errors [file]  Retry the failed and unreached items of a run (default: the latest run log)
+  --max-age <hours>      Allow a source log older than 24 hours`;
 
 function modifyUpdateMode(streamDefinition) {
 	if (!streamDefinition.configuration || !Array.isArray(streamDefinition.configuration)) {
@@ -73,18 +83,45 @@ function modifyUpdateMode(streamDefinition) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	const { ids: streamIds, debugMode } = resolveIds(argv, {
-		idFlag: 'id',
-		idsFlag: 'ids',
-		columnDefault: 'streamId'
+	const source = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		toEntries: (row) => (row.streamId == null ? null : String(row.streamId))
 	});
 
-	const logger = createLogger('bulk-update-stream-update-method', {
+	let streamIds;
+	let debugMode = false;
+	if (source) {
+		streamIds = source.entries;
+	} else {
+		({ ids: streamIds, debugMode } = resolveIds(argv, {
+			idFlag: 'id',
+			idsFlag: 'ids',
+			columnDefault: 'streamId'
+		}));
+	}
+	const entries = streamIds.map((streamId) => ({ streamId }));
+
+	const logger = createLogger(COMMAND, {
 		debugMode,
+		source,
 		runMeta: { updateMethod: 'APPEND' }
 	});
 
+	if (source) {
+		printSource(source);
+		if (streamIds.length === 0) {
+			console.log('The source log has nothing left to retry.');
+			process.exit(0);
+		}
+		if (!(await confirmSource(`Retry ${streamIds.length} stream(s)? (yes/no): `, argv))) {
+			console.log('Cancelled.');
+			process.exit(0);
+		}
+	}
+
 	console.log(`Processing ${streamIds.length} stream(s)...\n`);
+	logger.beginExecution(entries, (entry) => String(entry.streamId));
 
 	let successCount = 0;
 	let skipCount = 0;
@@ -139,7 +176,7 @@ async function main() {
 	logger.writeRunLog({ total: streamIds.length, updated: successCount, errors: errorCount });
 
 	if (errorCount > 0) {
-		console.error('\nSome streams failed to update. Check the error messages above.');
+		console.error(`\nSome streams failed to update. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`);
 		process.exit(1);
 	} else {
 		console.log('\nAll streams processed successfully!');

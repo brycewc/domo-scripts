@@ -17,6 +17,8 @@
  *   node cli.js bulk-revoke-access-tokens --owner 1250228141
  *   node cli.js bulk-revoke-access-tokens --expired
  *   node cli.js bulk-revoke-access-tokens --deleted-owners --dry-run
+ *   node cli.js bulk-revoke-access-tokens --from-dry-run
+ *   node cli.js bulk-revoke-access-tokens --retry-errors
  *
  * Options:
  *   --id              Single token ID (enables debug logging)
@@ -29,12 +31,32 @@
  *   --expired         Revoke every token whose expiry is in the past
  *   --deleted-owners  Revoke every token whose owner has been deleted
  *   --dry-run         Preview without revoking
+ *   --from-dry-run [file]  Revoke exactly the tokens a dry run listed (default: latest dry run)
+ *   --retry-errors [file]  Retry the failed and unreached revokes of a run (default: latest run)
+ *   --max-age <hours>      Allow a source log older than 24 hours
+ *   --yes, -y              Skip the confirmation prompt for the two flags above
  */
 
-const { api, config, resolveIds, createLogger, showHelp } = require('../lib');
+const { api, config, resolveIds, createLogger, loadSource, printSource, confirmSource, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
 
+const COMMAND = 'bulk-revoke-access-tokens';
 const USER_INDEX_BATCH_SIZE = 50;
+const SELECTION_FLAGS = [
+	'id',
+	'ids',
+	'file',
+	'f',
+	'column',
+	'c',
+	'filter-column',
+	'filter-value',
+	'owner',
+	'expired',
+	'deleted-owners',
+	'dry-run',
+	'dry'
+];
 
 const HELP_TEXT = `Usage: node cli.js bulk-revoke-access-tokens [options]
 
@@ -53,7 +75,13 @@ Optional:
   --filter-column <col>  Filter input CSV rows by column
   --filter-value <val>   Required value for --filter-column
   --dry-run              Preview without revoking
-  --help                 Show this help`;
+  --help                 Show this help
+
+Reusing an earlier run (tokens already gone are skipped):
+  --from-dry-run [file]  Revoke exactly the tokens a dry run listed (default: the latest dry run log)
+  --retry-errors [file]  Retry the failed and unreached revokes of a run (default: the latest run log)
+  --max-age <hours>      Allow a source log older than 24 hours
+  --yes, -y              Skip the confirmation prompt`;
 
 async function fetchAllAccessTokens() {
 	const tokens = await api.get('/data/v1/accesstokens');
@@ -129,14 +157,34 @@ function describeToken(token) {
 	return parts.join(' ');
 }
 
-async function main() {
-	showHelp(argv, HELP_TEXT);
+function tokenEntry(id, token) {
+	return {
+		id: String(id),
+		name: token ? token.name || null : null,
+		ownerId: token ? (token.ownerId ?? null) : null,
+		expires: token ? (token.expires ?? null) : null
+	};
+}
 
-	const dryRun = argv['dry-run'] || argv.dry || false;
-	const owner = argv.owner != null ? String(argv.owner) : null;
-	const expiredOnly = Boolean(argv.expired);
-	const deletedOwnersOnly = Boolean(argv['deleted-owners']);
+// Drops tokens that are no longer present so a stale plan never re-deletes an id.
+async function loadFromSource(source) {
+	const live = new Map((await fetchAllAccessTokens()).map((t) => [String(t.id), t]));
+	const tokenById = {};
+	const tokenIds = [];
+	const missing = [];
+	for (const entry of source.entries) {
+		const token = live.get(entry.id);
+		if (token) {
+			tokenIds.push(entry.id);
+			tokenById[entry.id] = token;
+		} else {
+			missing.push(entry);
+		}
+	}
+	return { tokenIds, tokenById, missing };
+}
 
+async function discoverTokens(owner, expiredOnly, deletedOwnersOnly) {
 	const fetchModes = [owner && '--owner', expiredOnly && '--expired', deletedOwnersOnly && '--deleted-owners'].filter(Boolean);
 	if (fetchModes.length > 1) {
 		throw new Error(`Cannot combine ${fetchModes.join(' and ')}`);
@@ -204,31 +252,83 @@ async function main() {
 				: `file=${argv.file || argv.f}`;
 	}
 
-	const logger = createLogger('bulk-revoke-access-tokens', {
+	return { tokenIds, tokenById, debugMode, sourceLabel: source };
+}
+
+async function main() {
+	showHelp(argv, HELP_TEXT);
+
+	const planSource = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		toEntries: (row) => (row.id == null ? null : tokenEntry(row.id, row))
+	});
+	const meta = planSource ? planSource.meta : null;
+	const dryRun = argv['dry-run'] || argv.dry || false;
+	const owner = meta ? meta.owner : argv.owner != null ? String(argv.owner) : null;
+	const expiredOnly = meta ? Boolean(meta.expiredOnly) : Boolean(argv.expired);
+	const deletedOwnersOnly = meta ? Boolean(meta.deletedOwnersOnly) : Boolean(argv['deleted-owners']);
+
+	let tokenIds;
+	let tokenById;
+	let debugMode = false;
+	let sourceLabel;
+	let missing = [];
+	if (planSource) {
+		sourceLabel = meta.source;
+		console.log('Fetching all access tokens to check which logged tokens still exist...');
+		({ tokenIds, tokenById, missing } = await loadFromSource(planSource));
+		console.log('');
+	} else {
+		({ tokenIds, tokenById, debugMode, sourceLabel } = await discoverTokens(owner, expiredOnly, deletedOwnersOnly));
+	}
+
+	const logger = createLogger(COMMAND, {
 		debugMode,
 		dryRun,
+		source: planSource,
 		runMeta: {
-			source,
+			source: sourceLabel,
 			owner: owner || null,
 			expiredOnly,
 			deletedOwnersOnly,
-			file: argv.file || argv.f || null,
-			column: argv.column || argv.c || 'Token ID',
-			total: tokenIds.length
+			file: meta ? meta.file : argv.file || argv.f || null,
+			column: meta ? meta.column : argv.column || argv.c || 'Token ID',
+			total: tokenIds.length + missing.length
 		}
 	});
 
 	console.log('Bulk Revoke Access Tokens');
 	console.log('=========================\n');
-	if (dryRun) console.log('*** DRY RUN — no tokens will be revoked ***\n');
-	console.log(`Source: ${source}`);
+	if (dryRun) console.log('*** DRY RUN: no tokens will be revoked ***\n');
+	if (planSource) printSource(planSource);
+	console.log(`Source: ${sourceLabel}`);
 	console.log(`Tokens: ${tokenIds.length}\n`);
 
+	for (const entry of missing) {
+		console.log(`  ↷ id=${entry.id} no longer exists (skipped)`);
+		logger.addResult({ ...entry, status: 'skipped', reason: 'not-found', error: null });
+	}
+	if (missing.length > 0) console.log('');
+
 	if (tokenIds.length === 0) {
-		console.log('No matching tokens found. Nothing to do.');
-		logger.writeRunLog({ successCount: 0, errorCount: 0 });
+		console.log(planSource ? 'None of the logged tokens still exist. Nothing to do.' : 'No matching tokens found. Nothing to do.');
+		logger.writeRunLog({ successCount: 0, skippedCount: missing.length, errorCount: 0 });
 		return;
 	}
+
+	if (planSource) {
+		const ok = await confirmSource(`Revoke ${tokenIds.length} access token(s)? (yes/no): `, argv);
+		if (!ok) {
+			console.log('Aborted. No changes were made.');
+			process.exit(0);
+		}
+		console.log('');
+	}
+
+	logger.beginExecution(
+		tokenIds.map((id) => tokenEntry(id, tokenById[id])),
+		(row) => String(row.id)
+	);
 
 	let successCount = 0;
 	let errorCount = 0;
@@ -242,14 +342,7 @@ async function main() {
 		const debugLog = debugMode
 			? { id, token: meta || null, timestamp: new Date().toISOString() }
 			: null;
-		const entry = {
-			id,
-			name: meta ? meta.name || null : null,
-			ownerId: meta ? meta.ownerId ?? null : null,
-			expires: meta ? meta.expires ?? null : null,
-			status: null,
-			error: null
-		};
+		const entry = { ...tokenEntry(id, meta), status: null, error: null };
 
 		try {
 			if (dryRun) {
@@ -278,14 +371,22 @@ async function main() {
 	}
 
 	console.log('\n=== Summary ===');
-	console.log(`Total:     ${tokenIds.length}`);
+	console.log(`Total:     ${tokenIds.length + missing.length}`);
 	console.log(`${dryRun ? 'Would revoke' : 'Revoked'}: ${successCount}`);
+	if (planSource) console.log(`Gone:      ${missing.length}`);
 	console.log(`Errors:    ${errorCount}`);
 
-	logger.writeRunLog({ successCount, errorCount });
+	logger.writeRunLog({ successCount, skippedCount: missing.length, errorCount });
 
+	if (dryRun) {
+		console.log(`\nRun "node cli.js ${COMMAND} --from-dry-run" to apply this plan.`);
+	}
 	if (errorCount > 0) {
-		console.error('\nSome tokens failed. Check the error messages above.');
+		console.error(
+			dryRun || debugMode
+				? '\nSome tokens failed. Check the error messages above.'
+				: `\nSome tokens failed. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`
+		);
 		process.exit(1);
 	}
 }

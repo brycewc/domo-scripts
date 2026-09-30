@@ -8,22 +8,31 @@
  * Usage:
  *   node cli.js run-workflow-from-csv --workflow-id "<id>" --file "/path/to/data.csv"
  *   node cli.js run-workflow-from-csv --workflow-id "<id>" --file "/path/to/data.csv" --numeric-columns "hireDate,salary"
+ *   node cli.js run-workflow-from-csv --retry-errors  (re-sends the body recorded in the failed run's log)
  */
 
 const fs = require('fs');
 const { parse } = require('csv-parse/sync');
-const { api, createLogger, showHelp } = require('../lib');
+const { api, createLogger, loadSource, printSource, confirmSource, showHelp } = require('../lib');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'run-workflow-from-csv';
+const SELECTION_FLAGS = ['workflow-id', 'w', 'file', 'f', 'numeric-columns', 'n'];
 
 const HELP_TEXT = `Usage:
   node cli.js run-workflow-from-csv --workflow-id "<id>" --file "/path/to/data.csv"
   node cli.js run-workflow-from-csv --workflow-id "<id>" --file "/path/to/data.csv" --numeric-columns "hireDate,salary"
+  node cli.js run-workflow-from-csv --retry-errors
 
 Options:
   --workflow-id, -w       Workflow model ID (required)
   --file, -f              Path to the CSV file (required)
   --numeric-columns, -n   Comma-separated column names to parse as integers
-  --help, -h              Show this help message`;
+  --help, -h              Show this help message
+
+Retrying an earlier run (re-sends the workflow body recorded in the log):
+  --retry-errors [file]   Retry the failed and unreached items of a run (default: the latest run log)
+  --max-age <hours>       Allow a source log older than 24 hours`;
 
 showHelp(argv, HELP_TEXT);
 
@@ -54,39 +63,77 @@ function csvToWorkflowBody(csvPath, numericColumns) {
 }
 
 async function main() {
-	const workflowId = argv['workflow-id'] || argv.w;
-	const csvPath = argv.file || argv.f;
-	const numericColumnsArg = argv['numeric-columns'] || argv.n || '';
-	const numericColumns = new Set(
-		String(numericColumnsArg).split(',').map((s) => s.trim()).filter(Boolean)
-	);
+	const source = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		toEntries: (row) => (row.workflowId == null || !row.body ? null : { workflowId: row.workflowId, body: row.body })
+	});
 
-	if (!workflowId || !csvPath) {
-		console.error('Error: --workflow-id and --file are required');
-		console.error('\nUsage:');
-		console.error(
-			'  node cli.js run-workflow-from-csv --workflow-id "<id>" --file "/path/to/data.csv"'
+	let workflowId;
+	let body;
+	if (source) {
+		printSource(source);
+		if (source.entries.length === 0) {
+			console.log('The source log has nothing left to retry.');
+			process.exit(0);
+		}
+		({ workflowId, body } = source.entries[0]);
+	} else {
+		workflowId = argv['workflow-id'] || argv.w;
+		const csvPath = argv.file || argv.f;
+		const numericColumnsArg = argv['numeric-columns'] || argv.n || '';
+		const numericColumns = new Set(
+			String(numericColumnsArg).split(',').map((s) => s.trim()).filter(Boolean)
 		);
-		process.exit(1);
-	}
 
-	if (!fs.existsSync(csvPath)) {
-		console.error(`Error: file not found: ${csvPath}`);
-		process.exit(1);
-	}
+		if (!workflowId || !csvPath) {
+			console.error('Error: --workflow-id and --file are required');
+			console.error('\nUsage:');
+			console.error(
+				'  node cli.js run-workflow-from-csv --workflow-id "<id>" --file "/path/to/data.csv"'
+			);
+			process.exit(1);
+		}
 
-	console.log('Converting CSV to workflow body...');
-	const body = csvToWorkflowBody(csvPath, numericColumns);
+		if (!fs.existsSync(csvPath)) {
+			console.error(`Error: file not found: ${csvPath}`);
+			process.exit(1);
+		}
+
+		console.log('Converting CSV to workflow body...');
+		body = csvToWorkflowBody(csvPath, numericColumns);
+	}
 	const columnNames = Object.keys(body);
 	const rows = body[columnNames[0]].length;
+	console.log(`  Workflow: ${workflowId}`);
 	console.log(`  Columns: ${columnNames.join(', ')}`);
 	console.log(`  Rows: ${rows}`);
 
-	const logger = createLogger('run-workflow-from-csv', {
+	const logger = createLogger(COMMAND, {
 		debugMode: false,
+		source,
 		runMeta: { workflowId, rows }
 	});
 
+	if (source && !(await confirmSource(`\nRun workflow ${workflowId} again with these ${rows} row(s)? (yes/no): `, argv))) {
+		console.log('Cancelled.');
+		process.exit(0);
+	}
+	const entry = { workflowId, body };
+	logger.beginExecution([entry], (e) => String(e.workflowId));
+
+	try {
+		await runWorkflow(workflowId, body, logger);
+	} catch (err) {
+		logger.addResult({ row: 0, ...entry, status: 'error', error: err.message });
+		logger.writeRunLog({ total: 1, success: 0, errors: 1 });
+		console.error(err.message || err);
+		console.error(`\nThe workflow run failed. Run "node cli.js ${COMMAND} --retry-errors" to retry it.`);
+		process.exit(1);
+	}
+}
+
+async function runWorkflow(workflowId, body, logger) {
 	console.log('Fetching workflow model...');
 	const model = await api.get(`/workflow/v1/models/${workflowId}`);
 	const versions = model.versions;
@@ -112,35 +159,25 @@ async function main() {
 	console.log(
 		`Activating workflow (version ${latest.version}, trigger ${manualTriggerId})...`
 	);
+	let result;
 	try {
-		const result = await api.post(
-			`/workflow/v2/triggers/${manualTriggerId}/activate`,
-			body
-		);
-		console.log('Workflow run triggered successfully.');
-		if (result && typeof result === 'object') {
-			console.log(JSON.stringify(result, null, 2));
-		}
-		logger.addResult({
-			row: 0,
-			workflowId,
-			version: latest.version,
-			manualTriggerId,
-			status: 'success'
-		});
-		logger.writeRunLog({ total: 1, success: 1, errors: 0 });
+		result = await api.post(`/workflow/v2/triggers/${manualTriggerId}/activate`, body);
 	} catch (err) {
-		logger.addResult({
-			row: 0,
-			workflowId,
-			version: latest.version,
-			manualTriggerId,
-			status: 'error',
-			error: err.message
-		});
-		logger.writeRunLog({ total: 1, success: 0, errors: 1 });
+		err.message = `Activating version ${latest.version} (trigger ${manualTriggerId}) failed: ${err.message}`;
 		throw err;
 	}
+	console.log('Workflow run triggered successfully.');
+	if (result && typeof result === 'object') {
+		console.log(JSON.stringify(result, null, 2));
+	}
+	logger.addResult({
+		row: 0,
+		workflowId,
+		version: latest.version,
+		manualTriggerId,
+		status: 'success'
+	});
+	logger.writeRunLog({ total: 1, success: 1, errors: 0 });
 }
 
 main().catch((err) => {

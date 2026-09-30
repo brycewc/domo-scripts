@@ -2,7 +2,7 @@
  * Replace every reference to one beast mode / variable with another.
  *
  * Beast modes and variables are both "functions" on the Domo backend. A function
- * that nests another references it by numeric template id — `DOMO_BEAST_MODE(<id>)`
+ * that nests another references it by numeric template id: `DOMO_BEAST_MODE(<id>)`
  * in the formula, and a `FUNCTION_TEMPLATE` entry in its links. This command finds
  * every function that uses --old-id (via the templateDependencies search), does a
  * full GET of each, rewrites the reference to --new-id in the formula and links,
@@ -11,26 +11,35 @@
  * repointed automatically.
  *
  * WARNING: This rewrites live beast modes / variables. Use --dry-run to preview the
- * affected functions (and the rewritten payloads in the run log) before applying.
+ * affected functions (and each rewritten formula in the run log) before applying.
+ * --from-dry-run skips the search but re-fetches and rewrites each function,
+ * skipping any whose checksum changed since the dry run.
  *
  * Usage:
  *   node cli.js replace-function-references --old-id 412339 --new-id 516658 --dry-run
  *   node cli.js replace-function-references --old-id 412339 --new-id 516658
  *   node cli.js replace-function-references --old-id 412339 --new-id 516658 --batch-size 25 --yes
+ *   node cli.js replace-function-references --from-dry-run
+ *   node cli.js replace-function-references --retry-errors
  *
  * Options:
- *   --old-id            ID of the beast mode / variable currently referenced (required)
- *   --new-id            ID of the beast mode / variable to reference instead (required)
- *   --batch-size, -b    Functions per bulk update call (default: 50)
- *   --yes, -y           Skip the confirmation prompt
- *   --dry-run           Preview the affected functions without writing
+ *   --old-id               ID of the beast mode / variable currently referenced (required)
+ *   --new-id               ID of the beast mode / variable to reference instead (required)
+ *   --batch-size, -b       Functions per bulk update call (default: 50)
+ *   --yes, -y              Skip the confirmation prompt
+ *   --dry-run              Preview the affected functions without writing
+ *   --from-dry-run [file]  Run exactly what a dry run planned (default: the latest dry run log)
+ *   --retry-errors [file]  Retry the failed and unreached items of a run (default: the latest run log)
+ *   --max-age <hours>      Allow a source log older than 24 hours
  */
 
-const { api, config, createLogger, showHelp } = require('../lib');
+const { api, config, createLogger, loadSource, printSource, showHelp } = require('../lib');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
 
+const COMMAND = 'replace-function-references';
 const PAGE_SIZE = 100;
+const SELECTION_FLAGS = ['old-id', 'new-id', 'dry-run', 'dry'];
 
 const HELP_TEXT = `Usage: node cli.js replace-function-references --old-id <id> --new-id <id> [options]
 
@@ -41,11 +50,16 @@ and links, and saves them back in batches. Domo re-derives nesting server-side.
 WARNING: This rewrites live beast modes / variables.
 
 Options:
-  --old-id          ID of the beast mode / variable currently referenced (required)
-  --new-id          ID of the beast mode / variable to reference instead (required)
-  --batch-size, -b  Functions per bulk update call (default: 50)
-  --yes, -y         Skip the confirmation prompt
-  --dry-run         Preview the affected functions without writing`;
+  --old-id               ID of the beast mode / variable currently referenced (required)
+  --new-id               ID of the beast mode / variable to reference instead (required)
+  --batch-size, -b       Functions per bulk update call (default: 50)
+  --yes, -y              Skip the confirmation prompt
+  --dry-run              Preview the affected functions without writing
+
+Reusing an earlier run (skips the search; the log's --old-id and --new-id are reused):
+  --from-dry-run [file]  Run exactly what a dry run planned (default: the latest dry run log)
+  --retry-errors [file]  Retry the failed and unreached items of a run (default: the latest run log)
+  --max-age <hours>      Allow a source log older than 24 hours`;
 
 function ask(question) {
 	const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -65,7 +79,7 @@ async function getTemplate(id) {
 // Every function (beast mode or variable) that nests `oldId`, paged in full.
 // Mirrors the screenshot's search: filter on templateDependencies. No notvariable
 // filter, so both beast modes and variables that reference it come back.
-async function findReferencingFunctions(oldId) {
+async function findReferencingFunctions(oldId, newId) {
 	const found = [];
 	let offset = 0;
 	while (true) {
@@ -79,8 +93,8 @@ async function findReferencingFunctions(oldId) {
 		const functions = result.results || [];
 		for (const fn of functions) {
 			// A function can't reference itself, and the replacement shouldn't be
-			// rewritten to point at itself either — skip both defensively.
-			if (String(fn.id) === String(oldId) || String(fn.id) === String(argv['new-id'])) continue;
+			// rewritten to point at itself either, so skip both defensively.
+			if (String(fn.id) === String(oldId) || String(fn.id) === String(newId)) continue;
 			found.push({ id: fn.id, name: fn.name || String(fn.id), variable: fn.variable === true });
 		}
 		offset += PAGE_SIZE;
@@ -142,16 +156,36 @@ async function bulkUpdate(entries) {
 	});
 }
 
+// checkSum tracks the formula; lastModified is the fallback when it is absent.
+function fingerprintOf(template) {
+	return template.checkSum ?? template.lastModified ?? null;
+}
+
+function toEntry(row) {
+	if (row.id == null) return null;
+	return {
+		id: row.id,
+		name: row.name,
+		variable: row.variable === true,
+		fingerprint: row.fingerprint ?? null
+	};
+}
+
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	const oldId = argv['old-id'];
-	const newId = argv['new-id'];
-	const batchSize = parseInt(argv['batch-size'] || argv.b || '50', 10);
+	const source = loadSource(COMMAND, argv, { selectionFlags: SELECTION_FLAGS, toEntries: toEntry });
+	const oldId = source ? source.meta.oldId : argv['old-id'];
+	const newId = source ? source.meta.newId : argv['new-id'];
+	const batchSize = parseInt(argv['batch-size'] || argv.b || (source && source.meta.batchSize) || '50', 10);
 	const dryRun = argv['dry-run'] || argv.dry || false;
 	const skipConfirm = argv.yes || argv.y || false;
 
-	if (oldId === undefined || newId === undefined) {
+	if (oldId == null || newId == null) {
+		if (source) {
+			console.error(`Error: ${source.relPath} does not record --old-id and --new-id.`);
+			process.exit(1);
+		}
 		console.error('Error: both --old-id and --new-id are required.\n');
 		console.error(HELP_TEXT);
 		process.exit(1);
@@ -161,26 +195,28 @@ async function main() {
 		process.exit(1);
 	}
 
-	const logger = createLogger('replace-function-references', {
+	const logger = createLogger(COMMAND, {
 		debugMode: false,
 		dryRun,
+		source,
 		runMeta: { oldId, newId, batchSize }
 	});
 
 	console.log('Replace Function References');
 	console.log('===========================\n');
-	if (dryRun) console.log('*** DRY RUN — no functions will be modified ***\n');
+	if (dryRun) console.log('*** DRY RUN: no functions will be modified ***\n');
+	if (source) printSource(source);
 
-	// Surface both endpoints' names / types. The old id may be a DELETED function —
-	// those still come back from the dependency search even though the template GET
-	// 404s — so tolerate its fetch failing and carry on. The new id must exist:
+	// Surface both endpoints' names / types. The old id may be a DELETED function
+	// (those still come back from the dependency search even though the template GET
+	// 404s), so tolerate its fetch failing and carry on. The new id must exist:
 	// repointing to a missing function would break every dependent formula.
 	let oldFn = null;
 	let newFn;
 	try {
 		oldFn = await getTemplate(oldId);
 	} catch (e) {
-		console.log(`Note: could not load --old-id ${oldId} (${e.message}) — treating it as a deleted function.`);
+		console.log(`Note: could not load --old-id ${oldId} (${e.message}), treating it as a deleted function.`);
 	}
 	try {
 		newFn = await getTemplate(newId);
@@ -205,16 +241,20 @@ async function main() {
 		);
 	}
 
-	console.log('Searching for functions that reference the old id...\n');
-	const referencing = await findReferencingFunctions(oldId);
-
-	if (referencing.length === 0) {
-		console.log('No beast modes or variables reference that id. Nothing to do.');
-		logger.writeRunLog({ total: 0, updated: 0, skipped: 0, errors: 0 });
-		process.exit(0);
+	let referencing;
+	if (source) {
+		referencing = source.entries;
+		console.log(`Re-fetching ${referencing.length} function(s) from the source log...\n`);
+	} else {
+		console.log('Searching for functions that reference the old id...\n');
+		referencing = (await findReferencingFunctions(oldId, newId)).map((fn) => ({ ...fn, fingerprint: null }));
+		if (referencing.length === 0) {
+			console.log('No beast modes or variables reference that id. Nothing to do.');
+			logger.writeRunLog({ total: 0, updated: 0, skipped: 0, errors: 0 });
+			process.exit(0);
+		}
+		console.log(`Found ${referencing.length} function(s) referencing ${oldId}. Fetching full definitions...\n`);
 	}
-
-	console.log(`Found ${referencing.length} function(s) referencing ${oldId}. Fetching full definitions...\n`);
 
 	// Build the rewritten update entries up front so the dry-run preview and the
 	// real write operate on exactly the same payloads.
@@ -222,9 +262,16 @@ async function main() {
 	const skipped = [];
 	let fetchErrors = 0;
 	for (let i = 0; i < referencing.length; i++) {
-		const fn = referencing[i];
+		const planned = referencing[i];
 		try {
-			const template = await getTemplate(fn.id);
+			const template = await getTemplate(planned.id);
+			const current = fingerprintOf(template);
+			if (source && planned.fingerprint != null && current !== planned.fingerprint) {
+				console.log(`  - "${planned.name}" (${planned.id}): changed since the source log, skipping`);
+				skipped.push({ ...planned, status: 'skipped', reason: 'drift' });
+				continue;
+			}
+			const fn = { ...planned, fingerprint: current };
 			const entry = buildUpdateEntry(template, oldId, newId);
 			if (!entry) {
 				console.log(`  - "${fn.name}" (${fn.id}): no reference found in formula/links, skipping`);
@@ -233,8 +280,10 @@ async function main() {
 			}
 			entries.push({ fn, entry });
 		} catch (e) {
-			console.error(`  ✗ "${fn.name}" (${fn.id}): failed to fetch — ${e.message}`);
-			logger.addResult({ ...fn, status: 'error', error: `fetch failed: ${e.message}` });
+			console.error(`  ✗ "${planned.name}" (${planned.id}): failed to fetch: ${e.message}`);
+			// In source mode the fetch belongs to execution, so the row stays retryable.
+			const phase = source ? {} : { phase: 'discover' };
+			logger.addResult({ ...planned, status: 'error', ...phase, error: `fetch failed: ${e.message}` });
 			fetchErrors++;
 		}
 		if (i < referencing.length - 1) await new Promise((r) => setTimeout(r, 100));
@@ -259,6 +308,7 @@ async function main() {
 			logger.addResult({ ...fn, status: 'dry-run', rewrittenExpression: entry.expression });
 		}
 		logger.writeRunLog({ total: referencing.length, updated: 0, skipped: skipped.length, errors: fetchErrors });
+		console.log(`Run "node cli.js ${COMMAND} --from-dry-run" to apply this plan.`);
 		process.exit(0);
 	}
 
@@ -272,6 +322,10 @@ async function main() {
 
 	const totalBatches = Math.ceil(entries.length / batchSize);
 	console.log(`\nUpdating ${entries.length} function(s) in ${totalBatches} batch(es)...\n`);
+	logger.beginExecution(
+		entries.map((e) => e.fn),
+		(row) => String(row.id)
+	);
 
 	let successCount = 0;
 	let errorCount = 0;
@@ -321,7 +375,7 @@ async function main() {
 	});
 
 	if (errorCount + fetchErrors > 0) {
-		console.error('\nSome functions failed. Check the error messages above.');
+		console.error(`\nSome functions failed. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`);
 		process.exit(1);
 	} else {
 		console.log('\nAll references replaced successfully!');

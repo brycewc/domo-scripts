@@ -11,7 +11,7 @@
  * the triggerSettings object AND a per-input executeFlowWhenUpdated flag on both
  * `inputs[]` and the matching LoadFromVault entry in `actions[]`. Clearing only
  * triggerSettings leaves the input-level flag set, and Domo keeps firing the
- * dataflow on dataset updates — so we must clear both.
+ * dataflow on dataset updates, so we must clear both.
  *
  * Time-based (SCHEDULE) triggers are mirrored the same way: the schedule lives in
  * triggerSettings AND in a top-level scheduleInfo cron object, so we null both.
@@ -22,6 +22,7 @@
  *   node cli.js bulk-delete-dataflow-triggers --id 123
  *   node cli.js bulk-delete-dataflow-triggers --ids "123,456,789"
  *   node cli.js bulk-delete-dataflow-triggers --file "dataflows.csv" --dry-run
+ *   node cli.js bulk-delete-dataflow-triggers --retry-errors
  *
  * Options:
  *   --file, -f       CSV file with dataflow IDs
@@ -32,13 +33,31 @@
  *   --filter-value   Value the filter-column must equal to include the row
  *   --description    Version description recorded on the dataflow (default: "Removed all triggers via script")
  *   --dry-run        Preview which dataflows would be modified without applying
+ *   --retry-errors [file]  Retry the failed and unreached dataflows of a run (default: latest run log)
+ *   --max-age <hours>      Allow a source log older than 24 hours
  */
 
 const api = require('../lib/api');
 const { resolveIds } = require('../lib/input');
 const { createLogger } = require('../lib/log');
+const { loadSource, printSource, confirmSource } = require('../lib/plan');
 const { showHelp } = require('../lib/help');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'bulk-delete-dataflow-triggers';
+const SELECTION_FLAGS = [
+	'file',
+	'f',
+	'column',
+	'c',
+	'id',
+	'ids',
+	'filter-column',
+	'filter-value',
+	'description',
+	'dry-run',
+	'dry'
+];
 
 const HELP_TEXT = `Usage:
   node cli.js bulk-delete-dataflow-triggers --file "dataflows.csv"
@@ -58,7 +77,11 @@ Options:
   --filter-column  CSV column to filter on
   --filter-value   Value the filter-column must equal
   --description    Version description recorded on the dataflow (default: "Removed all triggers via script")
-  --dry-run        Preview without applying changes`;
+  --dry-run        Preview without applying changes
+
+Retrying an earlier run (reuses the log's description):
+  --retry-errors [file]  Retry the failed and unreached items of a run (default: the latest run log)
+  --max-age <hours>      Allow a source log older than 24 hours`;
 
 function clearTriggers(definition, description) {
 	const triggers = definition.triggerSettings?.triggers;
@@ -128,27 +151,42 @@ function clearTriggers(definition, description) {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	if (!argv.file && !argv.f && !argv.id && !argv.ids) {
+	const source = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		toEntries: (row) => (row.dataflowId == null ? null : String(row.dataflowId))
+	});
+
+	if (!source && !argv.file && !argv.f && !argv.id && !argv.ids) {
 		console.error('Error: --file, --id, or --ids is required\n');
 		console.error(HELP_TEXT);
 		process.exit(1);
 	}
 
 	const dryRun = argv['dry-run'] || argv.dry || false;
-	const description = argv.description || 'Removed all triggers via script';
+	const description = source
+		? source.meta.description || 'Removed all triggers via script'
+		: argv.description || 'Removed all triggers via script';
 
-	const { ids: dataflowIds, debugMode } = resolveIds(argv, {
-		idFlag: 'id',
-		idsFlag: 'ids',
-		columnDefault: 'DataFlow ID'
-	});
+	let dataflowIds;
+	let debugMode = false;
+	if (source) {
+		dataflowIds = source.entries;
+	} else {
+		({ ids: dataflowIds, debugMode } = resolveIds(argv, {
+			idFlag: 'id',
+			idsFlag: 'ids',
+			columnDefault: 'DataFlow ID'
+		}));
+	}
 
-	const logger = createLogger('bulk-delete-dataflow-triggers', {
+	const logger = createLogger(COMMAND, {
 		debugMode,
 		dryRun,
+		source,
 		runMeta: {
-			file: argv.file || argv.f || null,
-			column: argv.column || argv.c || 'DataFlow ID',
+			file: source ? source.meta.file : argv.file || argv.f || null,
+			column: source ? source.meta.column : argv.column || argv.c || 'DataFlow ID',
 			description,
 			totalDataflows: dataflowIds.length
 		}
@@ -157,8 +195,23 @@ async function main() {
 	console.log('Bulk Delete Dataflow Triggers');
 	console.log('=============================\n');
 	if (dryRun) {
-		console.log('*** DRY RUN — no dataflows will be modified ***\n');
+		console.log('*** DRY RUN: no dataflows will be modified ***\n');
 	}
+	if (source) {
+		printSource(source);
+		if (dataflowIds.length === 0) {
+			console.log('The source log has nothing left to retry.');
+			process.exit(0);
+		}
+		if (!(await confirmSource(`Remove all triggers from ${dataflowIds.length} dataflow(s)? (yes/no): `, argv))) {
+			console.log('Cancelled.');
+			process.exit(0);
+		}
+	}
+	logger.beginExecution(
+		dataflowIds.map((dataflowId) => ({ dataflowId })),
+		(entry) => String(entry.dataflowId)
+	);
 	if (debugMode) {
 		console.log(`Processing single dataflow ${dataflowIds[0]} (debug log enabled)\n`);
 	} else {
@@ -271,7 +324,11 @@ async function main() {
 	logger.writeRunLog({ successCount, skipCount, errorCount });
 
 	if (errorCount > 0) {
-		console.error('\nSome dataflows failed to update. Check the error messages above.');
+		console.error(
+			dryRun
+				? '\nSome dataflows could not be checked. Check the error messages above.'
+				: `\nSome dataflows failed to update. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`
+		);
 		process.exit(1);
 	} else if (dryRun) {
 		console.log('\nRe-run without --dry-run to apply the changes.');

@@ -11,6 +11,7 @@
  *   node cli.js transfer-stream --source-env prod --target-env sandbox --stream-ids 1,2,3
  *   node cli.js transfer-stream --source-env prod --target-env sandbox --file streams.csv
  *   node cli.js transfer-stream --source-env prod --target-env sandbox --stream-id 12345 --dry-run
+ *   node cli.js transfer-stream --source-env prod --target-env sandbox --retry-errors
  */
 
 const argv = require('minimist')(process.argv.slice(2));
@@ -19,10 +20,28 @@ const {
 	loadEnvConfig,
 	resolveIds,
 	createLogger,
+	loadSource,
+	printSource,
+	confirmSource,
 	showHelp,
 	idMapping,
 	rewriteDomain
 } = require('../lib');
+
+const COMMAND = 'transfer-stream';
+const SELECTION_FLAGS = [
+	'stream-id',
+	'stream-ids',
+	'file',
+	'f',
+	'column',
+	'c',
+	'filter-column',
+	'filter-value',
+	'dataset-name',
+	'rewrite-domain',
+	'dry-run'
+];
 
 const HELP_TEXT = `Usage: node cli.js transfer-stream [options]
 
@@ -50,10 +69,15 @@ Optional:
                         streams instead. Useful for non-interactive runs.
   --rewrite-domain      Replace the source instance's <name>.domo.com hostname
                         with the target's everywhere it appears in the stream
-                        body — including JSON-encoded configuration[].value
+                        body, including JSON-encoded configuration[].value
                         blobs. Useful for Domo-on-Domo (governance) transfers
                         where streams reference URLs back to their own instance.
   --help                Show this help
+
+Retrying an earlier run (pass the same --source-env/--target-env; reuses the
+log's dataset name and domain rewrite; streams already in the mapping file are skipped):
+  --retry-errors [file] Retry the failed and unreached items of a run (default: the latest run log)
+  --max-age <hours>     Allow a source log older than 24 hours
 
 Account translation:
   If the source stream has an account, its ID is looked up under "accounts" in
@@ -141,31 +165,56 @@ async function main() {
 		process.exit(1);
 	}
 
-	const { ids: streamIds, debugMode } = resolveIds(argv, {
-		name: 'stream',
-		columnDefault: 'Stream ID'
-	});
-
-	const dryRun = Boolean(argv['dry-run']);
-	const noPrompt = Boolean(argv['no-prompt']);
-	const allowPrompt = !noPrompt && !dryRun;
-	const shouldRewriteDomain = Boolean(argv['rewrite-domain']);
-	const datasetNameOverride = argv['dataset-name'] || null;
-
 	const sourceCfg = loadEnvConfig(sourceEnv);
 	const targetCfg = loadEnvConfig(targetEnv);
+	const instances = {
+		source: { env: sourceCfg.env, instance: sourceCfg.instance },
+		target: { env: targetCfg.env, instance: targetCfg.instance }
+	};
+
+	const retrySource = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		instances,
+		toEntries: (row) => (row.sourceStreamId == null ? null : String(row.sourceStreamId))
+	});
+	const meta = retrySource ? retrySource.meta : null;
+	if (meta && !('rewriteDomain' in meta)) {
+		console.error(
+			`Error: ${retrySource.relPath} predates --retry-errors and does not record --rewrite-domain or --dataset-name. Re-run with the original flags and --stream-ids instead.`
+		);
+		process.exit(1);
+	}
+
+	let streamIds;
+	let debugMode = false;
+	if (retrySource) {
+		streamIds = retrySource.entries;
+	} else {
+		({ ids: streamIds, debugMode } = resolveIds(argv, {
+			name: 'stream',
+			columnDefault: 'Stream ID'
+		}));
+	}
+
+	const dryRun = Boolean(argv['dry-run']);
+	// minimist turns --no-prompt into prompt: false.
+	const noPrompt = argv.prompt === false || Boolean(argv['no-prompt']);
+	const allowPrompt = !noPrompt && !dryRun;
+	const shouldRewriteDomain = meta ? Boolean(meta.rewriteDomain) : Boolean(argv['rewrite-domain']);
+	const datasetNameOverride = meta ? meta.datasetName || null : argv['dataset-name'] || null;
+
 	const sourceApi = createApiClient(sourceCfg);
 	const targetApi = createApiClient(targetCfg);
 
 	const mapping = idMapping.loadMapping(sourceEnv, targetEnv);
 
-	const logger = createLogger('transfer-stream', {
+	const logger = createLogger(COMMAND, {
 		debugMode,
 		dryRun,
-		instances: {
-			source: { env: sourceCfg.env, instance: sourceCfg.instance },
-			target: { env: targetCfg.env, instance: targetCfg.instance }
-		}
+		instances,
+		source: retrySource,
+		runMeta: { datasetName: datasetNameOverride, rewriteDomain: shouldRewriteDomain }
 	});
 
 	const sourceLabel = `${sourceCfg.env} (${sourceCfg.instance})`;
@@ -180,9 +229,25 @@ async function main() {
 	console.log(`Streams:  ${streamIds.length}`);
 	console.log(`Mapping:  ${mapping.file}`);
 	if (dryRun) console.log('Dry run:  yes (no POST, no prompts, mapping not saved)');
-	else if (noPrompt) console.log('Prompts:  disabled (unmapped accounts will skip)');
+	else if (noPrompt) console.log('Prompts:  disabled (unmapped accounts fail; map them, then --retry-errors)');
 	if (shouldRewriteDomain) console.log(`Rewrite:  ${sourceDomain} → ${targetDomain}`);
 	console.log();
+
+	if (retrySource) {
+		printSource(retrySource);
+		if (streamIds.length === 0) {
+			console.log('The source log has nothing left to retry.');
+			process.exit(0);
+		}
+		if (!(await confirmSource(`Retry transferring ${streamIds.length} stream(s)? (yes/no): `, argv))) {
+			console.log('Cancelled.');
+			process.exit(0);
+		}
+	}
+	logger.beginExecution(
+		streamIds.map((sourceStreamId) => ({ sourceStreamId })),
+		(entry) => String(entry.sourceStreamId)
+	);
 
 	let createdCount = 0;
 	let skippedCount = 0;
@@ -191,6 +256,20 @@ async function main() {
 	for (let i = 0; i < streamIds.length; i++) {
 		const sourceStreamId = streamIds[i];
 		console.log(`[${i + 1}/${streamIds.length}] Stream ${sourceStreamId}`);
+
+		// The create may have succeeded before the failure that put this stream in the retry set.
+		const existingTargetId = retrySource ? idMapping.translate(mapping, 'streams', sourceStreamId) : null;
+		if (existingTargetId != null) {
+			console.log(`  Skipped: already transferred as stream ${existingTargetId} (per ${mapping.file})`);
+			logger.addResult({
+				sourceStreamId,
+				targetStreamId: existingTargetId,
+				status: 'skipped',
+				reason: 'already-transferred'
+			});
+			skippedCount++;
+			continue;
+		}
 
 		try {
 			const source = await sourceApi.get(`/data/v1/streams/${sourceStreamId}?fields=all`);
@@ -220,19 +299,20 @@ async function main() {
 					console.error(`  ✗ ${err.message}`);
 					logger.addResult({
 						sourceStreamId,
-						status: 'skipped',
+						status: 'error',
 						reason: 'missing-account-mapping',
+						error: err.message,
 						sourceAccountId: source.account && source.account.id
 					});
 					if (debugMode) logger.writeDebugLog(sourceStreamId, { source, error: err.message });
-					skippedCount++;
+					errorCount++;
 					continue;
 				}
 				throw err;
 			}
 
 			if (dryRun) {
-				console.log('  Dry run — would POST to /data/v1/streams');
+				console.log('  Dry run: would POST to /data/v1/streams');
 				logger.addResult({
 					sourceStreamId,
 					status: 'dry-run',
@@ -257,9 +337,11 @@ async function main() {
 				oldId: sourceDatasetId,
 				newId: newDatasetId
 			});
+			// Saved per stream so an interrupted run still records what it created.
+			idMapping.saveMapping(mapping);
 
 			logger.addResult({
-				sourceStreamId: source.id,
+				sourceStreamId,
 				targetStreamId: newStream.id,
 				sourceDatasetId,
 				targetDatasetId: newDatasetId,
@@ -285,7 +367,6 @@ async function main() {
 	}
 
 	if (!dryRun && createdCount > 0) {
-		idMapping.saveMapping(mapping);
 		console.log(`\nMapping saved to ${mapping.file}`);
 	}
 
@@ -303,7 +384,14 @@ async function main() {
 
 	logger.writeRunLog(summary);
 
-	if (errorCount > 0) process.exit(1);
+	if (errorCount > 0) {
+		if (!dryRun) {
+			console.error(
+				`\nSome streams failed. Run "node cli.js ${COMMAND} --source-env ${sourceEnv} --target-env ${targetEnv} --retry-errors" to retry them.`
+			);
+		}
+		process.exit(1);
+	}
 }
 
 main().catch((err) => {

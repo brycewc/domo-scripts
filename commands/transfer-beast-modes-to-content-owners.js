@@ -20,6 +20,8 @@
  *   node cli.js transfer-beast-modes-to-content-owners --from-user 12345 --output plan.csv --dry-run
  *   node cli.js transfer-beast-modes-to-content-owners --from-user 12345 --verify --yes
  *   node cli.js transfer-beast-modes-to-content-owners --from-user 12345 --manager 67890
+ *   node cli.js transfer-beast-modes-to-content-owners --from-dry-run
+ *   node cli.js transfer-beast-modes-to-content-owners --retry-errors
  *
  * Options:
  *   --from-user, -u      User ID whose beast modes are transferred (required)
@@ -33,12 +35,32 @@
  *   --verify             Re-read every transferred beast mode and confirm the owner moved
  *   --yes, -y            Skip the confirmation prompt
  *   --dry-run            Print the routing plan without transferring anything
+ *   --from-dry-run [file]  Transfer exactly what a dry run routed (default: latest dry run)
+ *   --retry-errors [file]  Retry the failed and unreached transfers of a run (default: latest run)
+ *   --max-age <hours>    Allow a source log older than 24 hours
+ *
+ * Every transfer re-reads the beast mode first and skips it when --from-user no
+ * longer owns it, so replaying an old plan never takes a beast mode off someone else.
  */
 
-const { api, config, createLogger, showHelp } = require('../lib');
+const { api, config, createLogger, loadSource, printSource, showHelp } = require('../lib');
 const fs = require('fs');
 const readline = require('readline');
 const argv = require('minimist')(process.argv.slice(2));
+
+const COMMAND = 'transfer-beast-modes-to-content-owners';
+const LOG_NAME = 'transferBeastModesToContentOwners';
+const SELECTION_FLAGS = [
+	'from-user',
+	'u',
+	'manager',
+	'dataflow-map-dataset',
+	'max',
+	'm',
+	'allow-inactive-owner',
+	'dry-run',
+	'dry'
+];
 
 const PAGE_SIZE = 100;
 const CARD_BATCH = 100;
@@ -89,7 +111,13 @@ Optional:
                           owner actually moved. Skipped on a dry run.
   --yes, -y               Skip the confirmation prompt
   --dry-run               Print the routing plan without transferring anything
-  --help                  Show this help`;
+  --help                  Show this help
+
+Reusing an earlier run (skips the search and routing; the log's options are reused):
+  --from-dry-run [file]   Transfer exactly what a dry run routed (default: the latest dry run log)
+  --retry-errors [file]   Retry the failed and unreached transfers of a run (default: the latest run log)
+  --max-age <hours>       Allow a source log older than 24 hours
+A beast mode --from-user no longer owns is skipped, never transferred.`;
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -525,26 +553,37 @@ async function bulkUpdate(updates) {
 	}
 }
 
-async function readUpdate(id, toUserId) {
+function templateOwnerId(template) {
+	const owner = template.owner && template.owner.id != null ? template.owner.id : template.owner;
+	return owner == null ? null : String(owner);
+}
+
+async function readUpdate(id, fromUserId, toUserId) {
 	const template = await safe(`read template ${id}`, () => api.get(`/query/v1/functions/template/${id}?hidden=true`));
-	if (!template) return null;
+	if (!template) return { error: 'could not re-read template' };
+	const owner = templateOwnerId(template);
+	if (owner !== String(fromUserId)) {
+		return { skip: owner === String(toUserId) ? 'already-transferred' : 'owner-changed', owner };
+	}
 	// Only `owner` may move. Echoing the links back exactly as the server holds them
 	// leaves expression, checkSum, legacyId and status untouched, and omitting them
 	// entirely makes the endpoint return HTTP 500.
-	return { id: template.id, owner: Number(toUserId), links: template.links || [] };
+	return { update: { id: template.id, owner: Number(toUserId), links: template.links || [] } };
 }
 
-async function transferToOwner(plans, toUserId, batchSize) {
+async function transferToOwner(plans, fromUserId, toUserId, batchSize) {
 	const transferred = [];
 	const failed = [];
+	const skipped = [];
 
 	for (let i = 0; i < plans.length; i += batchSize) {
 		const chunk = plans.slice(i, i + batchSize);
 		const updates = [];
 		for (const plan of chunk) {
-			const update = await readUpdate(plan.id, toUserId);
-			if (update) updates.push({ plan, update });
-			else failed.push({ plan, error: 'could not re-read template' });
+			const read = await readUpdate(plan.id, fromUserId, toUserId);
+			if (read.update) updates.push({ plan, update: read.update });
+			else if (read.skip) skipped.push({ plan, reason: read.skip, owner: read.owner });
+			else failed.push({ plan, error: read.error });
 			await delay(CALL_DELAY);
 		}
 		if (updates.length === 0) continue;
@@ -555,13 +594,15 @@ async function transferToOwner(plans, toUserId, batchSize) {
 			console.log(`    Batch failed, retrying ${updates.length} beast mode(s) individually...`);
 			for (const { plan, update } of updates) {
 				let ok = await bulkUpdate([update]);
+				let fresh = null;
 				if (!ok) {
 					// "Function links cannot be updated using the update template endpoint"
 					// shows up transiently and clears on a retry with freshly read links.
-					const fresh = await readUpdate(plan.id, toUserId);
-					if (fresh) ok = await bulkUpdate([fresh]);
+					fresh = await readUpdate(plan.id, fromUserId, toUserId);
+					if (fresh.update) ok = await bulkUpdate([fresh.update]);
 				}
 				if (ok) transferred.push(plan);
+				else if (fresh && fresh.skip) skipped.push({ plan, reason: fresh.skip, owner: fresh.owner });
 				else failed.push({ plan, error: 'bulk update rejected the beast mode twice' });
 				await delay(CALL_DELAY);
 			}
@@ -569,7 +610,7 @@ async function transferToOwner(plans, toUserId, batchSize) {
 		await delay(BATCH_DELAY);
 	}
 
-	return { transferred, failed };
+	return { transferred, failed, skipped };
 }
 
 // Domo reports success on the write call and the search index that discovery uses
@@ -586,7 +627,7 @@ async function verifyTransfers(plans) {
 			problems.push({ id: plan.id, name: plan.name, issue: 'could not re-read after transfer' });
 			continue;
 		}
-		const owner = template.owner && template.owner.id != null ? template.owner.id : template.owner;
+		const owner = templateOwnerId(template);
 		if (owner == null) problems.push({ id: plan.id, name: plan.name, issue: 'OWNERLESS after transfer' });
 		else if (String(owner) !== String(plan.destination)) {
 			problems.push({ id: plan.id, name: plan.name, issue: `owner is ${owner}, expected ${plan.destination}` });
@@ -711,61 +752,139 @@ function printPreview(plans) {
 	}
 }
 
+function planRow(plan) {
+	return {
+		id: plan.id,
+		name: plan.name,
+		scope: plan.scope,
+		resourceId: plan.resourceId,
+		resourceName: plan.resourceName,
+		owners: plan.owners,
+		destination: plan.destination,
+		rule: plan.rule,
+		note: plan.note,
+		status: plan.status,
+		error: plan.error || null,
+		...(plan.reason ? { reason: plan.reason, currentOwner: plan.currentOwner } : {})
+	};
+}
+
+function rowToPlan(row) {
+	if (row.id == null || !row.destination) return null;
+	const { status, error, reason, currentOwner, ...plan } = planRow(row);
+	return { ...plan, id: String(plan.id), destination: String(plan.destination), owners: plan.owners || [] };
+}
+
+async function executePlans(routable, ctx, logger, summary) {
+	const byDestination = new Map();
+	for (const plan of routable) {
+		if (!byDestination.has(plan.destination)) byDestination.set(plan.destination, []);
+		byDestination.get(plan.destination).push(plan);
+	}
+
+	console.log(`\nTransferring ${routable.length} beast mode(s) to ${byDestination.size} owner(s)...\n`);
+	let index = 0;
+	for (const [destination, items] of byDestination) {
+		index++;
+		console.log(`[${index}/${byDestination.size}] ${userLabel(destination)}: ${items.length} beast mode(s)`);
+		const { transferred, failed, skipped } = await transferToOwner(items, ctx.fromUserId, destination, ctx.batchSize);
+		for (const plan of transferred) plan.status = 'transferred';
+		for (const { plan, error } of failed) {
+			plan.status = 'error';
+			plan.error = error;
+		}
+		for (const { plan, reason, owner } of skipped) {
+			plan.status = 'skipped';
+			plan.reason = reason;
+			plan.currentOwner = owner;
+		}
+		for (const plan of items) logger.addResult(planRow(plan));
+		summary.transferred += transferred.length;
+		summary.failed += failed.length;
+		summary.ownerChanged += skipped.length;
+		const extras = [failed.length && `✗ ${failed.length} failed`, skipped.length && `↷ ${skipped.length} no longer owned by the source`];
+		console.log(`  ✓ ${transferred.length} transferred${extras.filter(Boolean).map((e) => `, ${e}`).join('')}`);
+	}
+}
+
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
-	const fromUser = argv['from-user'] || argv.u;
+	const source = loadSource(LOG_NAME, argv, { selectionFlags: SELECTION_FLAGS, toEntries: rowToPlan });
+	const meta = source ? source.meta : {};
+	const fromUser = source ? meta.fromUser : argv['from-user'] || argv.u;
 	if (!fromUser) {
 		console.error('Error: --from-user is required. Run with --help for usage.');
 		process.exit(1);
 	}
 	const fromUserId = String(fromUser);
-	const max = parseInt(argv.max || argv.m || '0', 10) || 0;
-	const batchSize = parseInt(argv['batch-size'] || argv.b || '50', 10);
+	const max = source ? meta.max || 0 : parseInt(argv.max || argv.m || '0', 10) || 0;
+	const batchSize = parseInt(argv['batch-size'] || argv.b || meta.batchSize || '50', 10);
 	const outputFile = argv.output || argv.o || null;
-	const dataflowMapOverride = argv['dataflow-map-dataset'] || null;
-	const allowInactiveOwner = Boolean(argv['allow-inactive-owner']);
-	const verify = Boolean(argv.verify);
+	const dataflowMapOverride = source ? meta.dataflowMapOverride : argv['dataflow-map-dataset'] || null;
+	const managerOverride = source ? meta.managerOverride : argv.manager ? String(argv.manager) : null;
+	const allowInactiveOwner = source ? Boolean(meta.allowInactiveOwner) : Boolean(argv['allow-inactive-owner']);
+	const verify = argv.verify !== undefined ? Boolean(argv.verify) : Boolean(meta.verify);
 	const dryRun = Boolean(argv['dry-run'] || argv.dry);
 	const skipPrompt = Boolean(argv.yes || argv.y);
 
-	const logger = createLogger('transferBeastModesToContentOwners', {
+	const logger = createLogger(LOG_NAME, {
 		debugMode: false,
 		dryRun,
-		runMeta: { fromUser: fromUserId, max: max || null, batchSize, allowInactiveOwner, verify }
+		source,
+		runMeta: {
+			fromUser: fromUserId,
+			max: max || null,
+			batchSize,
+			allowInactiveOwner,
+			verify,
+			managerOverride: managerOverride || null,
+			dataflowMapOverride: dataflowMapOverride || null
+		}
 	});
 
 	console.log('Transfer Beast Modes To Content Owners');
 	console.log('======================================\n');
-	if (dryRun) console.log('*** DRY RUN — no beast modes will be transferred ***\n');
+	if (dryRun) console.log('*** DRY RUN: no beast modes will be transferred ***\n');
 
 	const fromUserRecord = await getUser(fromUserId);
+	console.log(`Instance:       ${config.instanceUrl}`);
+	console.log(`From user:      ${fromUserRecord ? `${fromUserRecord.displayName} (${fromUserId})` : fromUserId}`);
+	console.log(`Batch size:     ${batchSize}`);
+
+	const summary = { found: 0, transferred: 0, skipped: 0, unroutable: 0, ownerChanged: 0, failed: 0 };
+	const allPlans = [];
+
+	if (source) {
+		console.log();
+		printSource(source);
+		await runFromSource(source.entries, { fromUserId, batchSize, skipPrompt, verify, outputFile }, logger, summary);
+		return;
+	}
+
 	// reportsTo is blank on terminated and integration accounts, which is exactly when
 	// this command tends to be run, so --manager is the supported way to supply it.
-	const managerId = argv.manager ? String(argv.manager) : await getManagerId(fromUserId);
+	const managerId = managerOverride || (await getManagerId(fromUserId));
 	if (managerId) await getUser(managerId);
 	const dataflowMapDataset = await resolveDataflowMapDataset(dataflowMapOverride);
 
-	console.log(`Instance:       ${config.instanceUrl}`);
-	console.log(`From user:      ${fromUserRecord ? `${fromUserRecord.displayName} (${fromUserId})` : fromUserId}`);
 	console.log(`Manager:        ${managerId ? userLabel(managerId) : '(none on record)'}`);
-	console.log(`DataFlow map:   ${dataflowMapDataset || '(not found — the producing dataflow rule is skipped)'}`);
+	console.log(`DataFlow map:   ${dataflowMapDataset || '(not found, so the producing dataflow rule is skipped)'}`);
 	console.log(`Max:            ${max || '(no limit)'}`);
-	console.log(`Batch size:     ${batchSize}`);
 	console.log(`Inactive owner: ${allowInactiveOwner ? 'allowed as a destination' : 'skipped'}`);
 
-	const ctx = { allowInactiveOwner, dataflowMapDataset, fromUserId, managerId };
-	const summary = { found: 0, transferred: 0, skipped: 0, unroutable: 0, failed: 0 };
-	const allPlans = [];
+	const ctx = { allowInactiveOwner, dataflowMapDataset, fromUserId, managerId, batchSize };
 	const attempted = new Set();
 
+	// Repeated even on a dry run: the owner search pages unstably (see findBeastModes),
+	// so a single pass can miss beast modes.
 	for (let pass = 1; pass <= MAX_PASSES; pass++) {
 		console.log(`\n=== Pass ${pass} ===`);
 		console.log(`Searching for beast modes owned by ${fromUserId}...`);
 		let templates = (await findBeastModes(fromUserId)).filter((t) => !attempted.has(String(t.id)));
 		if (templates.length === 0) {
 			if (pass === 1) console.log('  No beast modes found.');
-			else console.log('  Nothing left to transfer.');
+			else console.log(dryRun ? '  No further beast modes found.' : '  Nothing left to transfer.');
 			break;
 		}
 		if (max) {
@@ -786,19 +905,21 @@ async function main() {
 				plan.status = plan.rule === 'already-owned-by-source' ? 'skipped' : 'unroutable';
 				if (plan.rule === 'already-owned-by-source') summary.skipped++;
 				else summary.unroutable++;
+				logger.addResult(planRow(plan));
 			}
 		}
+		allPlans.push(...plans);
+		for (const template of templates) attempted.add(String(template.id));
 
 		if (dryRun) {
-			for (const plan of routable) plan.status = 'dry-run';
-			allPlans.push(...plans);
-			break;
+			for (const plan of routable) {
+				plan.status = 'dry-run';
+				logger.addResult(planRow(plan));
+			}
+			continue;
 		}
 
-		if (routable.length === 0) {
-			allPlans.push(...plans);
-			break;
-		}
+		if (routable.length === 0) break;
 
 		if (pass === 1 && !skipPrompt) {
 			const answer = await ask(`\nTransfer ${routable.length} beast mode(s) to the destinations above? (yes/no): `);
@@ -808,33 +929,38 @@ async function main() {
 			}
 		}
 
-		for (const template of templates) attempted.add(String(template.id));
-
-		const byDestination = new Map();
-		for (const plan of routable) {
-			if (!byDestination.has(plan.destination)) byDestination.set(plan.destination, []);
-			byDestination.get(plan.destination).push(plan);
-		}
-
-		console.log(`\nTransferring ${routable.length} beast mode(s) to ${byDestination.size} owner(s)...\n`);
-		let index = 0;
-		for (const [destination, items] of byDestination) {
-			index++;
-			console.log(`[${index}/${byDestination.size}] ${userLabel(destination)} — ${items.length} beast mode(s)`);
-			const { transferred, failed } = await transferToOwner(items, destination, batchSize);
-			for (const plan of transferred) plan.status = 'transferred';
-			for (const { plan, error } of failed) {
-				plan.status = 'error';
-				plan.error = error;
-			}
-			summary.transferred += transferred.length;
-			summary.failed += failed.length;
-			console.log(`  ✓ ${transferred.length} transferred${failed.length ? `, ✗ ${failed.length} failed` : ''}`);
-		}
-
-		allPlans.push(...plans);
+		logger.beginExecution(routable.map(rowToPlan), (row) => String(row.id));
+		await executePlans(routable, ctx, logger, summary);
 	}
 
+	await finish({ allPlans, summary, verify, dryRun, outputFile, logger });
+}
+
+async function runFromSource(plans, opts, logger, summary) {
+	const { fromUserId, batchSize, skipPrompt, verify, outputFile } = opts;
+	summary.found = plans.length;
+	if (plans.length === 0) {
+		console.log('The source log has nothing left to transfer.');
+		logger.writeRunLog({ ...summary, apiErrors: errors });
+		return;
+	}
+	for (const destination of new Set(plans.map((p) => p.destination))) await getUser(destination);
+	printPreview(plans);
+
+	if (!skipPrompt) {
+		const answer = await ask(`\nTransfer ${plans.length} beast mode(s) to the destinations above? (yes/no): `);
+		if (answer !== 'yes' && answer !== 'y') {
+			console.log('Aborted. No changes were made.');
+			process.exit(0);
+		}
+	}
+
+	logger.beginExecution(plans, (row) => String(row.id));
+	await executePlans(plans, { fromUserId, batchSize }, logger, summary);
+	await finish({ allPlans: plans, summary, verify, dryRun: false, outputFile, logger });
+}
+
+async function finish({ allPlans, summary, verify, dryRun, outputFile, logger }) {
 	if (verify && !dryRun) {
 		const transferred = allPlans.filter((p) => p.status === 'transferred');
 		if (transferred.length > 0) {
@@ -850,22 +976,6 @@ async function main() {
 		}
 	}
 
-	for (const plan of allPlans) {
-		logger.addResult({
-			id: plan.id,
-			name: plan.name,
-			scope: plan.scope,
-			resourceId: plan.resourceId,
-			resourceName: plan.resourceName,
-			owners: plan.owners,
-			destination: plan.destination,
-			rule: plan.rule,
-			note: plan.note,
-			status: plan.status,
-			error: plan.error || null
-		});
-	}
-
 	if (outputFile) writePlanCsv(outputFile, allPlans);
 
 	console.log('\n=== Summary ===');
@@ -873,16 +983,20 @@ async function main() {
 	console.log(`Transferred: ${summary.transferred}`);
 	console.log(`Already owned by the resource owner: ${summary.skipped}`);
 	console.log(`Not routable: ${summary.unroutable}`);
+	if (summary.ownerChanged > 0) console.log(`No longer owned by the source: ${summary.ownerChanged}`);
 	console.log(`Failed:      ${summary.failed}`);
 	if (summary.verified != null) console.log(`Verified:    ${summary.verified}`);
 	if (errors.length > 0) console.log(`API errors logged: ${errors.length}`);
 
 	logger.writeRunLog({ ...summary, apiErrors: errors });
 
-	if (summary.failed > 0 || summary.verifyProblems > 0) {
+	if (dryRun) console.log(`\nRun "node cli.js ${COMMAND} --from-dry-run" to apply this plan.`);
+	if (summary.failed > 0) {
+		console.error(`\nSome beast modes did not transfer. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`);
+	} else if (summary.verifyProblems > 0) {
 		console.error('\nSome beast modes did not transfer. Check the messages above and the run log.');
-		process.exit(1);
 	}
+	if (summary.failed > 0 || summary.verifyProblems > 0) process.exit(1);
 }
 
 main().catch((err) => {

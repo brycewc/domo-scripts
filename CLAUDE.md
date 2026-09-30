@@ -60,7 +60,8 @@ const { api, config, readCSV, resolveIds, createLogger } = require('../lib');
 | [rewrite.js](lib/rewrite.js) | `rewriteDomain(value, source, target) → { value, count }` | Recursively replaces every occurrence of `source` (e.g. `domo.domo.com`) with `target` in any string inside `value`. Walks arrays and plain objects. JSON-encoded strings (like Domo's `configuration[].value` blobs) are treated as ordinary strings — a literal substring replace inside the encoded form is still valid JSON because hostnames don't contain any characters JSON has to escape. Used by `transfer-stream`'s `--rewrite-domain` flag for Domo-on-Domo (governance) transfers. |
 | [csv.js](lib/csv.js)       | `readCSV(filePath, { column, filterColumn, filterValue })`           | Parses CSV with optional row filtering and column extraction. Returns extracted values (if `column` set) or full record objects.                                                                                                                                               |
 | [input.js](lib/input.js)   | `resolveIds(argv, { name, columnDefault })`                          | Resolves entity IDs from `--file` (CSV), `--<name>-id` (single, enables debug mode), or `--<name>-ids` (comma-separated). Also handles `--column`, `--filter-column`, `--filter-value`. Returns `{ ids, debugMode }`.                                                          |
-| [log.js](lib/log.js)       | `createLogger(commandName, { debugMode, dryRun, runMeta, instances })` | Returns `{ writeDebugLog(itemId, data), addResult(entry), writeRunLog(summary) }`. In debug mode (single-ID), writes per-item JSON logs. In bulk mode, collects results and writes a summary run log. Logs go to `logs/<commandName>/`. Dry-run logs are prefixed with `dry_`. Single-instance runs stamp `env`/`instance`; if `instances: { source, target }` is passed (transfer commands), that replaces the single-instance fields. |
+| [log.js](lib/log.js)       | `createLogger(commandName, { debugMode, dryRun, runMeta, instances, source })` | Returns `{ writeDebugLog(itemId, data), addResult(entry), markProcessed(entries), beginExecution(entries, keyOf), writeRunLog(summary) }`. In debug mode (single-ID), writes per-item JSON logs. In bulk mode, collects results and writes a summary run log. Dry runs always write a run log (it is the plan `--from-dry-run` reads). Logs go to `logs/<commandName>/`. Dry-run logs are prefixed with `dry_`. Headers stamp `command` and `planVersion`; single-instance runs stamp `env`/`instance`; if `instances: { source, target }` is passed (transfer commands), that replaces the single-instance fields. `source` (from `loadSource`) stamps `fromPlan` / `retryOf`. `beginExecution` (call once after confirmation, before the first mutation) checkpoints the run log every 30s and on exit/SIGINT, writing never-processed entries under `unreached`. |
+| [plan.js](lib/plan.js)     | `loadSource(commandName, argv, { selectionFlags, modes, toEntries, instances })`, `printSource(source)`, `confirmSource(question, argv)`, `stripStatus(row)` | Backs `--from-dry-run [file]` (the `dry-run` rows of a dry-run log) and `--retry-errors [file]` (the `error` rows without `phase: 'discover'`, plus `unreached`, of a real run log). Bare flag = latest log. Refuses logs from another command or instance, older than 24h without `--max-age`, or combined with any `selectionFlags`. Returns `null` when neither flag is set, else `{ mode, relPath, meta (the logged header), entries, ... }`. |
 
 ### Commands (commands/)
 
@@ -91,9 +92,19 @@ Key categories:
 
 Written to `logs/<commandName>/` (git-ignored). Two log types:
 
-- **Debug logs** (`debug_<itemId>_<timestamp>.json`) — detailed per-item logs in single-ID mode (`--<entity>-id`)
-- **Run logs** (`run_<timestamp>.json`) — summary with all results in bulk mode
+- **Debug logs** (`debug_<itemId>_<timestamp>.json`): detailed per-item logs in single-ID mode (`--<entity>-id`)
+- **Run logs** (`run_<timestamp>.json`): summary with all results in bulk mode
 - Dry-run variants prefixed with `dry_`
+
+### Replay and retry contract
+
+Run logs double as input for `--from-dry-run` and `--retry-errors`, so commands that support them follow these rules:
+
+- Call `loadSource` right after `showHelp`, with the same name passed to `createLogger`. In source mode, take every option from `source.meta`, skip discovery, and feed `source.entries` to the execute step.
+- `runMeta` records every option the execute step needs (never secrets), so a replay or a retry of a retry behaves like the original.
+- Result rows are the entry's fields plus `status` (+ `error`). Planned rows are `dry-run`, no-ops `skipped`. Errors from before any mutation was attempted carry `phase: 'discover'` and are not retried.
+- Commands that PUT whole objects never replay a stored body: re-fetch, compare a fingerprint recorded at dry-run time, re-apply the change.
+- Commands that fetch and mutate each item in one loop support only `--retry-errors` (`modes: ['retry-errors']`).
 
 ## Domo API Conventions
 

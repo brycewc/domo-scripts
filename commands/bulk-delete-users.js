@@ -12,10 +12,14 @@
  *   node cli.js bulk-delete-users --file users.csv [--column "User ID"]
  *   node cli.js bulk-delete-users --file users.csv --dry-run
  *   node cli.js bulk-delete-users --file users.csv --yes      # non-interactive
+ *   node cli.js bulk-delete-users --retry-errors              # retry the latest run's failures
  */
 
 const argv = require('minimist')(process.argv.slice(2));
-const { api, resolveIds, createLogger, showHelp } = require('../lib');
+const { api, resolveIds, createLogger, loadSource, printSource, showHelp } = require('../lib');
+
+const COMMAND = 'bulk-delete-users';
+const SELECTION_FLAGS = ['id', 'ids', 'file', 'f', 'column', 'c', 'filter-column', 'filter-value', 'dry-run', 'dry'];
 
 const HELP_TEXT = `Usage: node cli.js bulk-delete-users [options]
 
@@ -35,7 +39,11 @@ Optional:
   --dry-run             Print who would be deleted; skip prompt and DELETE
   --yes                 Skip the interactive confirmation prompt. Required for
                         non-TTY runs (CI, piped stdin)
-  --help                Show this help`;
+  --help                Show this help
+
+Reusing an earlier run:
+  --retry-errors [file] Retry the failed and unreached deletes of a run (default: the latest run log)
+  --max-age <hours>     Allow a source log older than 24 hours`;
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -53,17 +61,29 @@ async function promptConfirm() {
 async function main() {
 	showHelp(argv, HELP_TEXT);
 
+	const source = loadSource(COMMAND, argv, {
+		selectionFlags: SELECTION_FLAGS,
+		modes: ['retry-errors'],
+		toEntries: (row) => (row.userId == null ? null : { userId: String(row.userId) })
+	});
 	const dryRun = Boolean(argv['dry-run']);
 	const skipPrompt = Boolean(argv.yes);
 
-	const { ids: userIds, debugMode } = resolveIds(argv, {
-		idFlag: 'id',
-		idsFlag: 'ids',
-		columnDefault: 'User ID'
-	});
+	const { ids: userIds, debugMode } = source
+		? { ids: source.entries.map((e) => e.userId), debugMode: false }
+		: resolveIds(argv, {
+				idFlag: 'id',
+				idsFlag: 'ids',
+				columnDefault: 'User ID'
+			});
 
 	console.log('Bulk Delete Users');
 	console.log('=================');
+	if (source) printSource(source);
+	if (userIds.length === 0) {
+		console.log('The source log has nothing left to delete.');
+		return;
+	}
 	console.log(`Users:   ${userIds.length}`);
 	if (dryRun) console.log('Dry run: yes (no DELETE will be issued)');
 	console.log();
@@ -78,8 +98,8 @@ async function main() {
 	console.log('   Run bulk-transfer-ownership FIRST if you want to preserve their content.');
 
 	if (dryRun) {
-		console.log('\nDry run — exiting without prompting or deleting.');
-		const logger = createLogger('bulk-delete-users', { debugMode, dryRun });
+		console.log('\nDry run: exiting without prompting or deleting.');
+		const logger = createLogger(COMMAND, { debugMode, dryRun });
 		for (const id of userIds) logger.addResult({ userId: id, status: 'dry-run' });
 		logger.writeRunLog({ total: userIds.length, deleted: 0, errors: 0 });
 		return;
@@ -97,7 +117,11 @@ async function main() {
 		}
 	}
 
-	const logger = createLogger('bulk-delete-users', { debugMode, dryRun });
+	const logger = createLogger(COMMAND, { debugMode, dryRun, source });
+	logger.beginExecution(
+		userIds.map((userId) => ({ userId })),
+		(row) => String(row.userId)
+	);
 	let deleted = 0;
 	let errors = 0;
 
@@ -125,7 +149,10 @@ async function main() {
 	console.log(`Errors:  ${errors}`);
 
 	logger.writeRunLog({ total: userIds.length, deleted, errors });
-	if (errors > 0) process.exit(1);
+	if (errors > 0) {
+		if (!debugMode) console.error(`\nSome deletes failed. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`);
+		process.exit(1);
+	}
 }
 
 main().catch((err) => {
