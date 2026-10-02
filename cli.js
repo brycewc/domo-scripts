@@ -25,6 +25,7 @@ const commands = {
 	'build-activity-log-type-map': './commands/build-activity-log-type-map',
 	'check-credentials': './commands/check-credentials',
 	'clear-logs': './commands/clear-logs',
+	'delete-dashboard-tree': './commands/delete-dashboard-tree',
 	'delete-unused-beast-modes': './commands/delete-unused-beast-modes',
 	'export-dashboard-content': './commands/export-dashboard-content',
 	'replace-function-references': './commands/replace-function-references',
