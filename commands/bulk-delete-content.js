@@ -20,7 +20,7 @@
  *   app-studio   DELETE /content/v1/dataapps/{appId}                       (per-item)
  *   worksheet    DELETE /content/v1/dataapps/{id}                          (per-item)
  *   custom-app   DELETE /apps/v1/designs/{id}                              (per-item)
- *   code-engine  DELETE /codeengine/v2/packages/{id}                       (per-item)
+ *   code-engine  DELETE /codeengine/v2/packages/{id}                       (per-item)*
  *   jupyter      DELETE /datascience/v1/workspaces/{id}                    (per-item)
  *   ai-project   DELETE /datascience/ml/v1/projects/{id}                   (per-item)
  *   ai-model     DELETE /datascience/ml/v1/models/{id}                     (per-item)
@@ -39,7 +39,9 @@
  * its project. workflow (*) deactivates any active versions first — the delete
  * endpoint rejects a model that still has an active version — by listing
  * GET /workflow/v2/models/{id}/versions and PUTting each active one back with
- * active:false before the DELETE. jupyter is the activity-log
+ * active:false before the DELETE. code-engine (*) deletes any deployed versions
+ * first (DELETE /codeengine/v2/packages/{id}/versions/{version}), since the
+ * package delete rejects a package that still has one. jupyter is the activity-log
  * DATA_SCIENCE_NOTEBOOK type (the API
  * calls those "Jupyter workspaces") — that is a DIFFERENT thing from workspace,
  * which is the navigation Workspaces feature (nav/v1/workspaces, keyed by GUID).
@@ -211,7 +213,8 @@ activity-log labels emitted by bulk-list-user-content are accepted too:
   app-studio   (DATA_APP, data-app)
   worksheet    (WORKSHEET) — dataapps; same endpoint as app-studio
   custom-app   (RYUU_APP, app, ryuu)
-  code-engine  (CODEENGINE_PACKAGE, codeengine) — Code Engine packages (UUID id)
+  code-engine  (CODEENGINE_PACKAGE, codeengine): Code Engine packages (UUID id);
+               deployed versions are deleted first
   jupyter      (DATA_SCIENCE_NOTEBOOK, jupyter-workspace) — data science
                notebooks; NOT the same as workspace
   ai-project   (AI_PROJECT)
@@ -348,9 +351,27 @@ const DELETERS = {
 		single: (id) => api.del(`/apps/v1/designs/${id}`)
 	},
 	'code-engine': {
-		// Code Engine packages (activity-log CODEENGINE_PACKAGE). The id is a UUID.
+		// Domo refuses to delete a package with a deployed version, so those go first,
+		// one at a time (concurrent deletes on one package lose all but one).
+		// Deleting the last version drops the package, so its own delete may then 404.
 		label: 'Code Engine package',
-		single: (id) => api.del(`/codeengine/v2/packages/${id}`)
+		single: async (id) => {
+			const info = await api.get(`/codeengine/v2/packages/${id}?parts=versions`);
+			const deployed = (info.versions || []).filter((v) => v.released != null && v.version).map((v) => v.version);
+			for (const version of deployed) {
+				try {
+					await api.del(`/codeengine/v2/packages/${id}/versions/${version}`);
+				} catch (error) {
+					if (!isAlreadyGone(error)) throw new Error(`deleting deployed version ${version}: ${error.message}`);
+				}
+			}
+			try {
+				return await api.del(`/codeengine/v2/packages/${id}`);
+			} catch (error) {
+				if (deployed.length > 0 && isAlreadyGone(error)) return null;
+				throw error;
+			}
+		}
 	},
 	jupyter: {
 		label: 'Jupyter workspace',

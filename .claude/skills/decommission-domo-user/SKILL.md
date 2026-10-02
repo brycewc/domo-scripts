@@ -132,7 +132,11 @@ The full catalogue of traps found so far is in [references/api-traps.md](referen
 
 ## 7. Leave an auditable trail
 
-Write everything to `logs/cleanup-<userId>/` (git-ignored) as one CSV per action, each row carrying the evidence behind its verdict, plus a `README.md` recording the rules, the method, the API traps hit, and what remains. Lettered files (`A-`, `B-`, ...) in execution order work well. Quarantine superseded lists in `superseded/` so nobody runs a plan that was built on the narrower window.
+Write everything to `logs/cleanup-<userId>/` (git-ignored) as one CSV per action, each row carrying the evidence behind its verdict, plus a `README.md` recording the rules, the method, the API traps hit, and what remains. Lettered files (`A-`, `B-`, ...) in execution order work well. Put a **Next steps** section near
+the top of the README with the exact commands for every remaining step, ready to paste from the
+repo root (dry run, then the real run, then the check that proves it worked), and keep it current
+as steps finish. Any step the CLI cannot do as one command gets a small script in the run folder,
+so nothing in that section needs hand-editing before it runs. Quarantine superseded lists in `superseded/` so nobody runs a plan that was built on the narrower window.
 
 ## What is usually left at the end
 
