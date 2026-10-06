@@ -77,6 +77,11 @@ async function getPdpPolicies(datasetId) {
 	);
 }
 
+// dataSourcePermissions is false on both the All Rows policy and custom ones, so it cannot tell them apart.
+function isOpenPolicy(policy) {
+	return policy.type === 'open';
+}
+
 async function enablePdp(datasetId) {
 	return api.put(`/query/v1/data-control/${datasetId}`, {
 		enabled: true,
@@ -107,6 +112,7 @@ function buildPolicyBody(datasetId, policy) {
 		parameters: (policy.parameters || []).map((p) => ({
 			ignoreCase: p.ignoreCase || false,
 			name: p.name,
+			not: p.not || false,
 			operator: p.operator,
 			type: p.type,
 			values: p.values || []
@@ -197,14 +203,14 @@ async function main() {
 	console.log(`Fetching PDP policies from source dataset: ${sourceDatasetId}`);
 	const sourcePolicies = await getPdpPolicies(sourceDatasetId);
 
-	// The source "All Rows" (open) policy — used as the fallback assignment for
+	// The source "All Rows" (open) policy, used as the fallback assignment for
 	// the target's All Rows policy when no --all-rows-users/-groups are given.
-	const sourceAllRows = sourcePolicies.find((p) => !p.dataSourcePermissions);
+	const sourceAllRows = sourcePolicies.find(isOpenPolicy);
 
 	// Keep custom policies. If allowed columns were specified, restrict to
 	// policies that filter on one of those columns; otherwise copy all of them.
 	const policiesToCopy = sourcePolicies.filter((p) => {
-		if (!p.dataSourcePermissions) return false;
+		if (isOpenPolicy(p)) return false;
 		if (allowedColumns.length === 0) return true;
 		const paramColumns = (p.parameters || []).map((param) => param.name);
 		return paramColumns.some((col) => allowedColumns.includes(col));
@@ -266,7 +272,7 @@ async function main() {
 			// the target ends up with exactly the source set. Otherwise leave
 			// them in place and update/create by name below.
 			const policies = await getPdpPolicies(targetId);
-			const existingCustom = policies.filter((p) => p.dataSourcePermissions);
+			const existingCustom = policies.filter((p) => !isOpenPolicy(p));
 			if (clean) {
 				for (const old of existingCustom) {
 					await deletePdpPolicy(targetId, old.filterGroupId);
@@ -276,7 +282,7 @@ async function main() {
 			}
 
 			// Update the "All Rows" policy to assign the designated group
-			const allRowsPolicy = policies.find((p) => !p.dataSourcePermissions);
+			const allRowsPolicy = policies.find(isOpenPolicy);
 			if (!allRowsPolicy) {
 				throw new Error(
 					'Could not find the All Rows policy after enabling PDP'
