@@ -15,6 +15,7 @@ id-mappings/
 tmp
 # Personal Claude Code overrides
 .claude/settings.local.json
+.claude/skills/decommission-domo-user/
 
 # Personal VS Code workspace config
 .vscode/
