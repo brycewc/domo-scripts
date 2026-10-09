@@ -5,7 +5,8 @@
  * functions (beast modes with no active links to cards, views, etc.)
  * and deletes them in batches. Optionally restricted to one or more owners
  * and/or one or more datasets. Variables are excluded unless
- * --include-variables is passed.
+ * --include-variables is passed, and archived beast modes unless
+ * --include-archived is passed.
  *
  * WARNING: This is a destructive operation. Deleted beast modes cannot be
  * recovered. Use --dry-run to preview what would be deleted first, then
@@ -20,6 +21,7 @@
  *   node cli.js delete-unused-beast-modes --dataset "<datasetId>"
  *   node cli.js delete-unused-beast-modes --created-before "2024-01-01"
  *   node cli.js delete-unused-beast-modes --include-locked --include-variables
+ *   node cli.js delete-unused-beast-modes --include-archived --dry-run
  *
  * Options:
  *   --owner, -o          Only delete beast modes owned by these user ID(s) (comma-separated)
@@ -30,7 +32,8 @@
  *   --batch-size, -b     Number of beast modes per bulk delete call (default: 500)
  *   --include-locked     Also delete locked beast modes (skipped by default)
  *   --include-variables  Also delete unused variables (excluded by default)
- *   --dry-run            Preview which beast modes would be deleted without deleting
+ *   --include-archived   Also delete archived beast modes (excluded by default)
+ *   --dry-run           Preview which beast modes would be deleted without deleting
  *   --from-dry-run [file] Delete the beast modes a dry run found (default: latest dry run)
  *   --retry-errors [file] Retry the failed and unreached deletes of a run (default: latest run)
  *   --max-age <hours>    Allow a source log older than 24 hours
@@ -43,7 +46,7 @@ const argv = require('minimist')(process.argv.slice(2));
 const COMMAND = 'delete-unused-beast-modes';
 const PAGE_SIZE = 5000;
 const PREVIEW_LIMIT = 50;
-const SELECTION_FLAGS = ['owner', 'o', 'dataset', 'd', 'created-before', 'max', 'm', 'include-locked', 'include-variables', 'dry-run', 'dry'];
+const SELECTION_FLAGS = ['owner', 'o', 'dataset', 'd', 'created-before', 'max', 'm', 'include-locked', 'include-variables', 'include-archived', 'dry-run', 'dry'];
 
 const HELP_TEXT = `Usage: node cli.js delete-unused-beast-modes [options]
 
@@ -60,7 +63,9 @@ Options:
   --batch-size, -b       Beast modes per bulk delete call (default: 500)
   --include-locked       Also delete locked beast modes (skipped by default)
   --include-variables    Also delete unused variables (excluded by default)
-  --dry-run              Preview without deleting
+  --include-archived     Also delete archived beast modes, e.g. ones left behind by
+                         deleted cards (excluded by default)
+  --dry-run             Preview without deleting
 
 Reusing an earlier run (skips the search; the log's filters are reused):
   --from-dry-run [file]  Delete the beast modes a dry run found (default: the latest dry run log)
@@ -104,7 +109,8 @@ function parseSelection() {
     createdBeforeMs,
     max: parseInt(argv.max || argv.m || '0', 10) || 0,
     includeLocked: argv['include-locked'] || false,
-    includeVariables: argv['include-variables'] || false
+    includeVariables: argv['include-variables'] || false,
+    includeArchived: argv['include-archived'] || false
   };
 }
 
@@ -115,12 +121,18 @@ function selectionFromMeta(meta) {
     createdBeforeMs: meta.createdBefore ? Date.parse(meta.createdBefore) : 0,
     max: meta.max || 0,
     includeLocked: Boolean(meta.includeLocked),
-    includeVariables: Boolean(meta.includeVariables)
+    includeVariables: Boolean(meta.includeVariables),
+    includeArchived: Boolean(meta.includeArchived)
   };
 }
 
-async function searchFunctions(ownerIds, datasetIds, includeVariables, limit, offset) {
+async function searchFunctions(ownerIds, datasetIds, includeVariables, archived, limit, offset) {
   const filters = [{ field: 'notNested' }, { field: 'inactive', value: true }];
+  // The search omits archived functions by default, and the archived filter
+  // returns only archived ones, so including them takes a second pass.
+  if (archived) {
+    filters.push({ field: 'archived' });
+  }
   if (!includeVariables) {
     filters.push({ field: 'notvariable' });
   }
@@ -153,13 +165,31 @@ async function deleteSingleFunction(id) {
   return api.del(`/query/v1/functions/template/${id}`);
 }
 
-async function findUnusedBeastModes({ ownerIds, datasetIds, includeVariables, includeLocked, createdBeforeMs, max }) {
+async function findUnusedBeastModes(selection) {
+  const passes = selection.includeArchived ? [false, true] : [false];
+  const candidates = [];
+  let lockedSkipped = 0;
+  for (const archived of passes) {
+    const pass = await scanSearchResults(selection, archived);
+    candidates.push(...pass.candidates);
+    lockedSkipped += pass.lockedSkipped;
+  }
+  if (passes.length > 1) {
+    candidates.sort((a, b) => (a.created || 0) - (b.created || 0));
+  }
+  return {
+    candidates: selection.max ? candidates.slice(0, selection.max) : candidates,
+    lockedSkipped
+  };
+}
+
+async function scanSearchResults({ ownerIds, datasetIds, includeVariables, includeLocked, createdBeforeMs, max }, archived) {
   const candidates = [];
   let lockedSkipped = 0;
   let offset = 0;
 
   while (true) {
-    const result = await searchFunctions(ownerIds, datasetIds, includeVariables, PAGE_SIZE, offset);
+    const result = await searchFunctions(ownerIds, datasetIds, includeVariables, archived, PAGE_SIZE, offset);
     const functions = result.results || [];
     if (functions.length === 0) break;
 
@@ -183,7 +213,8 @@ async function findUnusedBeastModes({ ownerIds, datasetIds, includeVariables, in
         id: fn.id,
         name: fn.name,
         owner: fn.owner,
-        created: fn.created
+        created: fn.created,
+        ...(archived && { archived: true })
       });
       if (max && candidates.length >= max) {
         return { candidates, lockedSkipped };
@@ -204,10 +235,10 @@ async function main() {
 
   const source = loadSource(COMMAND, argv, {
     selectionFlags: SELECTION_FLAGS,
-    toEntries: (row) => (row.id == null ? null : { id: row.id, name: row.name, owner: row.owner, created: row.created })
+    toEntries: (row) => (row.id == null ? null : { id: row.id, name: row.name, owner: row.owner, created: row.created, ...(row.archived && { archived: true }) })
   });
   const selection = source ? selectionFromMeta(source.meta) : parseSelection();
-  const { ownerIds, datasetIds, createdBeforeMs, max, includeLocked, includeVariables } = selection;
+  const { ownerIds, datasetIds, createdBeforeMs, max, includeLocked, includeVariables, includeArchived } = selection;
   const batchSize = parseInt(argv['batch-size'] || argv.b || (source && source.meta.batchSize) || '500', 10);
   const dryRun = argv['dry-run'] || argv.dry || false;
 
@@ -222,7 +253,8 @@ async function main() {
       max: max || null,
       batchSize,
       includeLocked,
-      includeVariables
+      includeVariables,
+      includeArchived
     }
   });
 
@@ -238,7 +270,8 @@ async function main() {
   console.log(`Max to delete:  ${max || '(no limit)'}`);
   console.log(`Batch size:     ${batchSize}`);
   console.log(`Locked:         ${includeLocked ? 'included' : 'skipped'}`);
-  console.log(`Variables:      ${includeVariables ? 'included' : 'excluded'}\n`);
+  console.log(`Variables:      ${includeVariables ? 'included' : 'excluded'}`);
+  console.log(`Archived:       ${includeArchived ? 'included' : 'excluded'}\n`);
 
   let candidates;
   let lockedSkipped = 0;
@@ -262,7 +295,7 @@ async function main() {
 
   console.log(`${source ? 'To delete' : 'Found'} ${candidates.length} unused beast mode(s):\n`);
   for (const fn of candidates.slice(0, PREVIEW_LIMIT)) {
-    console.log(`  ${String(fn.id).padEnd(10)} ${fn.name} (owner: ${fn.owner})`);
+    console.log(`  ${String(fn.id).padEnd(10)} ${fn.name} (owner: ${fn.owner})${fn.archived ? ' [archived]' : ''}`);
   }
   if (candidates.length > PREVIEW_LIMIT) {
     console.log(`  ... and ${candidates.length - PREVIEW_LIMIT} more (full list in the run log)`);
