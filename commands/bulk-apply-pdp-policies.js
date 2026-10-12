@@ -10,12 +10,17 @@
  * and any others are created. Pass --clean to instead delete all existing
  * custom policies first and write only the source set.
  *
+ * Without --source-dataset-id, --all-rows-users / --all-rows-groups are added
+ * to each target's existing All Rows assignment and no custom policies change.
+ * Targets that do not already have PDP enabled are skipped.
+ *
  * Usage:
  *   node cli.js bulk-apply-pdp-policies --file "datasets.csv" --source-dataset-id "SRC_ID" --allowed-columns "ae_email,sc_email"
  *   node cli.js bulk-apply-pdp-policies --file "datasets.csv" --column "DataSet ID" --source-dataset-id "SRC_ID" --allowed-columns "ae_email"
  *   node cli.js bulk-apply-pdp-policies --file "datasets.csv" --all-rows-users "123,456" --all-rows-groups "789" --source-dataset-id "SRC_ID" --allowed-columns "ae_email"
  *   node cli.js bulk-apply-pdp-policies --dataset-id "TARGET_ID" --source-dataset-id "SRC_ID" --allowed-columns "ae_email,sc_email"
  *   node cli.js bulk-apply-pdp-policies --dataset-ids "id1,id2,id3" --source-dataset-id "SRC_ID" --allowed-columns "ae_email"
+ *   node cli.js bulk-apply-pdp-policies --file "datasets.csv" --all-rows-users "123,456" --all-rows-groups "789"
  *   node cli.js bulk-apply-pdp-policies --retry-errors
  *
  * Options:
@@ -23,11 +28,11 @@
  *   --dataset-id        Single target dataset ID (enables debug logging)
  *   --dataset-ids       Comma-separated target dataset IDs
  *   --column, -c        CSV column name containing dataset IDs (default: "DataSet ID")
- *   --source-dataset-id Source dataset to copy PDP policies from (required)
+ *   --source-dataset-id Source dataset to copy PDP policies from (required unless --all-rows-users/-groups is set)
  *   --allowed-columns   Comma-separated list of allowed PDP filter columns (optional; copies all policies if omitted)
- *   --all-rows-users    Comma-separated user IDs to assign to the All Rows policy
- *   --all-rows-groups   Comma-separated group IDs to assign to the All Rows policy
- *   --clean             Delete all existing custom policies before writing the new set
+ *   --all-rows-users    Comma-separated user IDs to assign to the All Rows policy (added to existing without a source)
+ *   --all-rows-groups   Comma-separated group IDs to assign to the All Rows policy (added to existing without a source)
+ *   --clean             Delete all existing custom policies before writing the new set (requires a source)
  *   --retry-errors [file]  Retry the failed and unreached datasets of a run (default: latest run log)
  *   --max-age <hours>      Allow a source log older than 24 hours
  */
@@ -60,11 +65,15 @@ Options:
   --dataset-id        Single target dataset ID
   --dataset-ids       Comma-separated target dataset IDs
   --column, -c        CSV column with dataset IDs (default: "DataSet ID")
-  --source-dataset-id Source dataset to copy policies from (required)
+  --source-dataset-id Source dataset to copy policies from (required unless --all-rows-users/-groups is set)
   --allowed-columns   Allowed PDP filter columns, comma-separated (optional; copies all policies if omitted)
   --all-rows-users    User IDs for the All Rows policy
   --all-rows-groups   Group IDs for the All Rows policy
-  --clean             Delete existing custom policies first (default: add/update in place)
+  --clean             Delete existing custom policies first (default: add/update in place; requires a source)
+
+Without --source-dataset-id, the --all-rows-users/-groups IDs are added to each
+target's existing All Rows policy and custom policies are left untouched.
+Datasets that do not already have PDP enabled are skipped.
 
 Retrying an earlier run (reuses the log's source dataset and policy options):
   --retry-errors [file]  Retry the failed and unreached items of a run (default: the latest run log)
@@ -80,6 +89,11 @@ async function getPdpPolicies(datasetId) {
 // dataSourcePermissions is false on both the All Rows policy and custom ones, so it cannot tell them apart.
 function isOpenPolicy(policy) {
 	return policy.type === 'open';
+}
+
+async function isPdpEnabled(datasetId) {
+	const status = await api.get(`/query/v2/data-control/${datasetId}`);
+	return Boolean(status && status.enabled);
 }
 
 async function enablePdp(datasetId) {
@@ -140,11 +154,8 @@ async function main() {
 	});
 	const meta = source ? source.meta : null;
 
-	const sourceDatasetId = meta ? meta.sourceDatasetId : argv['source-dataset-id'] || argv.s;
-	if (!sourceDatasetId) {
-		console.error('Error: --source-dataset-id is required.');
-		process.exit(1);
-	}
+	const sourceDatasetId =
+		(meta ? meta.sourceDatasetId : argv['source-dataset-id'] || argv.s) || null;
 
 	const clean = meta ? Boolean(meta.clean) : Boolean(argv.clean);
 	const allowedColumns = meta
@@ -171,6 +182,18 @@ async function main() {
 					.map((id) => Number(id.trim()))
 					.filter(Boolean)
 			: [];
+
+	const allRowsOnly = !sourceDatasetId;
+	if (allRowsOnly && allRowsUserIds.length === 0 && allRowsGroupIds.length === 0) {
+		console.error(
+			'Error: --source-dataset-id is required unless --all-rows-users or --all-rows-groups is set.'
+		);
+		process.exit(1);
+	}
+	if (allRowsOnly && clean) {
+		console.error('Error: --clean requires --source-dataset-id.');
+		process.exit(1);
+	}
 
 	let datasetIds;
 	let debugMode = false;
@@ -199,47 +222,55 @@ async function main() {
 		}
 	}
 
-	// Step 1: Read source PDP policies
-	console.log(`Fetching PDP policies from source dataset: ${sourceDatasetId}`);
-	const sourcePolicies = await getPdpPolicies(sourceDatasetId);
+	let sourceAllRows;
+	let policiesToCopy = [];
+	if (allRowsOnly) {
+		console.log('No source dataset: adding to the All Rows policy only.');
+		console.log(`  Users:  [${allRowsUserIds}]`);
+		console.log(`  Groups: [${allRowsGroupIds}]`);
+	} else {
+		// Step 1: Read source PDP policies
+		console.log(`Fetching PDP policies from source dataset: ${sourceDatasetId}`);
+		const sourcePolicies = await getPdpPolicies(sourceDatasetId);
 
-	// The source "All Rows" (open) policy, used as the fallback assignment for
-	// the target's All Rows policy when no --all-rows-users/-groups are given.
-	const sourceAllRows = sourcePolicies.find(isOpenPolicy);
+		// The source "All Rows" (open) policy, used as the fallback assignment for
+		// the target's All Rows policy when no --all-rows-users/-groups are given.
+		sourceAllRows = sourcePolicies.find(isOpenPolicy);
 
-	// Keep custom policies. If allowed columns were specified, restrict to
-	// policies that filter on one of those columns; otherwise copy all of them.
-	const policiesToCopy = sourcePolicies.filter((p) => {
-		if (isOpenPolicy(p)) return false;
-		if (allowedColumns.length === 0) return true;
-		const paramColumns = (p.parameters || []).map((param) => param.name);
-		return paramColumns.some((col) => allowedColumns.includes(col));
-	});
+		// Keep custom policies. If allowed columns were specified, restrict to
+		// policies that filter on one of those columns; otherwise copy all of them.
+		policiesToCopy = sourcePolicies.filter((p) => {
+			if (isOpenPolicy(p)) return false;
+			if (allowedColumns.length === 0) return true;
+			const paramColumns = (p.parameters || []).map((param) => param.name);
+			return paramColumns.some((col) => allowedColumns.includes(col));
+		});
 
-	if (policiesToCopy.length === 0) {
+		if (policiesToCopy.length === 0) {
+			console.log(
+				allowedColumns.length > 0
+					? `\nNo PDP policies found matching columns [${allowedColumns.join(', ')}]. Nothing to copy.`
+					: '\nNo custom PDP policies found on the source dataset. Nothing to copy.'
+			);
+			logger.writeRunLog({ total: datasetIds.length, applied: 0, errors: 0 });
+			process.exit(0);
+		}
+
 		console.log(
-			allowedColumns.length > 0
-				? `\nNo PDP policies found matching columns [${allowedColumns.join(', ')}]. Nothing to copy.`
-				: '\nNo custom PDP policies found on the source dataset. Nothing to copy.'
+			`Found ${sourcePolicies.length} total policies (${policiesToCopy.length} to copy):\n`
 		);
-		logger.writeRunLog({ total: datasetIds.length, applied: 0, errors: 0 });
-		process.exit(0);
-	}
-
-	console.log(
-		`Found ${sourcePolicies.length} total policies (${policiesToCopy.length} to copy):\n`
-	);
-	for (const policy of policiesToCopy) {
-		const filters = (policy.parameters || [])
-			.map(
-				(p) =>
-					`${p.name} ${p.operator} ${p.type === 'DYNAMIC' ? p.values.join(', ') : `[${p.values.length} values]`}`
-			)
-			.join(' AND ');
-		const users = (policy.userIds || []).length;
-		const groups = (policy.groupIds || []).length;
-		console.log(`  - "${policy.name}" (${users} users, ${groups} groups)`);
-		if (filters) console.log(`    Filters: ${filters}`);
+		for (const policy of policiesToCopy) {
+			const filters = (policy.parameters || [])
+				.map(
+					(p) =>
+						`${p.name} ${p.operator} ${p.type === 'DYNAMIC' ? p.values.join(', ') : `[${p.values.length} values]`}`
+				)
+				.join(' AND ');
+			const users = (policy.userIds || []).length;
+			const groups = (policy.groupIds || []).length;
+			console.log(`  - "${policy.name}" (${users} users, ${groups} groups)`);
+			if (filters) console.log(`    Filters: ${filters}`);
+		}
 	}
 
 	console.log(`\nTarget datasets: ${datasetIds.length}`);
@@ -258,15 +289,37 @@ async function main() {
 
 	let successCount = 0;
 	let errorCount = 0;
+	let skippedCount = 0;
 
 	for (let i = 0; i < datasetIds.length; i++) {
+		// Rate-limit between datasets
+		if (i > 0) await new Promise((resolve) => setTimeout(resolve, 200));
+
 		const targetId = datasetIds[i];
 		console.log(`[${i + 1}/${datasetIds.length}] ${targetId}`);
 
 		try {
-			// Enable PDP on the target dataset
-			await enablePdp(targetId);
-			console.log('  PDP enabled');
+			if (allRowsOnly) {
+				if (!(await isPdpEnabled(targetId))) {
+					console.log('  Skipped: PDP is not enabled');
+					logger.addResult({
+						datasetId: targetId,
+						status: 'skipped',
+						reason: 'PDP not enabled'
+					});
+					if (debugMode)
+						logger.writeDebugLog(targetId, {
+							datasetId: targetId,
+							status: 'skipped',
+							reason: 'PDP not enabled'
+						});
+					skippedCount++;
+					continue;
+				}
+			} else {
+				await enablePdp(targetId);
+				console.log('  PDP enabled');
+			}
 
 			// Fetch existing policies. In clean mode, delete all custom ones so
 			// the target ends up with exactly the source set. Otherwise leave
@@ -297,7 +350,14 @@ async function main() {
 			// assignment so it carries over.
 			let effectiveAllRowsUsers = allRowsUserIds;
 			let effectiveAllRowsGroups = allRowsGroupIds;
-			if (
+			if (allRowsOnly) {
+				effectiveAllRowsUsers = [
+					...new Set([...(allRowsPolicy.userIds || []), ...allRowsUserIds])
+				];
+				effectiveAllRowsGroups = [
+					...new Set([...(allRowsPolicy.groupIds || []), ...allRowsGroupIds])
+				];
+			} else if (
 				!clean &&
 				allRowsUserIds.length === 0 &&
 				allRowsGroupIds.length === 0 &&
@@ -316,7 +376,7 @@ async function main() {
 				allRowsUpdate
 			);
 			console.log(
-				`  Updated "All Rows" policy — users: [${effectiveAllRowsUsers}], groups: [${effectiveAllRowsGroups}]`
+				`  Updated "All Rows" policy: users [${effectiveAllRowsUsers}], groups [${effectiveAllRowsGroups}]`
 			);
 			await new Promise((resolve) => setTimeout(resolve, 150));
 
@@ -357,11 +417,6 @@ async function main() {
 				});
 			errorCount++;
 		}
-
-		// Rate-limit between datasets
-		if (i + 1 < datasetIds.length) {
-			await new Promise((resolve) => setTimeout(resolve, 200));
-		}
 	}
 
 	// Summary
@@ -369,21 +424,29 @@ async function main() {
 	console.log(`Total target datasets: ${datasetIds.length}`);
 	console.log(`Successfully applied:  ${successCount}`);
 	console.log(`Errors:                ${errorCount}`);
-	console.log(
-		clean
-			? `Policies per dataset:  ${policiesToCopy.length + 1} (${policiesToCopy.length} filtered + All Rows)`
-			: `Policies applied/dataset: ${policiesToCopy.length} (added or updated by name) + All Rows`
-	);
+	if (allRowsOnly) {
+		console.log(`Skipped (PDP off):     ${skippedCount}`);
+		console.log('Policies applied/dataset: All Rows only (users/groups added)');
+	} else {
+		console.log(
+			clean
+				? `Policies per dataset:  ${policiesToCopy.length + 1} (${policiesToCopy.length} filtered + All Rows)`
+				: `Policies applied/dataset: ${policiesToCopy.length} (added or updated by name) + All Rows`
+		);
+	}
 
 	logger.writeRunLog({
 		total: datasetIds.length,
 		applied: successCount,
+		skipped: skippedCount,
 		errors: errorCount
 	});
 
 	if (errorCount > 0) {
 		console.error(`\nSome datasets failed. Run "node cli.js ${COMMAND} --retry-errors" to retry them.`);
 		process.exit(1);
+	} else if (skippedCount > 0) {
+		console.log(`\nDone. ${skippedCount} dataset(s) skipped because PDP is not enabled.`);
 	} else {
 		console.log('\nAll PDP policies applied successfully!');
 	}

@@ -132,7 +132,7 @@ node cli.js bulk-update-stream-schedules --file "streams.csv" --filter-column "s
 | `bulk-add-dataflow-tags` | Add tags to dataflows from a CSV or by owner |
 | `bulk-add-dataflow-trigger-condition` | Add DATAFLOW_LAST_RUN trigger conditions to dataflow triggers |
 | `bulk-add-dataset-tags` | Add tags to datasets from a CSV or by owner |
-| `bulk-apply-pdp-policies` | Copy PDP policies from a source dataset to target datasets |
+| `bulk-apply-pdp-policies` | Copy PDP policies from a source dataset to target datasets, or (without `--source-dataset-id`) add users/groups to each target's All Rows policy |
 | `bulk-convert-stream-provider` | Convert streams from one connector type to another |
 | `bulk-delete-content` | Delete mixed content (dataflows, cards, datasets, groups, beast modes, variables, pages, alerts, scheduled reports, app-studio apps, worksheets, custom apps, Code Engine packages, Jupyter workspaces, AI projects, AI models, workflows, projects, project tasks, goals, metrics, filesets, AppDB collections, accounts, workspaces) from a CSV, routing each row to the right endpoint by type — consumes the `bulk-list-user-content` CSV directly; `--delete-output-datasets` also deletes each dataflow's output datasets |
 | `bulk-delete-dataflow-triggers` | Remove all triggers from dataflows listed in a CSV |
