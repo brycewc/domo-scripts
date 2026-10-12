@@ -27,7 +27,7 @@
  *   --ids            Comma-separated content IDs, instead of --file. Requires --content-type.
  *   --user           User ID to unshare from (required if --group is not set)
  *   --group          Group ID to unshare from (required if --user is not set)
- *   --content-type   Content type: card, badge, page, dataApp, alert, dataset.
+ *   --content-type   Content type: card, badge, page, dataApp, worksheet, alert, dataset.
  *                    Required for JSON files and --ids. For CSV, required when no type column is present;
  *                    otherwise used as the fallback when a row's type cell is empty.
  *   --id-column      CSV column with object IDs (default: "Object ID")
@@ -44,10 +44,11 @@
  *   --max-age <hours>
  *                    Allow a source log older than 24 hours
  *
- * Type values are case-insensitive. Aliases accepted: CARD → badge, DATA_SOURCE / DATASET → dataset.
+ * Type values are case-insensitive. Aliases accepted: CARD → badge, DATA_SOURCE / DATASET → dataset,
+ * DATA_APP → dataApp.
  *
  * Datasets are unshared via /data/v1/ui/bulk/share with accessLevel=NONE.
- * dataApps are unshared via /content/v1/dataapps/share/remove (with a group-owner workaround).
+ * dataApps and worksheets are unshared via /content/v1/dataapps/share/remove (with a group-owner workaround).
  * Alerts are unsubscribed one at a time via DELETE /social/v4/alerts/{id}/subscriptions.
  * Other content types use /content/v1/share/bulk/{type}/{recipient}/{id}. All in batches of 50.
  *
@@ -81,7 +82,7 @@ Options:
   --ids            Comma-separated content IDs, instead of --file. Requires --content-type.
   --user           User ID to unshare from (required if --group is not set)
   --group          Group ID to unshare from (required if --user is not set)
-  --content-type   Content type: card, badge, page, dataApp, alert, dataset.
+  --content-type   Content type: card, badge, page, dataApp, worksheet, alert, dataset.
                    Required for JSON files and --ids. For CSV, required when no type column is
                    present; otherwise used as fallback when a row's type cell is empty.
   --id-column      CSV column with object IDs (default: "Object ID")
@@ -97,20 +98,23 @@ Options:
   --max-age <hours>      Allow a source log older than 24 hours
   --yes, -y        Skip the confirmation prompt for --retry-errors
 
-Type values are case-insensitive. Aliases: CARD → badge, DATA_SOURCE / DATASET → dataset.
+Type values are case-insensitive. Aliases: CARD → badge, DATA_SOURCE / DATASET → dataset,
+DATA_APP → dataApp.
 
 Datasets are unshared via /data/v1/ui/bulk/share with accessLevel=NONE.
-dataApps are unshared via /content/v1/dataapps/share/remove (with a group-owner workaround).
+dataApps and worksheets are unshared via /content/v1/dataapps/share/remove (with a group-owner workaround).
 Alerts are unsubscribed one at a time via DELETE /social/v4/alerts/{id}/subscriptions.
 Other content types use /content/v1/share/bulk/{type}/{recipient}/{id}. All in batches of 50.`;
 
-const VALID_CONTENT_TYPES = ['badge', 'page', 'dataapp', 'alert', 'dataset'];
+const VALID_CONTENT_TYPES = ['badge', 'page', 'dataapp', 'worksheet', 'alert', 'dataset'];
+const DATA_APP_TYPES = ['dataapp', 'worksheet'];
 
 function normalizeContentType(raw) {
 	if (raw == null || raw === '') return null;
 	const lower = String(raw).trim().toLowerCase();
 	if (lower === 'card') return 'badge';
 	if (lower === 'data_source' || lower === 'dataset') return 'dataset';
+	if (lower === 'data_app') return 'dataapp';
 	return VALID_CONTENT_TYPES.includes(lower) ? lower : null;
 }
 
@@ -191,7 +195,7 @@ function loadItemsFromArgs() {
 		contentTypeFallback = normalizeContentType(argv['content-type']);
 		if (!contentTypeFallback) {
 			throw new Error(
-				'Invalid --content-type. Must be one of: card, badge, page, dataApp, alert, dataset'
+				'Invalid --content-type. Must be one of: card, badge, page, dataApp, worksheet, alert, dataset'
 			);
 		}
 	}
@@ -204,7 +208,7 @@ function loadItemsFromArgs() {
 	if (argv.ids) {
 		if (!contentTypeFallback) {
 			throw new Error(
-				'--content-type parameter is required with --ids: card, badge, page, dataApp, alert, dataset'
+				'--content-type parameter is required with --ids: card, badge, page, dataApp, worksheet, alert, dataset'
 			);
 		}
 		const ids = String(argv.ids)
@@ -251,7 +255,7 @@ function loadItemsFromArgs() {
 	} else if (fileExtension === 'json') {
 		if (!contentTypeFallback) {
 			throw new Error(
-				'--content-type parameter is required for JSON files: card, badge, page, dataApp, alert, dataset'
+				'--content-type parameter is required for JSON files: card, badge, page, dataApp, worksheet, alert, dataset'
 			);
 		}
 
@@ -330,10 +334,10 @@ async function main() {
 	let errorCount = 0;
 
 	let datasetItems = itemsByType.dataset || [];
-	const dataappItems = itemsByType.dataapp || [];
+	const dataappItems = DATA_APP_TYPES.flatMap((t) => itemsByType[t] || []);
 	const alertItems = itemsByType.alert || [];
 	const otherTypes = Object.keys(itemsByType).filter(
-		(t) => t !== 'dataset' && t !== 'dataapp' && t !== 'alert'
+		(t) => t !== 'dataset' && !DATA_APP_TYPES.includes(t) && t !== 'alert'
 	);
 
 	const skipInvalidDatasets = source ? Boolean(source.meta.skipInvalidDatasets) : Boolean(argv['skip-invalid-datasets']);
@@ -513,7 +517,7 @@ async function main() {
 	// DataApps: owner-flip workaround + /content/v1/dataapps/share/remove
 	if (dataappItems.length > 0) {
 		console.log(
-			`\nUnsharing ${dataappItems.length} dataApps from ${recipientType} ${recipientId}...`
+			`\nUnsharing ${dataappItems.length} dataApps / worksheets from ${recipientType} ${recipientId}...`
 		);
 
 		const ownerBody = {
@@ -713,7 +717,7 @@ async function main() {
 		`Total items processed: ${datasetItems.length + dataappItems.length + alertItems.length + otherItemCount}`
 	);
 	if (datasetItems.length > 0) console.log(`  Datasets: ${datasetItems.length}`);
-	if (dataappItems.length > 0) console.log(`  DataApps: ${dataappItems.length}`);
+	if (dataappItems.length > 0) console.log(`  DataApps / worksheets: ${dataappItems.length}`);
 	if (alertItems.length > 0) console.log(`  Alerts: ${alertItems.length}`);
 	for (const type of otherTypes) {
 		console.log(`  ${type}: ${itemsByType[type].length}`);

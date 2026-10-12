@@ -31,7 +31,7 @@
  *   --user                  User ID to share with (fallback when --user-column is unset/empty;
  *                           required if --group and --user-column are not set)
  *   --group                 Group ID to share with (required if --user and --user-column are not set)
- *   --content-type          Content type: card, badge, page, dataApp, alert, dataset.
+ *   --content-type          Content type: card, badge, page, dataApp, worksheet, alert, dataset.
  *                           Required for JSON files. For CSV, required when no type column is present;
  *                           otherwise used as the fallback when a row's type cell is empty.
  *   --id-column             CSV column with object IDs (default: "Object ID")
@@ -52,9 +52,11 @@
  *   --retry-errors [file]   Retry the failed and unreached items of a run (default: latest run log)
  *   --max-age <hours>       Allow a source log older than 24 hours
  *
- * Type values are case-insensitive. Aliases accepted: CARD → badge, DATA_SOURCE / DATASET → dataset.
+ * Type values are case-insensitive. Aliases accepted: CARD → badge, DATA_SOURCE / DATASET → dataset,
+ * DATA_APP → dataApp.
  *
  * Datasets are shared via /data/v1/ui/bulk/share, batched per access level.
+ * App Studio apps (dataApp) and worksheets are batched through /content/v1/dataapps/share.
  * All other content types are batched through /content/v1/share.
  */
 
@@ -92,7 +94,7 @@ Options:
   --user                  User ID to share with (fallback when --user-column is unset/empty;
                           required if --group and --user-column are not set)
   --group                 Group ID to share with (required if --user and --user-column are not set)
-  --content-type          Content type: card, badge, page, dataApp, alert, dataset.
+  --content-type          Content type: card, badge, page, dataApp, worksheet, alert, dataset.
                           Required for JSON files. For CSV, required when no type column is
                           present; otherwise used as fallback when a row's type cell is empty.
   --id-column             CSV column with object IDs (default: "Object ID")
@@ -114,9 +116,11 @@ Options:
   --max-age <hours>       Allow a source log older than 24 hours
   --yes, -y               Skip the confirmation prompt for --retry-errors
 
-Type values are case-insensitive. Aliases: CARD → badge, DATA_SOURCE / DATASET → dataset.`;
+Type values are case-insensitive. Aliases: CARD → badge, DATA_SOURCE / DATASET → dataset,
+DATA_APP → dataApp.`;
 
-const VALID_CONTENT_TYPES = ['card', 'badge', 'page', 'dataApp', 'alert', 'dataset'];
+const VALID_CONTENT_TYPES = ['card', 'badge', 'page', 'dataApp', 'worksheet', 'alert', 'dataset'];
+const DATA_APP_TYPES = ['dataApp', 'worksheet'];
 const VALID_ACCESS_LEVELS = ['CAN_VIEW', 'CAN_SHARE', 'CAN_EDIT', 'OWNER'];
 
 function normalizeContentType(raw) {
@@ -124,6 +128,7 @@ function normalizeContentType(raw) {
 	const lower = String(raw).trim().toLowerCase();
 	if (lower === 'card') return 'badge';
 	if (lower === 'data_source' || lower === 'dataset') return 'dataset';
+	if (lower === 'data_app') return 'dataApp';
 	const match = VALID_CONTENT_TYPES.find((t) => t.toLowerCase() === lower);
 	return match || null;
 }
@@ -297,7 +302,8 @@ async function loadItemsFromArgs() {
 	}
 
 	let datasetItems = fileJson.filter((item) => item.type === 'dataset');
-	const contentItems = fileJson.filter((item) => item.type !== 'dataset');
+	const dataAppItems = fileJson.filter((item) => DATA_APP_TYPES.includes(item.type));
+	const contentItems = fileJson.filter((item) => item.type !== 'dataset' && !DATA_APP_TYPES.includes(item.type));
 
 	const skipInvalidDatasets = Boolean(argv['skip-invalid-datasets']);
 	let invalidDatasetIds = [];
@@ -330,6 +336,7 @@ async function loadItemsFromArgs() {
 	return {
 		fileJson,
 		contentItems,
+		dataAppItems,
 		datasetItems,
 		invalidDatasetIds,
 		meta: {
@@ -357,12 +364,14 @@ async function main() {
 
 	let fileJson;
 	let contentItems;
+	let dataAppItems;
 	let datasetItems;
 	let invalidDatasetIds = [];
 	let meta;
 	if (source) {
 		fileJson = source.entries;
-		contentItems = fileJson.filter((item) => item.type !== 'dataset');
+		contentItems = fileJson.filter((item) => item.type !== 'dataset' && !DATA_APP_TYPES.includes(item.type));
+		dataAppItems = fileJson.filter((item) => DATA_APP_TYPES.includes(item.type));
 		datasetItems = fileJson.filter((item) => item.type === 'dataset');
 		const { file, fallbackRecipient, userColumn, idColumn, typeColumn, contentTypeFallback, accessLevelColumn, defaultAccessLevel, skipInvalidDatasets } =
 			source.meta;
@@ -372,14 +381,16 @@ async function main() {
 			console.log('The source log has nothing left to share.');
 			return;
 		}
-		console.log(`Retrying ${contentItems.length} content item(s) and ${datasetItems.length} dataset(s).`);
+		console.log(
+			`Retrying ${contentItems.length} content item(s), ${dataAppItems.length} App Studio app(s) / worksheet(s), and ${datasetItems.length} dataset(s).`
+		);
 		const ok = await confirmSource('Share them again? (yes/no): ', argv);
 		if (!ok) {
 			console.log('Aborted. No changes were made.');
 			process.exit(0);
 		}
 	} else {
-		({ fileJson, contentItems, datasetItems, invalidDatasetIds, meta } = await loadItemsFromArgs());
+		({ fileJson, contentItems, dataAppItems, datasetItems, invalidDatasetIds, meta } = await loadItemsFromArgs());
 	}
 
 	const verbose = Boolean(argv.verbose);
@@ -394,60 +405,46 @@ async function main() {
 			invalidDatasetIds,
 			totalItems: fileJson.length,
 			contentItemCount: contentItems.length,
+			dataAppItemCount: dataAppItems.length,
 			datasetItemCount: datasetItems.length
 		}
 	});
-	logger.beginExecution(contentItems.concat(datasetItems), itemKey);
+	logger.beginExecution(contentItems.concat(dataAppItems, datasetItems), itemKey);
 
 	let successCount = 0;
 	let errorCount = 0;
 
-	if (contentItems.length > 0) {
-		// /content/v1/share takes a single recipient list per call, so group by recipient.
-		const contentByRecipient = {};
-		for (const item of contentItems) {
+	async function shareByRecipient(items, { kind, label, share }) {
+		const byRecipient = {};
+		for (const item of items) {
 			const key = `${item.recipient.type}:${item.recipient.id}`;
-			if (!contentByRecipient[key]) contentByRecipient[key] = { recipient: item.recipient, items: [] };
-			contentByRecipient[key].items.push(item);
+			if (!byRecipient[key]) byRecipient[key] = { recipient: item.recipient, items: [] };
+			byRecipient[key].items.push(item);
 		}
 
 		const batchSize = 50;
-		const recipientKeys = Object.keys(contentByRecipient);
+		const recipientKeys = Object.keys(byRecipient);
 
 		console.log(
-			`Processing ${contentItems.length} content items across ${recipientKeys.length} recipient(s) in batches of ${batchSize}...`
+			`\nProcessing ${items.length} ${label} across ${recipientKeys.length} recipient(s) in batches of ${batchSize}...`
 		);
 
 		for (const key of recipientKeys) {
-			const { recipient, items } = contentByRecipient[key];
-			const totalBatches = Math.ceil(items.length / batchSize);
+			const { recipient, items: recipientItems } = byRecipient[key];
+			const totalBatches = Math.ceil(recipientItems.length / batchSize);
 
-			console.log(`\n  Recipient ${recipient.type}=${recipient.id}: ${items.length} item(s)`);
+			console.log(`\n  Recipient ${recipient.type}=${recipient.id}: ${recipientItems.length} item(s)`);
 
-			for (let start = 0; start < items.length; start += batchSize) {
-				const batch = items.slice(start, start + batchSize);
+			for (let start = 0; start < recipientItems.length; start += batchSize) {
+				const batch = recipientItems.slice(start, start + batchSize);
 				const batchNumber = Math.floor(start / batchSize) + 1;
 
 				console.log(
 					`  Processing batch ${batchNumber}/${totalBatches} (${batch.length} items)...`
 				);
 
-				const body = {
-					resources: batch.map((item) => ({ id: item.id, type: item.type })),
-					recipients: [
-						{
-							type: recipient.type,
-							id: recipient.id
-						}
-					],
-					message: 'Bulk sharing from script.'
-				};
-
 				try {
-					const result = await api.post(
-						'/content/v1/share?sendEmail=false',
-						body
-					);
+					const result = await share(batch, recipient);
 					console.log(
 						`  Batch ${batchNumber} success:`,
 						JSON.stringify(result, null, 2)
@@ -455,7 +452,7 @@ async function main() {
 					successCount++;
 					if (verbose) {
 						logger.addResult({
-							kind: 'content',
+							kind,
 							recipient,
 							batchNumber,
 							totalBatches,
@@ -468,7 +465,7 @@ async function main() {
 					console.error(`  Batch ${batchNumber} error:`, error.message);
 					errorCount++;
 					logger.addResult({
-						kind: 'content',
+						kind,
 						recipient,
 						batchNumber,
 						totalBatches,
@@ -479,11 +476,38 @@ async function main() {
 				}
 				logger.markProcessed(batch);
 
-				if (start + batchSize < items.length) {
+				if (start + batchSize < recipientItems.length) {
 					await new Promise((resolve) => setTimeout(resolve, 100));
 				}
 			}
 		}
+	}
+
+	if (contentItems.length > 0) {
+		await shareByRecipient(contentItems, {
+			kind: 'content',
+			label: 'content items',
+			share: (batch, recipient) =>
+				api.post('/content/v1/share?sendEmail=false', {
+					resources: batch.map((item) => ({ id: item.id, type: item.type })),
+					recipients: [{ type: recipient.type, id: recipient.id }],
+					message: 'Bulk sharing from script.'
+				})
+		});
+	}
+
+	// /content/v1/share returns 200 for dataApp/worksheet resources without sharing them.
+	if (dataAppItems.length > 0) {
+		await shareByRecipient(dataAppItems, {
+			kind: 'dataApp',
+			label: 'App Studio apps / worksheets',
+			share: (batch, recipient) =>
+				api.post('/content/v1/dataapps/share?sendEmail=false', {
+					dataAppIds: batch.map((item) => String(item.id)),
+					recipients: [{ type: recipient.type, id: Number(recipient.id) }],
+					message: 'Bulk sharing from script.'
+				})
+		});
 	}
 
 	if (datasetItems.length > 0) {
@@ -603,9 +627,10 @@ async function main() {
 
 	console.log('\n=== Summary ===');
 	console.log(
-		`Total items processed: ${contentItems.length + datasetItems.length}`
+		`Total items processed: ${contentItems.length + dataAppItems.length + datasetItems.length}`
 	);
 	console.log(`  Content items: ${contentItems.length}`);
+	console.log(`  App Studio apps / worksheets: ${dataAppItems.length}`);
 	console.log(`  Datasets: ${datasetItems.length}`);
 	if (invalidDatasetIds.length > 0) {
 		console.log(`Skipped invalid datasets: ${invalidDatasetIds.length}`);
@@ -616,6 +641,7 @@ async function main() {
 	logger.writeRunLog({
 		totalItems: fileJson.length,
 		contentItems: contentItems.length,
+		dataAppItems: dataAppItems.length,
 		datasetItems: datasetItems.length,
 		skippedInvalidDatasets: invalidDatasetIds.length,
 		successfulBatches: successCount,
